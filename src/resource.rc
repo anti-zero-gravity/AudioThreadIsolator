@@ -1,0 +1,116 @@
+#include "resource.h"
+#include <windows.h>
+#include <commctrl.h>
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+// Main Dialog
+IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 112
+STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_VISIBLE
+EXSTYLE WS_EX_APPWINDOW
+CAPTION "Audio Thread Isolator"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    CONTROL         "", IDC_LIST_PROCESSES, "SysListView32", 
+                    LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 
+                    6, 6, 388, 82
+
+    CONTROL         "Always on Top", IDC_CHK_ALWAYS_ON_TOP, "Button", 
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 404, 6, 60, 9
+    CONTROL         "Heuristics", IDC_CHK_HEURISTICS, "Button", 
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 404, 16, 60, 9
+
+    PUSHBUTTON      "To Tray (&T)", IDC_BTN_HIDE, 404, 29, 52, 10
+    PUSHBUTTON      "Settings (&S)", IDC_BTN_SETTINGS, 404, 41, 52, 10
+    
+    PUSHBUTTON      "Add (&A)", IDC_BTN_ADD, 404, 56, 52, 10
+    PUSHBUTTON      "Edit (&E)", IDC_BTN_EDIT, 404, 68, 52, 10
+    PUSHBUTTON      "Remove (&D)", IDC_BTN_REMOVE, 404, 80, 52, 10
+
+    PUSHBUTTON      "Exit (&X)", IDC_BTN_EXIT, 404, 96, 52, 10
+END
+
+
+// Process Picker Dialog
+IDD_PROCESS_PICKER DIALOGEX 0, 0, 340, 290
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_VISIBLE
+CAPTION "Select Process"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    LTEXT           "Check the processes you want to monitor and isolate:", -1, 7, 7, 326, 12
+    CONTROL         "", IDC_LIST_RUNNING, "SysListView32", 
+                    LVS_REPORT | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 
+                    7, 22, 326, 238
+    PUSHBUTTON      "Refresh (&R)", IDC_BTN_REFRESH, 7, 266, 55, 17
+    DEFPUSHBUTTON   "Done", IDC_BTN_SELECT_DONE, 215, 266, 55, 17
+    PUSHBUTTON      "Cancel", IDC_BTN_SELECT_CANCEL, 275, 266, 58, 17
+END
+
+// Global Settings Dialog
+// Global Settings Dialog
+IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 152
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
+CAPTION "Global Settings"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    CONTROL         "", IDC_LIST_SETTINGS_CORES, "SysListView32",
+                    LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
+                    12, 10, 256, 26
+
+    LTEXT           "Default Audio Core(s) (#, ...):", -1, 14, 48, 140, 10
+    EDITTEXT        IDC_EDIT_AUDIO_CORE, 232, 46, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+
+    LTEXT           "Other than Audio (Mask):", -1, 14, 68, 140, 10
+    EDITTEXT        IDC_EDIT_NORMAL_CORES, 232, 66, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+
+    LTEXT           "Audio Thread Priority:", -1, 14, 88, 140, 10
+    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 173, 86, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Polling Interval (ms):", -1, 14, 108, 140, 10
+    EDITTEXT        IDC_EDIT_POLLING_MS, 242, 106, 26, 14, ES_AUTOHSCROLL | ES_NUMBER | ES_RIGHT
+
+    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 172, 128, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 223, 128, 45, 15
+END
+
+// Process Rule Edit Dialog
+IDD_RULE_EDIT_DIALOG DIALOGEX 0, 0, 280, 164
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
+CAPTION "Thread Isolation Settings"
+
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    LTEXT           "Target Process:", -1, 14, 10, 65, 10
+    LTEXT           "", IDC_STATIC_PROCESS_NAME, 85, 10, 180, 10
+
+    CONTROL         "", IDC_LIST_RULE_CORES, "SysListView32",
+                    LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
+                    12, 24, 256, 26
+
+    LTEXT           "Audio Core(s) (#, ...):", -1, 14, 58, 140, 10
+    EDITTEXT        IDC_EDIT_RULE_CORE, 232, 56, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+
+    LTEXT           "Other than Audio (Mask):", -1, 14, 76, 140, 10
+    EDITTEXT        IDC_EDIT_RULE_NORMAL_CORES, 232, 74, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+
+    LTEXT           "Audio Thread Priority:", -1, 14, 94, 140, 10
+    COMBOBOX        IDC_COMBO_RULE_PRIO, 173, 92, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+
+    LTEXT           "Note: If other threads return to the audio core, status becomes Half-Isolated.\nAudio priority is auto-promoted by 1 step, keeping intruder threads 1 level below it.", 
+                    IDC_STATIC_HALF_ISOLATED_NOTE, 14, 112, 254, 20
+
+    DEFPUSHBUTTON   "OK", IDC_BTN_RULE_OK, 172, 140, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_RULE_CANCEL, 223, 140, 45, 15
+END
+
+// Tray Context Menu
+IDR_TRAY_MENU MENU
+BEGIN
+    POPUP ""
+    BEGIN
+        MENUITEM "Open Settings", ID_TRAY_OPEN
+        MENUITEM "Start with Windows", ID_TRAY_STARTUP
+        MENUITEM SEPARATOR
+        MENUITEM "Exit", ID_TRAY_EXIT
+    END
+END

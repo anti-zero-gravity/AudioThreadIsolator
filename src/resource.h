@@ -1,0 +1,47 @@
+#pragma once
+
+#define IDD_MAIN_DIALOG         101
+#define IDD_PROCESS_PICKER      102
+#define IDD_SETTINGS_DIALOG     103
+
+#define IDC_LIST_PROCESSES      1001
+#define IDC_BTN_ADD             1002
+#define IDC_BTN_REMOVE          1003
+#define IDC_BTN_SETTINGS        1004
+#define IDC_BTN_HIDE            1005
+#define IDC_BTN_EXIT            1006
+#define IDC_CHK_ALWAYS_ON_TOP   1007
+#define IDC_CHK_HEURISTICS      1008
+
+#define IDC_LIST_RUNNING        1010
+#define IDC_BTN_SELECT_DONE     1011
+#define IDC_BTN_SELECT_CANCEL   1012
+#define IDC_BTN_REFRESH         1013
+
+#define IDC_EDIT_AUDIO_CORE     1020
+#define IDC_EDIT_NORMAL_CORES   1021
+#define IDC_EDIT_POLLING_MS     1022
+#define IDC_BTN_SETTINGS_OK     1023
+#define IDC_BTN_SETTINGS_CANCEL 1024
+#define IDC_COMBO_AUDIO_PRIORITY 1025
+#define IDC_LIST_SETTINGS_CORES 1026
+
+#define IDD_RULE_EDIT_DIALOG    104
+#define IDC_STATIC_PROCESS_NAME 1030
+#define IDC_EDIT_RULE_CORE      1031
+#define IDC_COMBO_RULE_PRIO     1032
+#define IDC_BTN_RULE_OK         1033
+#define IDC_BTN_RULE_CANCEL     1034
+#define IDC_BTN_EDIT            1035
+#define IDC_LIST_RULE_CORES     1036
+#define IDC_EDIT_RULE_NORMAL_CORES 1037
+#define IDC_STATIC_HALF_ISOLATED_NOTE 1038
+#define IDC_COMBO_INPLACE_PRIO  1039
+
+#define IDR_TRAY_MENU           201
+#define ID_TRAY_OPEN            2001
+#define ID_TRAY_EXIT            2002
+#define ID_TRAY_STARTUP         2003
+
+#define IDI_APP_ICON            301
+

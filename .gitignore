@@ -1,0 +1,58 @@
+# Compiled Object files
+*.slo
+*.lo
+*.o
+*.obj
+
+# Precompiled Headers
+*.gch
+*.pch
+
+# Compiled Dynamic libraries
+*.so
+*.dylib
+*.dll
+
+# Compiled Static libraries
+*.lai
+*.la
+*.a
+*.lib
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Visual Studio / MSBuild
+.vs/
+Debug/
+Release/
+x64/
+x86/
+build/
+*.VC.db
+*.opendb
+
+# Local Configuration and Logs
+settings.ini
+debug.log*
+*.bak
+screenshot_*.png
+
+# Temporary inspection scripts
+*.py
+check_*.ps1
+dump_*.ps1
+find_*.ps1
+
+# Agent rules and internal plan logs
+.agents/
+plan.md
+arc.md
+
+# Build and measurement scripts
+build.ps1
+measure.ps1
+
+
