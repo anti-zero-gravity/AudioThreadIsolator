@@ -47,18 +47,21 @@ ATI employs a robust, 3-stage heuristic engine to reliably detect and isolate au
   - ASIO driver DLLs (e.g., `*asiodriver*.dll`, `vbvmaux_asiodriver64.dll`).
   - Windows Audio Core DLLs (`audioses.dll`, `dmusic.dll`, etc.).
 
-### 3. Stage 3: Thread Priority & Activity Sampling Detection (Fallback)
-For unknown applications or games without thread descriptions, ATI identifies audio playback threads based on thread priority and activity patterns. Detection behavior is distinguished by whether candidate threads are single or multiple:
+### 3. Stage 3: Call Stack Disassembly Scanning & Enhanced Heuristic Sampling
+For unknown applications, games, or engines without thread descriptions (Godot, Unity, DirectSound, WinMM), ATI combines advanced static and dynamic inspection techniques:
 
-- **When a single candidate thread exists (MMCSS / Real-time priority)**:
-  - Audio engines typically promote their playback threads to real-time priority (`THREAD_PRIORITY_TIME_CRITICAL` (+15) or higher) to avoid dropouts.
-  - If exactly one real-time thread exists within the target process, ATI immediately isolates it regardless of the Heuristics ON/OFF setting.
-- **When multiple candidate threads exist (e.g., Unity game engine / Target of Heuristics)**:
-  - Applications built with game engines such as Unity may spawn multiple unnamed threads sharing the same high priority level (e.g., `THREAD_PRIORITY_HIGHEST` (+2) or BasePri 10).
-  - **The "Heuristics" checkbox on the UI controls whether detection among these multiple candidate threads is enabled or disabled**:
-    - **Enabled (ON)**: Samples CPU execution time of candidate threads at regular intervals, statistically isolating the thread exhibiting continuous, steady audio buffer activity (10ms–15ms periodicity).
-    - **Disabled (OFF)**: Skips CPU sampling to maintain an ultra-low-overhead mode (0.00% CPU usage) in Standby state.
-- Users can also specify a custom target thread priority (`TargetPriority`) on a per-process basis.
+- **Stack Base Inspection & Call Stack Disassembly Scanning**:
+  - **FMOD / Unity**: Scans memory preceding `StackBase` in the thread TEB to extract embedded plaintext thread descriptions (`FMOD (WASAPI) feeder thread`, etc.).
+  - **Godot Engine & Unnamed WASAPI**: Scans return addresses on the thread call stack to inspect instructions near `[rip + disp32]` relative references, identifying core engine symbols like `"audio_driver_wasapi"` or `"AudioDriverWASAPI"` directly (instantly isolated as Rank 95 on the first turn).
+- **Enhanced 10-Second Heuristics Sampling (Unrestricted Modules / Top-Delta Exclusion)**:
+  - Completely eliminates restrictive module whitelists, scanning all threads including external sound modules (`DSOUND.dll`, `WINMM.dll`, `pxtoneWin32.dll`, etc.).
+  - Samples all threads over a 10-second observation window (20 turns at 500ms intervals) to accumulate delta CPU times.
+  - **Excludes the #1 highest delta thread** (typically the main game logic / rendering loop).
+  - **Evaluates candidates ranking #2 to #10**, verifying audio module signatures and steady polling cycles (10ms–15ms range) to reliably isolate true audio threads.
+- **Intruder Thread Suppression & Normal Thread Priority Protection**:
+  - After migrating normal threads to the default core mask, ATI physically re-checks their affinity. Only threads actively persisting on the dedicated audio core (e.g., self-binding NVIDIA display driver threads) are classified as "true intruders".
+  - Normal threads (main, render, input) that migrate successfully retain their original OS/game priority completely untouched (preventing unintended `-15` degradation).
+  - When an intruder is cohabiting (Half-Isolated), the audio thread is automatically elevated if set to `-15` (`-15` ➔ `-2` Lowest), while the intruder is demoted to the tier directly below (`-15`), maintaining audio priority dominance.
 
 ### Persistent Thread Tracking Mechanism
 - Once a thread is identified and isolated, ATI registers its Thread ID (TID) in an active tracking table.

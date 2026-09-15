@@ -5,7 +5,7 @@
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
 // Main Dialog
-IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 112
+IDD_MAIN_DIALOG DIALOGEX 0, 0, 486, 112
 STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_VISIBLE
 EXSTYLE WS_EX_APPWINDOW
 CAPTION "Audio Thread Isolator"
@@ -13,21 +13,21 @@ FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_PROCESSES, "SysListView32", 
                     LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP, 
-                    6, 6, 388, 82
+                    6, 6, 404, 82
 
     CONTROL         "Always on Top", IDC_CHK_ALWAYS_ON_TOP, "Button", 
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 404, 6, 60, 9
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 420, 6, 60, 9
     CONTROL         "Heuristics", IDC_CHK_HEURISTICS, "Button", 
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 404, 16, 60, 9
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 420, 16, 60, 9
 
-    PUSHBUTTON      "To Tray (&T)", IDC_BTN_HIDE, 404, 29, 52, 10
-    PUSHBUTTON      "Settings (&S)", IDC_BTN_SETTINGS, 404, 41, 52, 10
+    PUSHBUTTON      "To Tray (&T)", IDC_BTN_HIDE, 420, 29, 52, 10
+    PUSHBUTTON      "Settings (&S)", IDC_BTN_SETTINGS, 420, 41, 52, 10
     
-    PUSHBUTTON      "Add (&A)", IDC_BTN_ADD, 404, 56, 52, 10
-    PUSHBUTTON      "Edit (&E)", IDC_BTN_EDIT, 404, 68, 52, 10
-    PUSHBUTTON      "Remove (&D)", IDC_BTN_REMOVE, 404, 80, 52, 10
+    PUSHBUTTON      "Add (&A)", IDC_BTN_ADD, 420, 56, 52, 10
+    PUSHBUTTON      "Edit (&E)", IDC_BTN_EDIT, 420, 68, 52, 10
+    PUSHBUTTON      "Remove (&D)", IDC_BTN_REMOVE, 420, 80, 52, 10
 
-    PUSHBUTTON      "Exit (&X)", IDC_BTN_EXIT, 404, 96, 52, 10
+    PUSHBUTTON      "Exit (&X)", IDC_BTN_EXIT, 420, 96, 52, 10
 END
 
 

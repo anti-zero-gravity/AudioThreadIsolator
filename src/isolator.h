@@ -48,6 +48,8 @@ struct ProcessRule {
     int currentThreadCount = 0;           // 検出された総スレッド数 (アフィニティ制御対象スレッド規模)
     std::string detectedThreadName = "";  // 検出された再生スレッド名 (例: "ao/wasapi")
     DWORD activePid = 0;                  // 検出中のプロセスID (0: 未起動)
+    DWORD activeAudioTid = 0;             // 検出・隔離中のオーディオスレッドID
+    bool isAudioThreadSuspended = false;  // オーディオスレッド手動一時停止(テスト検証)中か
     bool isRunning = false;               // 現在稼働中か
     bool isAudioIsolated = false;         // オーディオスレッド検出・通常スレッド退避完了か
     bool hasIntruderThreads = false;      // オーディオ専有コアへの侵入・同居スレッドを検知・制圧中か
@@ -83,6 +85,8 @@ public:
     void UpdateRule(size_t index, const ProcessRule& rule);
     void ToggleProcessHeuristics(size_t index);
     void ToggleProcessBypass(size_t index);
+    bool ToggleSuspendAudioThread(size_t index);
+    void ResumeAllSuspendedThreads();
     std::vector<ProcessRule> GetRulesSnapshot();
 
     // システム情報ヘルパー
@@ -107,6 +111,14 @@ private:
 
     // スレッドCPU時間サンプリング (キー: PID, 値: (キー: TID, 値: 前回計測の合計CPU時間))
     std::unordered_map<DWORD, std::unordered_map<DWORD, ULONGLONG>> m_prevThreadCpuTimes;
+
+    // 10秒間サンプリング状態保持 (キー: PID)
+    struct ProcessSamplingState {
+        int sampleTurns = 0; // 0 〜 20 ターン (約10秒間)
+        std::unordered_map<DWORD, ULONGLONG> lastCpuTime;
+        std::unordered_map<DWORD, ULONGLONG> accumulatedDelta;
+    };
+    std::unordered_map<DWORD, ProcessSamplingState> m_samplingStates;
 
     // GetThreadDescription 関数ポインタ
     typedef HRESULT(WINAPI* PFN_GetThreadDescription)(HANDLE, PWSTR*);
