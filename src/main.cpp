@@ -1579,6 +1579,9 @@ static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
 static WNDPROC s_pfnOriginalListProc = nullptr;
 
 static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_ERASEBKGND) {
+        return 1; // 背景消去メッセージによるクリアをスキップし、LVS_EX_DOUBLEBUFFER に一任
+    }
     if (msg == WM_LBUTTONDOWN) {
         LVHITTESTINFO lvhti = { 0 };
         lvhti.pt.x = static_cast<short>(LOWORD(lParam));
@@ -1958,19 +1961,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetWindowPos(hBtnExit, nullptr, newX, newY, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
-        // ListView 下方の凡例領域を背景消去付きで再描画（旧位置の残像を防止）
-        HWND hListForInv = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-        if (hListForInv) {
-            RECT rcL;
-            GetWindowRect(hListForInv, &rcL);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcL), 2);
-            RECT rcClient;
-            GetClientRect(hDlg, &rcClient);
-            // 凡例領域: ListView下端からダイアログ下端まで
-            RECT rcBelow = { rcClient.left, rcL.bottom, rcClient.right, rcClient.bottom };
-            InvalidateRect(hDlg, &rcBelow, TRUE);
-        }
-        InvalidateRect(hDlg, nullptr, FALSE);
+        // ウィンドウリサイズ時、親ダイアログの余白・凡例領域を背景消去付きで無効化（旧位置の残像を防止）
+        // ※子コントロールは WS_CLIPCHILDREN により保護されチラつかない
+        InvalidateRect(hDlg, nullptr, TRUE);
         return TRUE;
     }
 
@@ -1998,15 +1991,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             // 凡例領域の背景を先に塗りつぶし（ListView下端からダイアログ底まで、リサイズ時の残像防止）
             RECT rcClient;
             GetClientRect(hDlg, &rcClient);
-            HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
-            int legendRight = rcClient.right;
-            if (hBtnExit) {
-                RECT rcExit;
-                GetWindowRect(hBtnExit, &rcExit);
-                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcExit), 2);
-                legendRight = rcExit.left - static_cast<int>(4 * scale);
-            }
-            RECT rcLegendArea = { 0, rcList.bottom, legendRight, rcClient.bottom };
+            RECT rcLegendArea = { 0, rcList.bottom, rcClient.right, rcClient.bottom };
             FillRect(hdc, &rcLegendArea, GetSysColorBrush(COLOR_BTNFACE));
 
             // 1行目: カラー凡例 4種 (左寄せ配置: 1: Half-Isolated, 2: Fully Isolated, 3: Standby / Scanning, 4: Sleeping (Restart))
@@ -2115,9 +2100,13 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             if (hList) {
                 if (changed) {
                     UpdateListViewDynamic(hList, rules);
-                    InvalidateRect(hList, nullptr, FALSE);
-                } else if (anyRunning) {
-                    InvalidateRect(hList, nullptr, FALSE);
+                }
+                if (anyRunning) {
+                    RECT rcClient;
+                    GetClientRect(hList, &rcClient);
+                    int col0W = ListView_GetColumnWidth(hList, 0);
+                    RECT rcCol0 = { 0, 0, col0W, rcClient.bottom };
+                    InvalidateRect(hList, &rcCol0, FALSE);
                 }
 
                 // 全対象 Not running かつ変化なしの時は、下部凡例領域の不要な再描画を行わず CPU/GPU 負荷とチラつきを抑止

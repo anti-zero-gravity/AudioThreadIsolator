@@ -328,23 +328,27 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
           }
 
           if (!modName.empty()) {
-            // (1) AUDIOSES.DLL (WASAPI 最前線)
+            // (1) InstantAud.ax (CyberLink PowerDVD オーディオ出力)
+            if (modName.find("instantaud") != std::string::npos) {
+              return "InstantAud.ax (CyberLink)";
+            }
+            // (2) AUDIOSES.DLL (WASAPI 最前線)
             if (modName.find("audioses") != std::string::npos) {
               return "WASAPI (audioses.dll)";
             }
-            // (2) ASIO ドライバ DLL
+            // (3) ASIO ドライバ DLL
             if (modName.find("asio") != std::string::npos) {
               return "ASIO Driver";
             }
-            // (3) DirectSound
+            // (4) DirectSound
             if (modName.find("dsound") != std::string::npos) {
               return "DirectSound (dsound.dll)";
             }
-            // (4) XAudio2
+            // (5) XAudio2
             if (modName.find("xaudio2") != std::string::npos) {
               return "XAudio2";
             }
-            // (5) WaveOut
+            // (6) WaveOut
             if (modName.find("winmm") != std::string::npos) {
               return "WaveOut (winmm.dll)";
             }
@@ -1516,10 +1520,6 @@ bool ThreadIsolator::ScanAndIsolate() {
       DWORD identifiedAudioTid = 0;
       std::string identifiedAudioLabel = "";
 
-      int bestRank = 0;
-      DWORD bestRankTid = 0;
-      std::string bestRankLabel = "";
-
       DWORD mainThreadTid =
           ptIt->second.empty() ? 0 : ptIt->second[0].th32ThreadID;
 
@@ -1535,7 +1535,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      // 1. 各スレッドの基本情報を収集 & 永続トラッキング・名前一致を先行判定
+      // 1. 各スレッドの基本情報を収集 & 永続トラッキングを判定
       for (const auto &te : ptIt->second) {
         totalThreadCount++;
         aliveTids.insert(te.th32ThreadID);
@@ -1571,34 +1571,6 @@ bool ThreadIsolator::ScanAndIsolate() {
               trackPidIt->second[te.th32ThreadID] = identifiedAudioLabel;
             }
           }
-        }
-
-        // (B) スレッド名ランク判定
-        int rank = GetAudioThreadRank(threadName);
-        if (rank > bestRank) {
-          bestRank = rank;
-          bestRankTid = te.th32ThreadID;
-          bestRankLabel = threadName;
-        }
-      }
-
-      // (B-2) 明確なオーディオスレッド名の一致判定
-      // (未特定時、またはより高ランクな Feeder 等を発見した場合に昇格)
-      if (bestRankTid != 0) {
-        int currentTrackedRank = identifiedAudioTid != 0
-                                     ? GetAudioThreadRank(identifiedAudioLabel)
-                                     : 0;
-        if (identifiedAudioTid == 0 || bestRank > currentTrackedRank) {
-          identifiedAudioTid = bestRankTid;
-          identifiedAudioLabel = bestRankLabel;
-          m_trackedAudioThreads[pid].clear();
-          m_trackedAudioThreads[pid][bestRankTid] = bestRankLabel;
-          char bLog[128];
-          snprintf(
-              bLog, sizeof(bLog),
-              "Selected audio thread by rank (%d): PID=%lu, TID=%lu, Name='%s'",
-              bestRank, pid, identifiedAudioTid, identifiedAudioLabel.c_str());
-          LogDebug(bLog);
         }
       }
 
@@ -1679,12 +1651,13 @@ bool ThreadIsolator::ScanAndIsolate() {
                   QueryCallstackAudioSignature(hProcess, ti.hThread);
 
               // オーディオ関連キーワード (dsound, winmm, pxtone, audioses,
-              // audio, sound, またはスタックシグネチャ検出)
+              // instantaud, audio, sound, またはスタックシグネチャ検出)
               if (!stackSig.empty() ||
                   modName.find("dsound.dll") != std::string::npos ||
                   modName.find("winmm.dll") != std::string::npos ||
                   modName.find("pxtone") != std::string::npos ||
                   modName.find("audioses") != std::string::npos ||
+                  modName.find("instantaud") != std::string::npos ||
                   modName.find("audio") != std::string::npos ||
                   modName.find("sound") != std::string::npos) {
                 sampleState.audioCandidateTids.insert(ti.tid);
@@ -1748,15 +1721,28 @@ bool ThreadIsolator::ScanAndIsolate() {
             } else {
               // 確定！
               identifiedAudioTid = cand1;
-              identifiedAudioLabel =
-                  "Audio (TID: " + std::to_string(identifiedAudioTid) + ")";
+              std::string candLabel = "";
+              for (const auto &ti : threadInfos) {
+                if (ti.tid == cand1) {
+                  if (!ti.threadName.empty()) {
+                    candLabel = ti.threadName;
+                  }
+                  break;
+                }
+              }
+              if (candLabel.empty()) {
+                candLabel =
+                    "Audio (TID: " + std::to_string(identifiedAudioTid) + ")";
+              }
+              identifiedAudioLabel = candLabel;
               m_trackedAudioThreads[pid][identifiedAudioTid] =
                   identifiedAudioLabel;
               char hLog[128];
               snprintf(hLog, sizeof(hLog),
-                       "Heuristics MATCH: PID=%lu, TID=%lu (accDelta=%llu)",
+                       "Heuristics MATCH: PID=%lu, TID=%lu (accDelta=%llu, Label='%s')",
                        pid, identifiedAudioTid,
-                       (unsigned long long)audioRanking[0].second);
+                       (unsigned long long)audioRanking[0].second,
+                       identifiedAudioLabel.c_str());
               LogDebug(hLog);
               m_samplingStates.erase(pid); // 探索完了
             }
@@ -1988,12 +1974,15 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.wasHalfAutoPromoted = false;
         stateChanged = true;
       }
-      std::string notDetectedName =
-          (m_config.enableHeuristics && rule.enableHeuristics) ? "Scanning..."
-                                                               : "Standby";
-      if (rule.detectedThreadName != notDetectedName) {
-        rule.detectedThreadName = notDetectedName;
-        stateChanged = true;
+      if (rule.detectedThreadName != "Heuristics" &&
+          rule.detectedThreadName != "Waiting new thread") {
+        std::string notDetectedName =
+            (m_config.enableHeuristics && rule.enableHeuristics) ? "Scanning..."
+                                                                 : "Standby";
+        if (rule.detectedThreadName != notDetectedName) {
+          rule.detectedThreadName = notDetectedName;
+          stateChanged = true;
+        }
       }
     }
 
