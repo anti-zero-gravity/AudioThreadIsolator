@@ -65,7 +65,7 @@ struct GlobalConfig {
     DWORD_PTR defaultAudioAffinityMask; // デフォルト隔離オーディオコアマスク (0: defaultAudioCoreから単一生成)
     int defaultAudioPriority;         // デフォルトオーディオ優先度 (-15: THREAD_PRIORITY_IDLE)
     DWORD_PTR normalAffinityMask;     // 通常スレッド退避先マスク (0: 隔離コア以外の全コア自動)
-    int pollingIntervalMs;            // 監視周期 (デフォルト 500ms)
+    int pollingIntervalMs;            // 監視周期 (デフォルト 1000ms)
     bool enableHeuristics = false;    // 非MMCSSスレッド探索用ヒューリスティック監視有効化 (デフォルト: false)
     std::vector<ProcessRule> rules;   // 監視プロセス一覧
 };
@@ -114,6 +114,9 @@ private:
     // キー: TID, 値: 適用済みマスク
     std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;
 
+    // Chromium モード: アフィニティ適用済み子プロセス PID セット (差分検出用)
+    std::unordered_set<DWORD> m_chromiumMaskedPids;
+
     // 永続オーディオスレッドトラッキング (キー: PID, 値: (キー: TID, 値: スレッド表示名))
     std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>> m_trackedAudioThreads;
 
@@ -122,11 +125,19 @@ private:
 
     // 10秒間サンプリング状態保持 (キー: PID)
     struct ProcessSamplingState {
-        int sampleTurns = 0; // 0 〜 20 ターン (約10秒間)
+        int sampleTurns = 0;                                   // 経過ターン数 (500ms単位)
+        int maxTurns = 20;                                     // 判定閾値 (初期値20=10秒、失速時+10=5秒延長)
         std::unordered_map<DWORD, ULONGLONG> lastCpuTime;
-        std::unordered_map<DWORD, ULONGLONG> accumulatedDelta;
+        std::unordered_map<DWORD, ULONGLONG> accumulatedDelta; // 累積デルタ
+        std::unordered_map<DWORD, ULONGLONG> latestDelta;      // 直近ターンの瞬間デルタ
+        std::unordered_set<DWORD> audioCandidateTids;          // オーディオ関連と判定された候補 TID
+        std::unordered_set<DWORD> inspectedTids;               // スタック検査済み TID (生涯1回)
     };
     std::unordered_map<DWORD, ProcessSamplingState> m_samplingStates;
+
+    // スレッドスナップショット遅延用キャッシュ (キー: PID)
+    std::unordered_map<DWORD, std::vector<DWORD>> m_cachedProcessTids;
+    std::unordered_map<DWORD, int> m_lastProcessThreadCount;
 
     // GetThreadDescription 関数ポインタ
     typedef HRESULT(WINAPI* PFN_GetThreadDescription)(HANDLE, PWSTR*);
@@ -134,6 +145,10 @@ private:
 
     std::string QueryThreadNameA(HANDLE hThread);
     bool IsNamedAudioThread(const std::string& threadName);
+
+public:
+    // ヒューリスティック探索中 (500ms タイマー要求中) かどうか判定
+    bool IsHeuristicsActive() const;
 };
 
 } // namespace ati

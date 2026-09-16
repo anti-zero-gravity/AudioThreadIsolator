@@ -27,11 +27,11 @@ static ati::ThreadIsolator g_isolator;
 static std::string g_iniPath;
 static bool g_startInTray = false;
 static bool g_alwaysOnTop = false;
-static bool g_enableHeuristics = false;
 static bool s_pulseTick = false;
 static HWND s_hInPlaceCombo = nullptr;
 static int s_inPlaceItemIndex = -1;
 static bool s_inPlaceCancelled = false;
+static HANDLE g_hSingleInstanceMutex = nullptr;
 
 void LogDebug(const char* msg) {
     char exePath[MAX_PATH] = { 0 };
@@ -321,13 +321,12 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
     }
 
     config.pollingIntervalMs = GetPrivateProfileIntA(
-        "Global", "PollingIntervalMs", 500, iniPath.c_str()
+        "Global", "PollingIntervalMs", 1000, iniPath.c_str()
     );
     if (config.pollingIntervalMs < 100) config.pollingIntervalMs = 100;
 
     g_alwaysOnTop = (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
-    g_enableHeuristics = (GetPrivateProfileIntA("Global", "EnableHeuristics", 0, iniPath.c_str()) != 0);
-    config.enableHeuristics = g_enableHeuristics;
+    config.enableHeuristics = true;
 
     config.rules.clear();
 
@@ -436,11 +435,6 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
     WritePrivateProfileStringA(
         "Global", "AlwaysOnTop", 
         g_alwaysOnTop ? "1" : "0", iniPath.c_str()
-    );
-
-    WritePrivateProfileStringA(
-        "Global", "EnableHeuristics", 
-        g_enableHeuristics ? "1" : "0", iniPath.c_str()
     );
 
     WritePrivateProfileSectionA("Processes", "\0", iniPath.c_str());
@@ -1538,6 +1532,23 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
     return CallWindowProcA(s_pfnOriginalListProc, hWnd, msg, wParam, lParam);
 }
 
+// --- アプリケーション再起動ヘルパー ---
+static void RestartApplication(HWND hDlg) {
+    char exePath[MAX_PATH] = { 0 };
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    KillTimer(hDlg, TIMER_POLLING_ID);
+    RemoveTrayIcon();
+    g_isolator.ResumeAllSuspendedThreads();
+    bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
+    const char* params = wasInTray ? "--tray" : nullptr;
+    if (g_hSingleInstanceMutex) {
+        CloseHandle(g_hSingleInstanceMutex);
+        g_hSingleInstanceMutex = nullptr;
+    }
+    ShellExecuteA(nullptr, "open", exePath, params, nullptr, wasInTray ? SW_HIDE : SW_SHOW);
+    DestroyWindow(hDlg);
+}
+
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg != WM_SETCURSOR && msg != WM_NCHITTEST && msg != WM_MOUSEMOVE && msg != WM_NCMOUSEMOVE && msg != 0x0113 /* WM_TIMER */) {
@@ -1702,12 +1713,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetWindowPos(hDlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
-        // Heuristics の初期状態適用
-        HWND hChkHeur = GetDlgItem(hDlg, IDC_CHK_HEURISTICS);
-        if (hChkHeur) {
-            SendMessageA(hChkHeur, BM_SETCHECK, g_enableHeuristics ? BST_CHECKED : BST_UNCHECKED, 0);
-        }
-
         // ATI 自身の自己隔離とプロセス優先度 Low (Idle) 化
         SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
         if (config.normalAffinityMask != 0) {
@@ -1824,7 +1829,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         };
 
         MoveRight(IDC_CHK_ALWAYS_ON_TOP);
-        MoveRight(IDC_CHK_HEURISTICS);
+
         MoveRight(IDC_BTN_HIDE);
         MoveRight(IDC_BTN_SETTINGS);
         MoveRight(IDC_BTN_ADD);
@@ -1853,7 +1858,19 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetWindowPos(hBtnExit, nullptr, newX, newY, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
-        InvalidateRect(hDlg, nullptr, TRUE);
+        // ListView 下方の凡例領域を背景消去付きで再描画（旧位置の残像を防止）
+        HWND hListForInv = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+        if (hListForInv) {
+            RECT rcL;
+            GetWindowRect(hListForInv, &rcL);
+            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcL), 2);
+            RECT rcClient;
+            GetClientRect(hDlg, &rcClient);
+            // 凡例領域: ListView下端からダイアログ下端まで
+            RECT rcBelow = { rcClient.left, rcL.bottom, rcClient.right, rcClient.bottom };
+            InvalidateRect(hDlg, &rcBelow, TRUE);
+        }
+        InvalidateRect(hDlg, nullptr, FALSE);
         return TRUE;
     }
 
@@ -1878,6 +1895,20 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(60, 60, 60));
 
+            // 凡例領域の背景を先に塗りつぶし（ListView下端からダイアログ底まで、リサイズ時の残像防止）
+            RECT rcClient;
+            GetClientRect(hDlg, &rcClient);
+            HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
+            int legendRight = rcClient.right;
+            if (hBtnExit) {
+                RECT rcExit;
+                GetWindowRect(hBtnExit, &rcExit);
+                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcExit), 2);
+                legendRight = rcExit.left - static_cast<int>(4 * scale);
+            }
+            RECT rcLegendArea = { 0, rcList.bottom, legendRight, rcClient.bottom };
+            FillRect(hdc, &rcLegendArea, GetSysColorBrush(COLOR_BTNFACE));
+
             // 1行目: カラー凡例 3種 (左寄せ配置: 1: Half-Isolated, 2: Fully Isolated, 3: Standby / Scanning)
             std::string txt1 = " Half-Isolated (Audio<-OtherThread)";
             std::string txt2 = " Fully Isolated";
@@ -1891,8 +1922,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
             int dotY = startY + static_cast<int>(3 * scale);
 
-            // 1. 黄色/緑パカパカドット + テキスト (Half-Isolated)
-            COLORREF colHalf = s_pulseTick ? RGB(124, 224, 173) : RGB(216, 178, 76);
+            // 1. 黄色ドット + テキスト (Half-Isolated: 消灯色固定)
+            COLORREF colHalf = RGB(216, 178, 76);
             HBRUSH brHalf = CreateSolidBrush(colHalf);
             HPEN penHalf = CreatePen(PS_SOLID, 1, colHalf);
             HGDIOBJ oldBrush = SelectObject(hdc, brHalf);
@@ -1900,19 +1931,19 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             Ellipse(hdc, legendStartX, dotY, legendStartX + dotSize, dotY + dotSize);
             TextOutA(hdc, legendStartX + dotSize + 2, startY, txt1.c_str(), static_cast<int>(txt1.length()));
 
-            // 2. 青緑ドット + テキスト (Fully Isolated)
+            // 2. 青緑ドット + テキスト (Fully Isolated: 消灯色固定)
             int x2 = legendStartX + dotSize + 2 + sz1.cx + spacing;
-            HBRUSH brGreen = CreateSolidBrush(RGB(124, 224, 173));
-            HPEN penGreen = CreatePen(PS_SOLID, 1, RGB(124, 224, 173));
+            HBRUSH brGreen = CreateSolidBrush(RGB(111, 201, 155));
+            HPEN penGreen = CreatePen(PS_SOLID, 1, RGB(111, 201, 155));
             SelectObject(hdc, brGreen);
             SelectObject(hdc, penGreen);
             Ellipse(hdc, x2, dotY, x2 + dotSize, dotY + dotSize);
             TextOutA(hdc, x2 + dotSize + 2, startY, txt2.c_str(), static_cast<int>(txt2.length()));
 
-            // 3. コーラルピンクドット + テキスト (Standby / Scanning)
+            // 3. コーラルピンクドット + テキスト (Standby / Scanning: 消灯色固定)
             int x3 = x2 + dotSize + 2 + sz2.cx + spacing;
-            HBRUSH brPink = CreateSolidBrush(RGB(224, 155, 151));
-            HPEN penPink = CreatePen(PS_SOLID, 1, RGB(224, 155, 151));
+            HBRUSH brPink = CreateSolidBrush(RGB(201, 139, 135));
+            HPEN penPink = CreatePen(PS_SOLID, 1, RGB(201, 139, 135));
             SelectObject(hdc, brPink);
             SelectObject(hdc, penPink);
             Ellipse(hdc, x3, dotY, x3 + dotSize, dotY + dotSize);
@@ -1927,15 +1958,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             DeleteObject(penHalf);
             DeleteObject(brHalf);
 
-            // 2行目 (もう1行下): ヒューリスティック探索進行ターンの英語ステータス表示
-            int startY2 = startY + static_cast<int>(16 * scale);
-            std::string hStatus = g_isolator.GetHeuristicsStatusText();
-            if (!hStatus.empty()) {
-                SetTextColor(hdc, RGB(180, 70, 70));
-                TextOutA(hdc, startX, startY2, hStatus.c_str(), static_cast<int>(hStatus.length()));
-                SetTextColor(hdc, RGB(60, 60, 60));
-            }
-
             SelectObject(hdc, oldFont);
         }
 
@@ -1947,21 +1969,43 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         if (wParam == TIMER_POLLING_ID) {
             s_pulseTick = !s_pulseTick;
             bool changed = g_isolator.ScanAndIsolate();
+
+            // 動的タイマー切り替え（Heuristics 探索中は 500ms、通常時は INI 準拠）
+            static UINT s_currentInterval = 0;
+            auto cfg = g_isolator.GetConfig();
+            UINT desiredInterval = g_isolator.IsHeuristicsActive() ? 500 : cfg.pollingIntervalMs;
+            if (s_currentInterval != desiredInterval) {
+                SetTimer(hDlg, TIMER_POLLING_ID, desiredInterval, nullptr);
+                s_currentInterval = desiredInterval;
+            }
+
+            auto rules = g_isolator.GetRulesSnapshot();
+            bool anyRunning = false;
+            for (const auto& r : rules) {
+                if (r.activePid != 0) {
+                    anyRunning = true;
+                    break;
+                }
+            }
+
             HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
             if (hList) {
                 if (changed) {
-                    auto rules = g_isolator.GetRulesSnapshot();
                     UpdateListViewDynamic(hList, rules);
+                    InvalidateRect(hList, nullptr, FALSE);
+                } else if (anyRunning) {
+                    InvalidateRect(hList, nullptr, FALSE);
                 }
-                InvalidateRect(hList, nullptr, FALSE);
 
-                // 下部ステータスバー・凡例領域の再描画 (2行分: 38*scale)
-                RECT rcList;
-                GetWindowRect(hList, &rcList);
-                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
-                float scale = GetDpiScaleForWindow(hDlg);
-                RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + static_cast<int>(38 * scale) };
-                InvalidateRect(hDlg, &rcStatus, TRUE);
+                // 全対象 Not running かつ変化なしの時は、下部凡例領域の不要な再描画を行わず CPU/GPU 負荷とチラつきを抑止
+                if (changed || anyRunning) {
+                    RECT rcList;
+                    GetWindowRect(hList, &rcList);
+                    MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
+                    float scale = GetDpiScaleForWindow(hDlg);
+                    RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + static_cast<int>(20 * scale) };
+                    InvalidateRect(hDlg, &rcStatus, FALSE);
+                }
             }
         }
         return TRUE;
@@ -1996,18 +2040,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             }
             return TRUE;
         }
-        else if (cmdId == IDC_CHK_HEURISTICS) {
-            HWND hChkHeur = GetDlgItem(hDlg, IDC_CHK_HEURISTICS);
-            if (hChkHeur) {
-                g_enableHeuristics = (SendMessageA(hChkHeur, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                auto config = g_isolator.GetConfig();
-                config.enableHeuristics = g_enableHeuristics;
-                g_isolator.UpdateConfig(config);
-                SaveConfig(config, g_iniPath);
-                LogDebug(("MainDlg: Heuristics toggled to " + std::to_string(g_enableHeuristics ? 1 : 0)).c_str());
-            }
-            return TRUE;
-        }
+
         else if (cmdId == IDC_COMBO_INPLACE_PRIO) {
             WORD notif = HIWORD(wParam);
             auto ApplyChange = [&]() {
@@ -2146,13 +2179,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             return TRUE;
         }
         else if (cmdId == ID_TRAY_RESTART) {
-            char exePath[MAX_PATH] = { 0 };
-            GetModuleFileNameA(nullptr, exePath, MAX_PATH);
-            KillTimer(hDlg, TIMER_POLLING_ID);
-            RemoveTrayIcon();
-            g_isolator.ResumeAllSuspendedThreads();
-            ShellExecuteA(nullptr, "open", exePath, "--tray", nullptr, SW_HIDE);
-            DestroyWindow(hDlg);
+            RestartApplication(hDlg);
             return TRUE;
         }
         break;
@@ -2191,10 +2218,11 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         float scale = GetDpiScaleForWindow(hDlg);
                         int cbLimit = rcSub.left + static_cast<int>(22 * scale);
                         if (lvhti.pt.x <= cbLimit) {
-                            // 未起動時（両方向トグル可）、または起動中かつ監視除外中（Bypass解除のみ可）
-                            // ※起動中かつ通常監視中（●表示）はスレッド変更済みのためトグル不可（インターロック保護）
+                            // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
+                            // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
+                            // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
                             const auto& targetRule = rules[lvhti.iItem];
-                            if (!targetRule.isRunning || targetRule.isBypassed) {
+                            {
                                 bool wasRunning = targetRule.isRunning;
                                 g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
                                 SaveConfig(g_isolator.GetConfig(), g_iniPath);
@@ -2433,12 +2461,12 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
     case WM_TRAYICON_MSG: {
         if (lParam == WM_LBUTTONUP) {
-            if (IsWindowVisible(hDlg)) {
-                SetForegroundWindow(hDlg);
-            } else {
+            if (IsIconic(hDlg)) {
                 ShowWindow(hDlg, SW_RESTORE);
-                SetForegroundWindow(hDlg);
+            } else if (!IsWindowVisible(hDlg)) {
+                ShowWindow(hDlg, SW_SHOW);
             }
+            SetForegroundWindow(hDlg);
         } else if (lParam == WM_RBUTTONUP) {
             HMENU hMenu = LoadMenuA(g_hInstance, MAKEINTRESOURCEA(IDR_TRAY_MENU));
             if (hMenu) {
@@ -2479,7 +2507,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     LogDebug("WinMain: start (High-DPI PerMonitorV2 enabled)");
 
     // 単一インスタンス制御 (多重起動の物理的防止)
-    HANDLE hMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
+    g_hSingleInstanceMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
         HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.2");
@@ -2488,7 +2516,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
             ShowWindow(hExisting, SW_SHOWNORMAL);
             SetForegroundWindow(hExisting);
         }
-        if (hMutex) CloseHandle(hMutex);
+        if (g_hSingleInstanceMutex) {
+            CloseHandle(g_hSingleInstanceMutex);
+            g_hSingleInstanceMutex = nullptr;
+        }
         return 0;
     }
 
@@ -2566,8 +2597,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     }
     LogDebug("WinMain: message loop exited");
 
-    if (hMutex) {
-        CloseHandle(hMutex);
+    if (g_hSingleInstanceMutex) {
+        CloseHandle(g_hSingleInstanceMutex);
+        g_hSingleInstanceMutex = nullptr;
     }
 
     return static_cast<int>(msg.wParam);

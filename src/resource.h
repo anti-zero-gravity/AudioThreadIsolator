@@ -11,7 +11,7 @@
 #define IDC_BTN_HIDE            1005
 #define IDC_BTN_EXIT            1006
 #define IDC_CHK_ALWAYS_ON_TOP   1007
-#define IDC_CHK_HEURISTICS      1008
+#define IDC_CHK_RESTART         1008
 
 #define IDC_LIST_RUNNING        1010
 #define IDC_BTN_SELECT_DONE     1011
