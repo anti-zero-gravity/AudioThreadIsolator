@@ -292,6 +292,108 @@ static int GetOneStepLowerPriority(int audioPriority) {
     }
 }
 
+// Chromium 判定: プロセスの exe ファイルをディスクから読み、"chromeos" ASCII 文字列を検索
+bool ThreadIsolator::DetectChromiumExe(HANDLE hProcess) {
+    char exePath[MAX_PATH] = { 0 };
+    DWORD pathLen = MAX_PATH;
+    if (!QueryFullProcessImageNameA(hProcess, 0, exePath, &pathLen) || pathLen == 0) {
+        return false;
+    }
+
+    FILE* fp = fopen(exePath, "rb");
+    if (!fp) return false;
+
+    fseek(fp, 0, SEEK_END);
+    long fileSize = ftell(fp);
+    if (fileSize <= 0 || fileSize > 10 * 1024 * 1024) {
+        fclose(fp);
+        return false;
+    }
+    fseek(fp, 0, SEEK_SET);
+
+    std::vector<BYTE> buf(static_cast<size_t>(fileSize));
+    size_t readBytes = fread(buf.data(), 1, static_cast<size_t>(fileSize), fp);
+    fclose(fp);
+    if (readBytes < 8) return false;
+
+    const char* needle = "chromeos";
+    size_t needleLen = 8;
+    for (size_t i = 0; i + needleLen <= readBytes; ++i) {
+        if (memcmp(&buf[i], needle, needleLen) == 0) {
+            char dLog[256];
+            snprintf(dLog, sizeof(dLog), "DetectChromiumExe: FOUND 'chromeos' in '%s'", exePath);
+            LogDebug(dLog);
+            return true;
+        }
+    }
+    return false;
+}
+
+// プロセスのコマンドラインを PEB 経由で取得 (ANSI 変換)
+std::string ThreadIsolator::QueryProcessCommandLine(HANDLE hProcess) {
+    typedef LONG NTSTATUS;
+    typedef NTSTATUS(NTAPI* pfnNtQueryInformationProcess)(
+        HANDLE, ULONG, PVOID, ULONG, PULONG);
+
+    static pfnNtQueryInformationProcess s_pfnNtQIP = nullptr;
+    if (!s_pfnNtQIP) {
+        HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
+        if (hNtdll) {
+            s_pfnNtQIP = reinterpret_cast<pfnNtQueryInformationProcess>(
+                GetProcAddress(hNtdll, "NtQueryInformationProcess"));
+        }
+    }
+    if (!s_pfnNtQIP) return "";
+
+    struct PROCESS_BASIC_INFO {
+        PVOID Reserved1;
+        PVOID PebBaseAddress;
+        PVOID Reserved2[2];
+        ULONG_PTR UniqueProcessId;
+        PVOID Reserved3;
+    };
+    PROCESS_BASIC_INFO pbi = { 0 };
+    ULONG retLen = 0;
+    NTSTATUS status = s_pfnNtQIP(hProcess, 0, &pbi, sizeof(pbi), &retLen);
+    if (status != 0 || !pbi.PebBaseAddress) return "";
+
+    PVOID pProcessParams = nullptr;
+    SIZE_T bytesRead = 0;
+    if (!ReadProcessMemory(hProcess,
+        reinterpret_cast<LPCVOID>(reinterpret_cast<uintptr_t>(pbi.PebBaseAddress) + 0x20),
+        &pProcessParams, sizeof(pProcessParams), &bytesRead) || !pProcessParams) {
+        return "";
+    }
+
+    struct UNICODE_STRING_RAW {
+        USHORT Length;
+        USHORT MaximumLength;
+        DWORD  padding;
+        PVOID  Buffer;
+    };
+    UNICODE_STRING_RAW cmdLineUs = { 0 };
+    if (!ReadProcessMemory(hProcess,
+        reinterpret_cast<LPCVOID>(reinterpret_cast<uintptr_t>(pProcessParams) + 0x70),
+        &cmdLineUs, sizeof(cmdLineUs), &bytesRead) || !cmdLineUs.Buffer || cmdLineUs.Length == 0) {
+        return "";
+    }
+
+    USHORT wcharCount = cmdLineUs.Length / sizeof(WCHAR);
+    if (wcharCount > 16384) wcharCount = 16384;
+    std::vector<WCHAR> wBuf(wcharCount + 1, 0);
+    if (!ReadProcessMemory(hProcess, cmdLineUs.Buffer, wBuf.data(),
+        static_cast<SIZE_T>(wcharCount) * sizeof(WCHAR), &bytesRead)) {
+        return "";
+    }
+    wBuf[wcharCount] = L'\0';
+
+    int aBufLen = WideCharToMultiByte(CP_ACP, 0, wBuf.data(), wcharCount, nullptr, 0, nullptr, nullptr);
+    if (aBufLen <= 0) return "";
+    std::string result(static_cast<size_t>(aBufLen), '\0');
+    WideCharToMultiByte(CP_ACP, 0, wBuf.data(), wcharCount, &result[0], aBufLen, nullptr, nullptr);
+    return result;
+}
+
 ThreadIsolator::ThreadIsolator()
 
     : m_pfnGetThreadDescription(nullptr) {
@@ -722,6 +824,22 @@ bool ThreadIsolator::ScanAndIsolate() {
             continue;
         }
 
+        // Chromium 系ブラウザ自動判定 (初回のみ exe ファイルを走査)
+        if (rule.isChromium == -1) {
+            HANDLE hFirstProc = OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, it->second[0]);
+            if (hFirstProc) {
+                rule.isChromium = DetectChromiumExe(hFirstProc) ? 1 : 0;
+                CloseHandle(hFirstProc);
+                char cLog[128];
+                snprintf(cLog, sizeof(cLog), "Chromium detect: '%s' -> isChromium=%d",
+                         rule.processName.c_str(), rule.isChromium);
+                LogDebug(cLog);
+            } else {
+                rule.isChromium = 0;
+            }
+        }
+
         int totalThreadCount = 0;
         bool audioDetectedInAny = false;
         std::string primaryAudioThreadName = "";
@@ -739,6 +857,174 @@ bool ThreadIsolator::ScanAndIsolate() {
             normalMask = MakeDefaultNormalMask(coreCount, rule.audioCore);
         }
         DWORD_PTR parentMask = audioMask | baseNormal;
+
+        // ── Chromium 専用パス: Audio Service のみスレッド走査、他は AffinityMask のみ ──
+        if (rule.isChromium == 1) {
+            DWORD audioServicePid = 0;
+
+            // Audio Service PID を特定 (コマンドライン走査)
+            for (DWORD pid : it->second) {
+                HANDLE hProc = OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_SET_INFORMATION,
+                    FALSE, pid);
+                if (!hProc) continue;
+
+                std::string cmdLine = QueryProcessCommandLine(hProc);
+                if (cmdLine.find("audio.mojom.AudioService") != std::string::npos) {
+                    audioServicePid = pid;
+                    rule.audioServicePid = pid;
+                    CloseHandle(hProc);
+                    char asLog[128];
+                    snprintf(asLog, sizeof(asLog), "Chromium AudioService found: PID=%lu", pid);
+                    LogDebug(asLog);
+                    break;
+                }
+
+                // Audio Service 以外: プロセス単位で audioCore を除外するマスクのみ適用
+                DWORD_PTR currentProcMask = 0, sysMask = 0;
+                if (GetProcessAffinityMask(hProc, &currentProcMask, &sysMask)) {
+                    if (currentProcMask != normalMask) {
+                        SetProcessAffinityMask(hProc, normalMask);
+                    }
+                }
+                CloseHandle(hProc);
+            }
+
+            if (audioServicePid == 0) {
+                // Audio Service 未検出: Standby 表示
+                if (rule.detectedThreadName != "Standby") {
+                    rule.detectedThreadName = "Standby";
+                    stateChanged = true;
+                }
+                rule.isAudioIsolated = false;
+                continue;
+            }
+
+            // Audio Service プロセスのスレッドを走査 (軽量: 通常3スレッド程度)
+            auto ptIt = processThreads.find(audioServicePid);
+            if (ptIt == processThreads.end() || ptIt->second.empty()) continue;
+
+            HANDLE hAsProc = OpenProcess(
+                PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                FALSE, audioServicePid);
+            if (!hAsProc) continue;
+
+            // 親プロセスのアフィニティを拡張
+            DWORD_PTR currentProcMask = 0, sysMask = 0;
+            if (GetProcessAffinityMask(hAsProc, &currentProcMask, &sysMask)) {
+                if ((currentProcMask & parentMask) != parentMask) {
+                    SetProcessAffinityMask(hAsProc, parentMask);
+                }
+            }
+
+            totalThreadCount = static_cast<int>(ptIt->second.size());
+
+            // CyclesDelta サンプリングでオーディオスレッドを特定
+            DWORD bestTid = 0;
+            ULONGLONG bestDelta = 0;
+            auto& sampleState = m_samplingStates[audioServicePid];
+            FILETIME cr, ex, kr, ur;
+
+            // 永続トラッキングから事前解決
+            {
+                auto trackIt = m_trackedAudioThreads.find(audioServicePid);
+                if (trackIt != m_trackedAudioThreads.end() && !trackIt->second.empty()) {
+                    bestTid = trackIt->second.begin()->first;
+                    primaryAudioThreadName = trackIt->second.begin()->second;
+                }
+            }
+
+            struct AsThreadInfo { DWORD tid; HANDLE hThread; };
+            std::vector<AsThreadInfo> asThreads;
+
+            for (const auto& te : ptIt->second) {
+                HANDLE hThread = OpenThread(
+                    THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                    FALSE, te.th32ThreadID);
+                if (!hThread) continue;
+                asThreads.push_back({ te.th32ThreadID, hThread });
+
+                // スレッド名チェック (wasapi_render_thread 等)
+                std::string tName = QueryThreadNameA(hThread);
+                int rank = GetAudioThreadRank(tName);
+                if (rank > 0 && bestTid == 0) {
+                    bestTid = te.th32ThreadID;
+                    primaryAudioThreadName = tName;
+                    m_trackedAudioThreads[audioServicePid].clear();
+                    m_trackedAudioThreads[audioServicePid][bestTid] = primaryAudioThreadName;
+                }
+
+                // CPU 時間サンプリング
+                if (GetThreadTimes(hThread, &cr, &ex, &kr, &ur)) {
+                    ULONGLONG totalTime = ((static_cast<ULONGLONG>(kr.dwHighDateTime) << 32) | kr.dwLowDateTime)
+                                        + ((static_cast<ULONGLONG>(ur.dwHighDateTime) << 32) | ur.dwLowDateTime);
+                    auto prevIt = sampleState.lastCpuTime.find(te.th32ThreadID);
+                    if (prevIt != sampleState.lastCpuTime.end()) {
+                        ULONGLONG d = (totalTime >= prevIt->second) ? (totalTime - prevIt->second) : 0;
+                        if (d > bestDelta) {
+                            bestDelta = d;
+                            if (bestTid == 0) {
+                                bestTid = te.th32ThreadID;
+                            }
+                        }
+                    }
+                    sampleState.lastCpuTime[te.th32ThreadID] = totalTime;
+                }
+            }
+
+            // 名前で見つからず CyclesDelta 最大で選定
+            if (bestTid != 0 && primaryAudioThreadName.empty()) {
+                primaryAudioThreadName = "Audio (TID: " + std::to_string(bestTid) + ")";
+                m_trackedAudioThreads[audioServicePid].clear();
+                m_trackedAudioThreads[audioServicePid][bestTid] = primaryAudioThreadName;
+            }
+
+            // アフィニティ・優先度の適用
+            for (const auto& at : asThreads) {
+                if (at.tid == bestTid) {
+                    SetThreadAffinityMask(at.hThread, audioMask);
+                    SetThreadPriority(at.hThread, rule.audioPriority);
+                    SetThreadIdealProcessor(at.hThread, static_cast<DWORD>(rule.audioCore));
+                    audioDetectedInAny = true;
+                    primaryAudioPid = audioServicePid;
+                    primaryAudioTid = bestTid;
+                } else {
+                    SetThreadAffinityMask(at.hThread, normalMask);
+                }
+                CloseHandle(at.hThread);
+            }
+
+            CloseHandle(hAsProc);
+
+            // 残りの全子プロセスにも normalMask を適用 (Audio Service 以外)
+            for (DWORD pid : it->second) {
+                if (pid == audioServicePid) continue;
+                HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+                if (!hProc) continue;
+                DWORD_PTR cpMask = 0, smask = 0;
+                if (GetProcessAffinityMask(hProc, &cpMask, &smask)) {
+                    if (cpMask != normalMask) {
+                        SetProcessAffinityMask(hProc, normalMask);
+                    }
+                }
+                CloseHandle(hProc);
+            }
+
+            // 状態更新
+            if (audioDetectedInAny) {
+                if (!rule.isAudioIsolated) { rule.isAudioIsolated = true; stateChanged = true; }
+                if (rule.activePid != primaryAudioPid) { rule.activePid = primaryAudioPid; stateChanged = true; }
+                if (rule.activeAudioTid != primaryAudioTid) { rule.activeAudioTid = primaryAudioTid; stateChanged = true; }
+                if (rule.detectedThreadName != primaryAudioThreadName) { rule.detectedThreadName = primaryAudioThreadName; stateChanged = true; }
+            } else {
+                if (rule.isAudioIsolated) { rule.isAudioIsolated = false; stateChanged = true; }
+                if (rule.detectedThreadName != "Scanning...") { rule.detectedThreadName = "Scanning..."; stateChanged = true; }
+            }
+            if (rule.currentThreadCount != totalThreadCount) { rule.currentThreadCount = totalThreadCount; stateChanged = true; }
+            continue;
+        }
+
+        // ── 既存パス（Firefox, foobar2000, ゲーム等）──
 
         // 同名プロセスの全 PID (マルチプロセス) を走査
         for (DWORD pid : it->second) {
@@ -807,6 +1093,16 @@ bool ThreadIsolator::ScanAndIsolate() {
 
             DWORD mainThreadTid = ptIt->second.empty() ? 0 : ptIt->second[0].th32ThreadID;
 
+            // 永続トラッキングから事前解決 (ループ前にオーディオTIDを確定させ、重い走査をスキップ)
+            {
+                auto trackPidIt = m_trackedAudioThreads.find(pid);
+                if (trackPidIt != m_trackedAudioThreads.end() && !trackPidIt->second.empty()) {
+                    auto firstTracked = trackPidIt->second.begin();
+                    identifiedAudioTid = firstTracked->first;
+                    identifiedAudioLabel = firstTracked->second;
+                }
+            }
+
             // 1. 各スレッドの基本情報を収集 & 永続トラッキング・名前一致を先行判定
             for (const auto& te : ptIt->second) {
                 totalThreadCount++;
@@ -820,10 +1116,10 @@ bool ThreadIsolator::ScanAndIsolate() {
                 if (!hThread) continue;
 
                 std::string threadName = QueryThreadNameA(hThread);
-                if (threadName.empty()) {
+                if (threadName.empty() && identifiedAudioTid == 0) {
                     threadName = QueryFmodOrUnityThreadName(hProcess, hThread);
                 }
-                if (threadName.empty()) {
+                if (threadName.empty() && identifiedAudioTid == 0) {
                     threadName = QueryCallstackAudioSignature(hProcess, hThread);
                 }
                 int priority = GetThreadPriority(hThread);
@@ -1004,9 +1300,25 @@ bool ThreadIsolator::ScanAndIsolate() {
             std::vector<DWORD> intruderTids;
             DWORD_PTR effectiveNormal = normalMask;
 
-            // まず非オーディオスレッド (通常スレッド群) を通常コア群へ先行退避し、侵入者を物理検出
+            // まず非オーディオスレッド (通常スレッド群) を通常コア群へ先行退避し、真の侵入者を物理検出
             for (const auto& ti : threadInfos) {
                 if (ti.tid == identifiedAudioTid) continue;
+
+                // スキャン時点 (退避前) の物理アフィニティを検査:
+                // オーディオコア (audioMask) を実行対象に含んでおり、かつ
+                // (A) オーディオコア単独に自己バインドしている、または
+                // (B) 以前のサイクルで通常コア群へ退避させたにもかかわらず自らオーディオコアへ再バインドして居座るスレッド
+                if (identifiedAudioTid != 0 && (ti.currentAffinity & audioMask) != 0) {
+                    bool isSpecificToAudio = ((ti.currentAffinity & ~audioMask) == 0);
+                    bool wasPreviouslyEvacuated = (m_appliedThreads.find(ti.tid) != m_appliedThreads.end());
+                    char dbgBuf[256];
+                    snprintf(dbgBuf, sizeof(dbgBuf), "IntruderCheck: PID=%lu, TID=%lu, aff=0x%llX, audioMask=0x%llX, specific=%d, evac=%d",
+                             pid, ti.tid, (unsigned long long)ti.currentAffinity, (unsigned long long)audioMask, isSpecificToAudio, wasPreviouslyEvacuated);
+                    LogDebug(dbgBuf);
+                    if (isSpecificToAudio || wasPreviouslyEvacuated) {
+                        intruderTids.push_back(ti.tid);
+                    }
+                }
 
                 // 通常スレッドの Ideal Processor を通常コアに設定
                 DWORD normalIdeal = 0;
@@ -1020,21 +1332,19 @@ bool ThreadIsolator::ScanAndIsolate() {
 
                 // 通常コア群 (effectiveNormal) へ退避
                 DWORD_PTR prevMask = SetThreadAffinityMask(ti.hThread, effectiveNormal);
-                if (prevMask != 0 && prevMask != effectiveNormal) {
+                if (prevMask != 0) {
                     m_appliedThreads[ti.tid] = effectiveNormal;
-                    stateChanged = true;
-                }
-
-                // 退避後の物理アフィニティを確認
-                DWORD_PTR actualAff = QueryThreadAffinityMask(ti.hThread);
-                // オーディオ特定時、通常コアへ退避させたにもかかわらず audioMask (Core #5) を保持し続けるスレッドのみが「真の侵入者」！
-                if (identifiedAudioTid != 0 && (actualAff & audioMask) != 0) {
-                    intruderTids.push_back(ti.tid);
+                    if (prevMask != effectiveNormal) {
+                        stateChanged = true;
+                    }
                 }
             }
 
             bool hasIntruders = !intruderTids.empty();
             rule.hasIntruderThreads = hasIntruders;
+            char hLog[128];
+            snprintf(hLog, sizeof(hLog), "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d", pid, intruderTids.size(), hasIntruders);
+            LogDebug(hLog);
 
             // オーディオスレッドの適用優先度 (targetAudioPrio) の決定
             int targetAudioPrio = rule.audioPriority;

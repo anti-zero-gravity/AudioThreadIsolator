@@ -395,6 +395,8 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             rule.targetPriority = static_cast<DWORD>(atoi(v.c_str()));
                         } else if (k == "Bypass" || k == "Ignore") {
                             rule.isBypassed = (atoi(v.c_str()) != 0);
+                        } else if (k == "IsChromium") {
+                            rule.isChromium = atoi(v.c_str());
                         }
                     }
                 }
@@ -458,6 +460,9 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         }
         if (rule.isBypassed) {
             val += ", Bypass:1";
+        }
+        if (rule.isChromium >= 0) {
+            val += ", IsChromium:" + std::to_string(rule.isChromium);
         }
         WritePrivateProfileStringA(
             "Processes", rule.processName.c_str(), val.c_str(), iniPath.c_str()
@@ -1545,7 +1550,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.2");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -2140,6 +2145,16 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetStartupEnabled(!IsStartupEnabled());
             return TRUE;
         }
+        else if (cmdId == ID_TRAY_RESTART) {
+            char exePath[MAX_PATH] = { 0 };
+            GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+            KillTimer(hDlg, TIMER_POLLING_ID);
+            RemoveTrayIcon();
+            g_isolator.ResumeAllSuspendedThreads();
+            ShellExecuteA(nullptr, "open", exePath, "--tray", nullptr, SW_HIDE);
+            DestroyWindow(hDlg);
+            return TRUE;
+        }
         break;
     }
 
@@ -2417,9 +2432,13 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_TRAYICON_MSG: {
-        if (lParam == WM_LBUTTONDBLCLK) {
-            ShowWindow(hDlg, SW_SHOW);
-            SetForegroundWindow(hDlg);
+        if (lParam == WM_LBUTTONUP) {
+            if (IsWindowVisible(hDlg)) {
+                SetForegroundWindow(hDlg);
+            } else {
+                ShowWindow(hDlg, SW_RESTORE);
+                SetForegroundWindow(hDlg);
+            }
         } else if (lParam == WM_RBUTTONUP) {
             HMENU hMenu = LoadMenuA(g_hInstance, MAKEINTRESOURCEA(IDR_TRAY_MENU));
             if (hMenu) {
@@ -2463,7 +2482,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     HANDLE hMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.2");
+        if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
         if (hExisting) {
             ShowWindow(hExisting, SW_SHOWNORMAL);
             SetForegroundWindow(hExisting);

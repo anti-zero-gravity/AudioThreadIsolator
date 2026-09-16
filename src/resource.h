@@ -42,6 +42,7 @@
 #define ID_TRAY_OPEN            2001
 #define ID_TRAY_EXIT            2002
 #define ID_TRAY_STARTUP         2003
+#define ID_TRAY_RESTART         2004
 
 #define IDI_APP_ICON            301
 

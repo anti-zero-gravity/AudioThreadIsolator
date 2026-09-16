@@ -42,6 +42,9 @@ struct ProcessRule {
     bool isBypassed = false;
     // 個別ヒューリスティック探索フラグ (デフォルト: true)
     bool enableHeuristics = true;
+    // Chromium系ブラウザ判定 (exe ファイル "chromeos" ASCII 走査結果、INI 永続化)
+    int isChromium = -1;                  // -1: 未判定, 0: 非Chromium, 1: Chromium系
+    DWORD audioServicePid = 0;            // Chromiumモード: 特定済み Audio Service の PID (ランタイムのみ)
 
     // リアルタイム動的状態 (GUI表示用)
     DWORD applyCount = 0;                 // 累計再生スレッド隔離回数
@@ -94,6 +97,11 @@ public:
     static DWORD_PTR GetFullCoreMask(int coreCount);
     static DWORD_PTR MakeCoreMask(int coreIndex);
     static DWORD_PTR MakeDefaultNormalMask(int coreCount, int isolatedCore);
+
+    // Chromium Audio Service モード: プロセスのコマンドラインを取得
+    static std::string QueryProcessCommandLine(HANDLE hProcess);
+    // Chromium判定: exe ファイルから "chromeos" 文字列を検索
+    static bool DetectChromiumExe(HANDLE hProcess);
 
     // ヒューリスティック状態テキスト取得 (GUI ステータスバー表示用)
     std::string GetHeuristicsStatusText() const;
