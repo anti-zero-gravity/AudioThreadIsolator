@@ -1545,7 +1545,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.2");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -2463,7 +2463,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     HANDLE hMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.2");
+        if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
         if (hExisting) {
             ShowWindow(hExisting, SW_SHOWNORMAL);
             SetForegroundWindow(hExisting);

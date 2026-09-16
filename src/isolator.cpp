@@ -820,10 +820,10 @@ bool ThreadIsolator::ScanAndIsolate() {
                 if (!hThread) continue;
 
                 std::string threadName = QueryThreadNameA(hThread);
-                if (threadName.empty()) {
+                if (threadName.empty() && identifiedAudioTid == 0) {
                     threadName = QueryFmodOrUnityThreadName(hProcess, hThread);
                 }
-                if (threadName.empty()) {
+                if (threadName.empty() && identifiedAudioTid == 0) {
                     threadName = QueryCallstackAudioSignature(hProcess, hThread);
                 }
                 int priority = GetThreadPriority(hThread);
@@ -1004,9 +1004,25 @@ bool ThreadIsolator::ScanAndIsolate() {
             std::vector<DWORD> intruderTids;
             DWORD_PTR effectiveNormal = normalMask;
 
-            // まず非オーディオスレッド (通常スレッド群) を通常コア群へ先行退避し、侵入者を物理検出
+            // まず非オーディオスレッド (通常スレッド群) を通常コア群へ先行退避し、真の侵入者を物理検出
             for (const auto& ti : threadInfos) {
                 if (ti.tid == identifiedAudioTid) continue;
+
+                // スキャン時点 (退避前) の物理アフィニティを検査:
+                // オーディオコア (audioMask) を実行対象に含んでおり、かつ
+                // (A) オーディオコア単独に自己バインドしている、または
+                // (B) 以前のサイクルで通常コア群へ退避させたにもかかわらず自らオーディオコアへ再バインドして居座るスレッド
+                if (identifiedAudioTid != 0 && (ti.currentAffinity & audioMask) != 0) {
+                    bool isSpecificToAudio = ((ti.currentAffinity & ~audioMask) == 0);
+                    bool wasPreviouslyEvacuated = (m_appliedThreads.find(ti.tid) != m_appliedThreads.end());
+                    char dbgBuf[256];
+                    snprintf(dbgBuf, sizeof(dbgBuf), "IntruderCheck: PID=%lu, TID=%lu, aff=0x%llX, audioMask=0x%llX, specific=%d, evac=%d",
+                             pid, ti.tid, (unsigned long long)ti.currentAffinity, (unsigned long long)audioMask, isSpecificToAudio, wasPreviouslyEvacuated);
+                    LogDebug(dbgBuf);
+                    if (isSpecificToAudio || wasPreviouslyEvacuated) {
+                        intruderTids.push_back(ti.tid);
+                    }
+                }
 
                 // 通常スレッドの Ideal Processor を通常コアに設定
                 DWORD normalIdeal = 0;
@@ -1020,21 +1036,19 @@ bool ThreadIsolator::ScanAndIsolate() {
 
                 // 通常コア群 (effectiveNormal) へ退避
                 DWORD_PTR prevMask = SetThreadAffinityMask(ti.hThread, effectiveNormal);
-                if (prevMask != 0 && prevMask != effectiveNormal) {
+                if (prevMask != 0) {
                     m_appliedThreads[ti.tid] = effectiveNormal;
-                    stateChanged = true;
-                }
-
-                // 退避後の物理アフィニティを確認
-                DWORD_PTR actualAff = QueryThreadAffinityMask(ti.hThread);
-                // オーディオ特定時、通常コアへ退避させたにもかかわらず audioMask (Core #5) を保持し続けるスレッドのみが「真の侵入者」！
-                if (identifiedAudioTid != 0 && (actualAff & audioMask) != 0) {
-                    intruderTids.push_back(ti.tid);
+                    if (prevMask != effectiveNormal) {
+                        stateChanged = true;
+                    }
                 }
             }
 
             bool hasIntruders = !intruderTids.empty();
             rule.hasIntruderThreads = hasIntruders;
+            char hLog[128];
+            snprintf(hLog, sizeof(hLog), "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d", pid, intruderTids.size(), hasIntruders);
+            LogDebug(hLog);
 
             // オーディオスレッドの適用優先度 (targetAudioPrio) の決定
             int targetAudioPrio = rule.audioPriority;
