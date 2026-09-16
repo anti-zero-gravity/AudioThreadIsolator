@@ -56,6 +56,8 @@ struct ProcessRule {
     bool isRunning = false;               // 現在稼働中か
     bool isAudioIsolated = false;         // オーディオスレッド検出・通常スレッド退避完了か
     bool hasIntruderThreads = false;      // オーディオ専有コアへの侵入・同居スレッドを検知・制圧中か
+    bool wasHalfAutoPromoted = false;     // Half-Isolated判定によるLowest(-2)への自動昇格が実行済みか
+    bool chromiumScanAttempted = false;   // Chromium起動時/Bypass復帰時のAudioService特定走査を試行済みか(未特定時はStandbyへ移行し毎秒走査を抑止)
 };
 
 
@@ -116,6 +118,9 @@ private:
 
     // Chromium モード: アフィニティ適用済み子プロセス PID セット (差分検出用)
     std::unordered_set<DWORD> m_chromiumMaskedPids;
+
+    // Chromium モード: コマンドライン走査済み子プロセス PID セット (毎秒総当たり走査防止)
+    std::unordered_set<DWORD> m_chromiumScannedPids;
 
     // Chromium Audio Service スレッド追従管理 (テスト仕様: 蓄積保持)
     struct ChromiumThreadTrackInfo {

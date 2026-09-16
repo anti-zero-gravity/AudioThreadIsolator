@@ -602,6 +602,44 @@ static void RemoveTrayIcon() {
     Shell_NotifyIconA(NIM_DELETE, &g_nid);
 }
 
+// --- affinity 表用サブクラスプロシージャ (表の内部スクロールを完全防止し常に先頭固定) ---
+static LRESULT CALLBACK AffinityTableSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_MOUSEWHEEL || msg == WM_VSCROLL || msg == WM_HSCROLL) {
+        return 0;
+    }
+    if (msg == LVM_SCROLL) {
+        return FALSE;
+    }
+    if (msg == LVM_ENSUREVISIBLE) {
+        return TRUE;
+    }
+    WNDPROC pfnOld = (WNDPROC)GetPropA(hWnd, "ATI_OrigTableProc");
+    if (msg == WM_NCDESTROY) {
+        RemovePropA(hWnd, "ATI_OrigTableProc");
+        if (pfnOld) {
+            SetWindowLongPtrA(hWnd, GWLP_WNDPROC, (LONG_PTR)pfnOld);
+            return CallWindowProcA(pfnOld, hWnd, msg, wParam, lParam);
+        }
+    }
+    if (pfnOld) {
+        LRESULT res = CallWindowProcA(pfnOld, hWnd, msg, wParam, lParam);
+        // クリックやフォーカス変化後に常に最上部(行0)へ戻す
+        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
+            CallWindowProcA(pfnOld, hWnd, LVM_SCROLL, 0, -9999);
+        }
+        return res;
+    }
+    return DefWindowProcA(hWnd, msg, wParam, lParam);
+}
+
+static void SubclassAffinityTable(HWND hList) {
+    if (!hList) return;
+    WNDPROC pfnOld = (WNDPROC)SetWindowLongPtrA(hList, GWLP_WNDPROC, (LONG_PTR)AffinityTableSubclassProc);
+    if (pfnOld) {
+        SetPropA(hList, "ATI_OrigTableProc", (HANDLE)pfnOld);
+    }
+}
+
 // --- 全体設定ダイアログ (ANSI - 表形式 + 右詰め入力欄 + リサイズ対応) ---
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     static ati::GlobalConfig s_tmpConfig;
@@ -657,6 +695,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
         if (hList) {
+            SubclassAffinityTable(hList);
             SendMessageA(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
             HWND hHeader = ListView_GetHeader(hList);
             if (hHeader) SendMessageA(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -692,6 +731,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             lvi.iItem = 1;
             lvi.pszText = const_cast<LPSTR>("Other than Audio");
             ListView_InsertItem(hList, &lvi);
+
+            ListView_Scroll(hList, 0, -9999);
         }
 
         // 入力ボックスの初期値設定
@@ -867,14 +908,23 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 LPNMITEMACTIVATE pia = reinterpret_cast<LPNMITEMACTIVATE>(lParam);
                 if (pia && pia->iItem >= 0 && pia->iSubItem >= 1 && pia->iSubItem <= coreCount) {
                     int logicalIdx = cores[pia->iSubItem - 1].logicalIndex;
+                    DWORD_PTR bit = (1ULL << logicalIdx);
                     if (pia->iItem == 0) {
-                        DWORD_PTR bit = (1ULL << logicalIdx);
+                        // 行 0: Default Audio Core
                         if (s_tmpConfig.defaultAudioAffinityMask & bit) {
+                            // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
                             if ((s_tmpConfig.defaultAudioAffinityMask & ~bit) != 0) {
                                 s_tmpConfig.defaultAudioAffinityMask &= ~bit;
                             }
                         } else {
-                            s_tmpConfig.defaultAudioAffinityMask |= bit;
+                            // チェックを入れる: 相互排他インターロック
+                            // Other than から外すが、Other than の最後の 1 個なら変更不可
+                            if ((s_tmpConfig.normalAffinityMask & bit) != 0 && (s_tmpConfig.normalAffinityMask & ~bit) == 0) {
+                                // Other than が空になってしまうため変更不可
+                            } else {
+                                s_tmpConfig.defaultAudioAffinityMask |= bit;
+                                s_tmpConfig.normalAffinityMask &= ~bit; // 相互排他
+                            }
                         }
                         int firstCore = 0;
                         for (int c = 0; c < 64; ++c) {
@@ -884,13 +934,37 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                         s_tmpConfig.defaultAudioCore = firstCore;
-                        SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, FormatMaskToCoreList(s_tmpConfig.defaultAudioAffinityMask).c_str());
                     } else if (pia->iItem == 1) {
-                        s_tmpConfig.normalAffinityMask ^= (1ULL << logicalIdx);
-                        char hexBuf[32];
-                        snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
-                        SetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf);
+                        // 行 1: Other than Audio
+                        if (s_tmpConfig.normalAffinityMask & bit) {
+                            // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
+                            if ((s_tmpConfig.normalAffinityMask & ~bit) != 0) {
+                                s_tmpConfig.normalAffinityMask &= ~bit;
+                            }
+                        } else {
+                            // チェックを入れる: 相互排他インターロック
+                            // Audio Core から外すが、Audio Core の最後の 1 個なら変更不可
+                            if ((s_tmpConfig.defaultAudioAffinityMask & bit) != 0 && (s_tmpConfig.defaultAudioAffinityMask & ~bit) == 0) {
+                                // Audio Core が空になってしまうため変更不可
+                            } else {
+                                s_tmpConfig.normalAffinityMask |= bit;
+                                s_tmpConfig.defaultAudioAffinityMask &= ~bit; // 相互排他
+                                int firstCore = 0;
+                                for (int c = 0; c < 64; ++c) {
+                                    if ((s_tmpConfig.defaultAudioAffinityMask & (1ULL << c)) != 0) {
+                                        firstCore = c;
+                                        break;
+                                    }
+                                }
+                                s_tmpConfig.defaultAudioCore = firstCore;
+                            }
+                        }
                     }
+                    SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, FormatMaskToCoreList(s_tmpConfig.defaultAudioAffinityMask).c_str());
+                    char hexBuf[32];
+                    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
+                    SetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf);
+
                     HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
                     InvalidateRect(hList, nullptr, FALSE);
                     return TRUE;
@@ -951,13 +1025,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             BOOL ok = FALSE;
             int poll = GetDlgItemInt(hDlg, IDC_EDIT_POLLING_MS, &ok, FALSE);
             if (ok && poll >= 100) s_tmpConfig.pollingIntervalMs = poll;
-
-            // Global settings change applies to all rules as new default
-            for (auto& r : s_tmpConfig.rules) {
-                r.audioCore = s_tmpConfig.defaultAudioCore;
-                r.audioAffinityMask = s_tmpConfig.defaultAudioAffinityMask;
-                r.audioPriority = s_tmpConfig.defaultAudioPriority;
-            }
 
             g_isolator.UpdateConfig(s_tmpConfig);
             SaveConfig(s_tmpConfig, g_iniPath);
@@ -1037,6 +1104,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
         if (hList) {
+            SubclassAffinityTable(hList);
             SendMessageA(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
             HWND hHeader = ListView_GetHeader(hList);
             if (hHeader) SendMessageA(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -1072,6 +1140,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             lvi.iItem = 1;
             lvi.pszText = const_cast<LPSTR>("Other than Audio");
             ListView_InsertItem(hList, &lvi);
+
+            ListView_Scroll(hList, 0, -9999);
         }
 
         if (s_editRule.audioAffinityMask == 0) {
@@ -1282,12 +1352,21 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                     int logicalIdx = cores[pia->iSubItem - 1].logicalIndex;
                     DWORD_PTR bit = (1ULL << logicalIdx);
                     if (pia->iItem == 0) {
+                        // 行 0: Audio Core
                         if (s_editRule.audioAffinityMask & bit) {
+                            // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
                             if ((s_editRule.audioAffinityMask & ~bit) != 0) {
                                 s_editRule.audioAffinityMask &= ~bit;
                             }
                         } else {
-                            s_editRule.audioAffinityMask |= bit;
+                            // チェックを入れる: 相互排他インターロック
+                            // Other than から外すが、Other than の最後の 1 個なら変更不可
+                            if ((s_editRule.normalAffinityMask & bit) != 0 && (s_editRule.normalAffinityMask & ~bit) == 0) {
+                                // Other than が空になってしまうため変更不可
+                            } else {
+                                s_editRule.audioAffinityMask |= bit;
+                                s_editRule.normalAffinityMask &= ~bit; // 相互排他
+                            }
                         }
                         int firstCore = 0;
                         for (int c = 0; c < 64; ++c) {
@@ -1297,17 +1376,37 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                         s_editRule.audioCore = firstCore;
-                        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, FormatMaskToCoreList(s_editRule.audioAffinityMask).c_str());
                     } else if (pia->iItem == 1) {
+                        // 行 1: Other than Audio
                         if (s_editRule.normalAffinityMask & bit) {
-                            s_editRule.normalAffinityMask &= ~bit;
+                            // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
+                            if ((s_editRule.normalAffinityMask & ~bit) != 0) {
+                                s_editRule.normalAffinityMask &= ~bit;
+                            }
                         } else {
-                            s_editRule.normalAffinityMask |= bit;
+                            // チェックを入れる: 相互排他インターロック
+                            // Audio Core から外すが、Audio Core の最後の 1 個なら変更不可
+                            if ((s_editRule.audioAffinityMask & bit) != 0 && (s_editRule.audioAffinityMask & ~bit) == 0) {
+                                // Audio Core が空になってしまうため変更不可
+                            } else {
+                                s_editRule.normalAffinityMask |= bit;
+                                s_editRule.audioAffinityMask &= ~bit; // 相互排他
+                                int firstCore = 0;
+                                for (int c = 0; c < 64; ++c) {
+                                    if ((s_editRule.audioAffinityMask & (1ULL << c)) != 0) {
+                                        firstCore = c;
+                                        break;
+                                    }
+                                }
+                                s_editRule.audioCore = firstCore;
+                            }
                         }
-                        char hexBuf[32] = { 0 };
-                        snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_editRule.normalAffinityMask));
-                        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, hexBuf);
                     }
+                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, FormatMaskToCoreList(s_editRule.audioAffinityMask).c_str());
+                    char hexBuf[32] = { 0 };
+                    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_editRule.normalAffinityMask));
+                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, hexBuf);
+
                     HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
                     InvalidateRect(hList, nullptr, FALSE);
                     return TRUE;
@@ -1354,6 +1453,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 int sel = static_cast<int>(SendMessageA(hCombo, CB_GETCURSEL, 0, 0));
                 if (sel != CB_ERR) {
                     s_editRule.audioPriority = static_cast<int>(SendMessageA(hCombo, CB_GETITEMDATA, sel, 0));
+                    s_editRule.wasHalfAutoPromoted = true; // ユーザー明示設定を保護
                 }
             }
 
@@ -1909,21 +2009,32 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             RECT rcLegendArea = { 0, rcList.bottom, legendRight, rcClient.bottom };
             FillRect(hdc, &rcLegendArea, GetSysColorBrush(COLOR_BTNFACE));
 
-            // 1行目: カラー凡例 3種 (左寄せ配置: 1: Half-Isolated, 2: Fully Isolated, 3: Standby / Scanning)
+            // 1行目: カラー凡例 4種 (左寄せ配置: 1: Half-Isolated, 2: Fully Isolated, 3: Standby / Scanning, 4: Sleeping (Restart))
             std::string txt1 = " Half-Isolated (Audio<-OtherThread)";
             std::string txt2 = " Fully Isolated";
             std::string txt3 = " Standby / Scanning";
-            SIZE sz1, sz2, sz3;
+            std::string txt4 = " Sleeping (Restart)";
+            SIZE sz1, sz2, sz3, sz4;
             GetTextExtentPoint32A(hdc, txt1.c_str(), static_cast<int>(txt1.length()), &sz1);
             GetTextExtentPoint32A(hdc, txt2.c_str(), static_cast<int>(txt2.length()), &sz2);
             GetTextExtentPoint32A(hdc, txt3.c_str(), static_cast<int>(txt3.length()), &sz3);
+            GetTextExtentPoint32A(hdc, txt4.c_str(), static_cast<int>(txt4.length()), &sz4);
             int spacing = static_cast<int>(12 * scale);
             int legendStartX = rcList.left + static_cast<int>(4 * scale);
 
             int dotY = startY + static_cast<int>(3 * scale);
 
-            // 1. 黄色ドット + テキスト (Half-Isolated: 消灯色固定)
-            COLORREF colHalf = RGB(216, 178, 76);
+            bool anyRunning = false;
+            auto rules = g_isolator.GetRulesSnapshot();
+            for (const auto& r : rules) {
+                if (r.isRunning) {
+                    anyRunning = true;
+                    break;
+                }
+            }
+
+            // 1. 黄色/青緑ドット + テキスト (Half-Isolated: リストプロセスが1つでも起動していれば無条件でパカパカ点滅、全停止時は鈍い黄色で静止)
+            COLORREF colHalf = (anyRunning && s_pulseTick) ? RGB(124, 224, 173) : RGB(216, 178, 76);
             HBRUSH brHalf = CreateSolidBrush(colHalf);
             HPEN penHalf = CreatePen(PS_SOLID, 1, colHalf);
             HGDIOBJ oldBrush = SelectObject(hdc, brHalf);
@@ -1949,8 +2060,20 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             Ellipse(hdc, x3, dotY, x3 + dotSize, dotY + dotSize);
             TextOutA(hdc, x3 + dotSize + 2, startY, txt3.c_str(), static_cast<int>(txt3.length()));
 
+            // 4. 薄紫/ピンクドット + テキスト (Sleeping: 再生＆リスタートのナッジ)
+            int x4 = x3 + dotSize + 2 + sz3.cx + spacing;
+            COLORREF colSleep = s_pulseTick ? RGB(255, 80, 120) : RGB(190, 160, 235);
+            HBRUSH brSleep = CreateSolidBrush(colSleep);
+            HPEN penSleep = CreatePen(PS_SOLID, 1, colSleep);
+            SelectObject(hdc, brSleep);
+            SelectObject(hdc, penSleep);
+            Ellipse(hdc, x4, dotY, x4 + dotSize, dotY + dotSize);
+            TextOutA(hdc, x4 + dotSize + 2, startY, txt4.c_str(), static_cast<int>(txt4.length()));
+
             SelectObject(hdc, oldPen);
             SelectObject(hdc, oldBrush);
+            DeleteObject(penSleep);
+            DeleteObject(brSleep);
             DeleteObject(penPink);
             DeleteObject(brPink);
             DeleteObject(penGreen);
@@ -1982,7 +2105,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             auto rules = g_isolator.GetRulesSnapshot();
             bool anyRunning = false;
             for (const auto& r : rules) {
-                if (r.activePid != 0) {
+                if (r.isRunning) {
                     anyRunning = true;
                     break;
                 }
@@ -2334,6 +2457,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                         // 通常の隔離完了: 青緑 #7CE0AD (Fully Isolated)
                                         col = s_pulseTick ? RGB(124, 224, 173) : RGB(111, 201, 155);
                                     }
+                                } else if (r.detectedThreadName == "sleeping...") {
+                                    // スリープ休眠中 (再生＆リスタートのナッジ): 薄紫と (255, 80, 120) でパカパカ点滅
+                                    col = s_pulseTick ? RGB(255, 80, 120) : RGB(190, 160, 235);
                                 } else {
                                     // 未特定 (Standby / Scanning): コーラルピンク #E09B97
                                     col = s_pulseTick ? RGB(224, 155, 151) : RGB(201, 139, 135);

@@ -45,7 +45,6 @@ BEGIN
 END
 
 // Global Settings Dialog
-// Global Settings Dialog
 IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 152
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
 CAPTION "Global Settings"
@@ -53,7 +52,7 @@ FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_SETTINGS_CORES, "SysListView32",
                     LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
-                    12, 10, 256, 26
+                    12, 10, 256, 28
 
     LTEXT           "Default Audio Core(s) (#, ...):", -1, 14, 48, 140, 10
     EDITTEXT        IDC_EDIT_AUDIO_CORE, 232, 46, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
@@ -83,7 +82,7 @@ BEGIN
 
     CONTROL         "", IDC_LIST_RULE_CORES, "SysListView32",
                     LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
-                    12, 24, 256, 26
+                    12, 22, 256, 28
 
     LTEXT           "Audio Core(s) (#, ...):", -1, 14, 58, 140, 10
     EDITTEXT        IDC_EDIT_RULE_CORE, 232, 56, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
