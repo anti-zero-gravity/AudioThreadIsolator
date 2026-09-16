@@ -2283,6 +2283,15 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                     plvcd->clrTextBk = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHT) : rowBkCol;
                     plvcd->clrText = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(0, 0, 0);
 
+                    if (plvcd->iSubItem == 4) {
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (row >= 0 && row < static_cast<int>(rules.size())) {
+                            if (rules[row].detectedThreadName == ">9999") {
+                                plvcd->clrText = RGB(220, 50, 50);
+                            }
+                        }
+                    }
+
                     if (plvcd->iSubItem == 0) {
                         auto rules = g_isolator.GetRulesSnapshot();
                         if (row >= 0 && row < static_cast<int>(rules.size())) {

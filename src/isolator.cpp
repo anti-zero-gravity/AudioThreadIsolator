@@ -558,6 +558,8 @@ void ThreadIsolator::Initialize(const GlobalConfig &config) {
   m_appliedThreads.clear();
   m_prevThreadCpuTimes.clear();
   m_samplingStates.clear();
+  m_chromiumThreadTracks.clear();
+  m_chromiumEvictedPids.clear();
 }
 
 void ThreadIsolator::UpdateConfig(const GlobalConfig &config) {
@@ -566,6 +568,8 @@ void ThreadIsolator::UpdateConfig(const GlobalConfig &config) {
   m_appliedThreads.clear();
   m_prevThreadCpuTimes.clear();
   m_samplingStates.clear();
+  m_chromiumThreadTracks.clear();
+  m_chromiumEvictedPids.clear();
 }
 
 GlobalConfig ThreadIsolator::GetConfig() {
@@ -627,6 +631,10 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
   if (index < m_config.rules.size()) {
     auto &rule = m_config.rules[index];
     rule.isBypassed = !rule.isBypassed;
+    rule.audioServicePid = 0;
+    m_chromiumMaskedPids.clear();
+    m_chromiumEvictedPids.clear();
+    m_chromiumThreadTracks.clear();
     if (rule.isBypassed) {
       if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
         HANDLE hThread =
@@ -1151,6 +1159,8 @@ bool ThreadIsolator::ScanAndIsolate() {
           audioServicePid = 0;
           rule.audioServicePid = 0;
           m_chromiumMaskedPids.erase(audioServicePid);
+          m_chromiumEvictedPids.erase(audioServicePid);
+          m_chromiumThreadTracks.erase(audioServicePid);
           LogDebug("Chromium AudioService PID expired, will re-scan");
         }
       }
@@ -1168,6 +1178,8 @@ bool ThreadIsolator::ScanAndIsolate() {
           if (cmdLine.find("audio.mojom.AudioService") != std::string::npos) {
             audioServicePid = pid;
             rule.audioServicePid = pid;
+            m_chromiumEvictedPids.erase(pid);
+            m_chromiumThreadTracks.erase(pid);
             char asLog[128];
             snprintf(asLog, sizeof(asLog),
                      "Chromium AudioService found: PID=%lu", pid);
@@ -1213,7 +1225,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         continue;
       }
 
-      // Audio Service プロセスのスレッドを走査 (軽量: 通常3スレッド程度)
+      // Audio Service プロセスのスレッドを走査
       auto ptIt = processThreads.find(audioServicePid);
       if (ptIt == processThreads.end() || ptIt->second.empty())
         continue;
@@ -1233,63 +1245,83 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
 
       totalThreadCount = static_cast<int>(ptIt->second.size());
+      auto &tracks = m_chromiumThreadTracks[audioServicePid];
 
-      // スレッド名およびコールスタックシグネチャでオーディオスレッドを特定
-      DWORD bestTid = 0;
-
-      // 永続トラッキングから事前解決
-      {
-        auto trackIt = m_trackedAudioThreads.find(audioServicePid);
-        if (trackIt != m_trackedAudioThreads.end() &&
-            !trackIt->second.empty()) {
-          bestTid = trackIt->second.begin()->first;
-          primaryAudioThreadName = trackIt->second.begin()->second;
+      // 手順 1: 初回一括退避 (未退避なら全スレッドを normalMask へ退避しフラグ 0 で登録)
+      if (m_chromiumEvictedPids.find(audioServicePid) == m_chromiumEvictedPids.end()) {
+        for (const auto &te : ptIt->second) {
+          HANDLE hThread = OpenThread(
+              THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+          if (hThread) {
+            SetThreadAffinityMask(hThread, normalMask);
+            ULONG64 cycle = 0;
+            QueryThreadCycleTime(hThread, &cycle);
+            tracks[te.th32ThreadID].flag = 0;
+            tracks[te.th32ThreadID].lastCycles = cycle;
+            CloseHandle(hThread);
+          }
         }
+        m_chromiumEvictedPids.insert(audioServicePid);
+        char eLog[128];
+        snprintf(eLog, sizeof(eLog), "Chromium AudioService initial eviction done: PID=%lu, threads=%zu",
+                 audioServicePid, ptIt->second.size());
+        LogDebug(eLog);
       }
 
-      struct AsThreadInfo {
-        DWORD tid;
-        HANDLE hThread;
-      };
-      std::vector<AsThreadInfo> asThreads;
+      // 手順 2 & 3: 毎ポーリング Delta 計測 & フラグ検査 & 4KB スタック走査
+      // しきい値: 10,000,000 delta / 1000ms
+      ULONG64 interval = (m_config.pollingIntervalMs > 0) ? static_cast<ULONG64>(m_config.pollingIntervalMs) : 1000ULL;
+      ULONG64 deltaThreshold = 10000000ULL * interval / 1000ULL;
+
+      int activeAudioCount = 0;
+      DWORD lastAudioTid = 0;
 
       for (const auto &te : ptIt->second) {
-        HANDLE hThread =
-            OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
-                       te.th32ThreadID);
+        HANDLE hThread = OpenThread(
+            THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
         if (!hThread)
           continue;
-        asThreads.push_back({te.th32ThreadID, hThread});
 
-        // スレッド名チェック (wasapi_render_thread 等)
-        std::string tName = QueryThreadNameA(hThread);
-        if (tName.empty()) {
-          tName = QueryCallstackAudioSignature(hAsProc, hThread);
-        }
-        int rank = GetAudioThreadRank(tName);
-        if (rank > 0 && bestTid == 0) {
-          bestTid = te.th32ThreadID;
-          primaryAudioThreadName = tName;
-          m_trackedAudioThreads[audioServicePid].clear();
-          m_trackedAudioThreads[audioServicePid][bestTid] =
-              primaryAudioThreadName;
-        }
-      }
+        auto &tInfo = tracks[te.th32ThreadID];
+        ULONG64 curCycles = 0;
+        if (QueryThreadCycleTime(hThread, &curCycles)) {
+          ULONG64 delta = 0;
+          if (tInfo.lastCycles > 0 && curCycles >= tInfo.lastCycles) {
+            delta = curCycles - tInfo.lastCycles;
+          }
+          tInfo.lastCycles = curCycles;
 
-      // アフィニティ・優先度の適用
-      for (const auto &at : asThreads) {
-        if (at.tid == bestTid) {
-          SetThreadAffinityMask(at.hThread, audioMask);
-          SetThreadPriority(at.hThread, rule.audioPriority);
-          SetThreadIdealProcessor(at.hThread,
-                                  static_cast<DWORD>(rule.audioCore));
-          audioDetectedInAny = true;
-          primaryAudioPid = audioServicePid;
-          primaryAudioTid = bestTid;
+          // しきい値以上の活動かつ未検査 (flag == 0) の場合、4KB スタックを検査
+          if (delta >= deltaThreshold) {
+            if (tInfo.flag == 0) {
+              std::string sig = QueryCallstackAudioSignature(hAsProc, hThread);
+              if (sig.find("WASAPI") != std::string::npos || sig.find("audioses") != std::string::npos) {
+                tInfo.flag = 2; // オーディオ確定
+                char aLog[128];
+                snprintf(aLog, sizeof(aLog), "Chromium WASAPI thread identified: TID=%lu, delta=%llu",
+                         te.th32ThreadID, delta);
+                LogDebug(aLog);
+              } else {
+                tInfo.flag = 1; // 非オーディオ確定
+              }
+            }
+          }
+        }
+
+        // フラグに応じたアフィニティ制御
+        if (tInfo.flag == 2) {
+          // オーディオ確定スレッド: アフィニティ・優先度・IdealProcessor を適用 (奪わない)
+          SetThreadAffinityMask(hThread, audioMask);
+          SetThreadPriority(hThread, rule.audioPriority);
+          SetThreadIdealProcessor(hThread, static_cast<DWORD>(rule.audioCore));
+          activeAudioCount++;
+          lastAudioTid = te.th32ThreadID;
         } else {
-          SetThreadAffinityMask(at.hThread, normalMask);
+          // 非オーディオまたは未検査: 通常コア
+          SetThreadAffinityMask(hThread, normalMask);
         }
-        CloseHandle(at.hThread);
+
+        CloseHandle(hThread);
       }
 
       CloseHandle(hAsProc);
@@ -1311,22 +1343,30 @@ bool ThreadIsolator::ScanAndIsolate() {
         CloseHandle(hProc);
       }
 
-      // 状態更新
-      if (audioDetectedInAny) {
+      // 状態更新 & テスト実装のカラム表示判定
+      size_t totalTrackedCount = tracks.size();
+      if (totalTrackedCount > 9999) {
+        if (rule.detectedThreadName != ">9999") {
+          rule.detectedThreadName = ">9999";
+          stateChanged = true;
+        }
+        rule.isAudioIsolated = (activeAudioCount > 0);
+      } else if (activeAudioCount > 0) {
         if (!rule.isAudioIsolated) {
           rule.isAudioIsolated = true;
           stateChanged = true;
         }
-        if (rule.activePid != primaryAudioPid) {
-          rule.activePid = primaryAudioPid;
+        if (rule.activePid != audioServicePid) {
+          rule.activePid = audioServicePid;
           stateChanged = true;
         }
-        if (rule.activeAudioTid != primaryAudioTid) {
-          rule.activeAudioTid = primaryAudioTid;
+        if (rule.activeAudioTid != lastAudioTid) {
+          rule.activeAudioTid = lastAudioTid;
           stateChanged = true;
         }
-        if (rule.detectedThreadName != primaryAudioThreadName) {
-          rule.detectedThreadName = primaryAudioThreadName;
+        std::string label = "WASAPI (audioses.dll)";
+        if (rule.detectedThreadName != label) {
+          rule.detectedThreadName = label;
           stateChanged = true;
         }
       } else {
@@ -1339,6 +1379,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           stateChanged = true;
         }
       }
+
       if (rule.currentThreadCount != totalThreadCount) {
         rule.currentThreadCount = totalThreadCount;
         stateChanged = true;

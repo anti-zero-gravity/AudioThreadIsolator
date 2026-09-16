@@ -117,6 +117,14 @@ private:
     // Chromium モード: アフィニティ適用済み子プロセス PID セット (差分検出用)
     std::unordered_set<DWORD> m_chromiumMaskedPids;
 
+    // Chromium Audio Service スレッド追従管理 (テスト仕様: 蓄積保持)
+    struct ChromiumThreadTrackInfo {
+        uint8_t flag = 0; // 0: 未検査, 1: 非オーディオ, 2: オーディオ (WASAPI確定)
+        ULONG64 lastCycles = 0;
+    };
+    std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>> m_chromiumThreadTracks;
+    std::unordered_set<DWORD> m_chromiumEvictedPids;
+
     // 永続オーディオスレッドトラッキング (キー: PID, 値: (キー: TID, 値: スレッド表示名))
     std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>> m_trackedAudioThreads;
 
