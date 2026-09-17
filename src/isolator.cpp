@@ -164,56 +164,6 @@ static std::string QueryFmodOrUnityThreadName(HANDLE hProcess, HANDLE hThread) {
   return "";
 }
 
-static int GetAudioThreadRank(const std::string &threadName) {
-  if (threadName.empty())
-    return 0;
-  std::string lower = ToLowerA(threadName);
-
-  // 除外対象 (ユーティリティ、メインループ、I/O ファイルスレッド、監視系)
-  if (lower.find("utility") != std::string::npos ||
-      lower.find("main") != std::string::npos ||
-      lower.find("watchdog") != std::string::npos ||
-      lower.find("file thread") != std::string::npos) {
-    return 0;
-  }
-
-  // 最優先帯: Feeder, WASAPI, ASIO, Playback Thread (DAC 出力最前線)
-  if (lower.find("feeder") != std::string::npos)
-    return 100;
-  if (lower.find("wasapi") != std::string::npos)
-    return 95; // wasapi_render_thread, WASAPI Exclusive Worker, ao/wasapi,
-               // WASAPI (Godot)
-  if (lower == "ao")
-    return 92;
-  if (lower.find("asio") != std::string::npos)
-    return 90;
-  if (lower.find("playback") != std::string::npos &&
-      lower.find("decod") == std::string::npos)
-    return 85; // Fb2k Playback Thread
-  if (lower.find("audiooutputdevice") != std::string::npos)
-    return 80;
-
-  // 一般オーディオスレッド名
-  if (lower.find("audiothread") != std::string::npos ||
-      lower.find("craudio") != std::string::npos)
-    return 65;
-  if (lower.find("mixer") != std::string::npos)
-    return 50;
-  if (lower.find("audio") != std::string::npos ||
-      lower.find("playback") != std::string::npos ||
-      lower.find("sound") != std::string::npos)
-    return 40;
-  if (lower.find("decod") != std::string::npos)
-    return 35;
-
-  // ゲーム系 (FMOD stream 等)
-  if (lower.find("stream") != std::string::npos)
-    return 20;
-  if (lower.find("fmod") != std::string::npos)
-    return 10;
-
-  return 0;
-}
 
 typedef DWORD(WINAPI *pfnGetMappedFileNameA)(HANDLE, LPVOID, LPSTR, DWORD);
 static pfnGetMappedFileNameA s_pfnGetMappedFileNameA = nullptr;
@@ -544,15 +494,7 @@ std::string ThreadIsolator::QueryProcessCommandLine(HANDLE hProcess) {
   return result;
 }
 
-ThreadIsolator::ThreadIsolator()
-
-    : m_pfnGetThreadDescription(nullptr) {
-  HMODULE hKernel32 = GetModuleHandleA("kernel32.dll");
-  if (hKernel32) {
-    m_pfnGetThreadDescription = reinterpret_cast<PFN_GetThreadDescription>(
-        GetProcAddress(hKernel32, "GetThreadDescription"));
-  }
-}
+ThreadIsolator::ThreadIsolator() {}
 
 ThreadIsolator::~ThreadIsolator() { ResumeAllSuspendedThreads(); }
 
@@ -902,30 +844,6 @@ DWORD_PTR ThreadIsolator::MakeDefaultNormalMask(int coreCount,
   return normal ? normal : full;
 }
 
-std::string ThreadIsolator::QueryThreadNameA(HANDLE hThread) {
-  if (!m_pfnGetThreadDescription)
-    return "";
-
-  PWSTR pDesc = nullptr;
-  HRESULT hr = m_pfnGetThreadDescription(hThread, &pDesc);
-  if (SUCCEEDED(hr) && pDesc) {
-    int len =
-        WideCharToMultiByte(CP_ACP, 0, pDesc, -1, nullptr, 0, nullptr, nullptr);
-    std::string result;
-    if (len > 0) {
-      result.resize(len - 1);
-      WideCharToMultiByte(CP_ACP, 0, pDesc, -1, &result[0], len, nullptr,
-                          nullptr);
-    }
-    LocalFree(pDesc);
-    return result;
-  }
-  return "";
-}
-
-bool ThreadIsolator::IsNamedAudioThread(const std::string &threadName) {
-  return GetAudioThreadRank(threadName) > 0;
-}
 
 bool ThreadIsolator::ScanAndIsolate() {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -1419,7 +1337,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           rule.activeAudioTid = lastAudioTid;
           stateChanged = true;
         }
-        std::string label = "WASAPI (audioses.dll)";
+        std::string label = "PID " + std::to_string(audioServicePid) + " / TID " + std::to_string(lastAudioTid);
         if (rule.detectedThreadName != label) {
           rule.detectedThreadName = label;
           stateChanged = true;
@@ -1546,27 +1464,11 @@ bool ThreadIsolator::ScanAndIsolate() {
         if (!hThread)
           continue;
 
-        std::string threadName = "";
-        if (identifiedAudioTid != 0) {
-          // オーディオスレッド確定済み: 確定スレッド以外の通常スレッドに対する毎秒の名前取得(GetThreadDescription)をスキップ
-          if (te.th32ThreadID == identifiedAudioTid) {
-            threadName = !identifiedAudioLabel.empty() ? identifiedAudioLabel : QueryThreadNameA(hThread);
-          }
-        } else {
-          // 未確定時のみ名前を取得して探索
-          threadName = QueryThreadNameA(hThread);
-          if (threadName.empty()) {
-            threadName = QueryFmodOrUnityThreadName(hProcess, hThread);
-          }
-          if (threadName.empty()) {
-            threadName = QueryCallstackAudioSignature(hProcess, hThread);
-          }
-        }
         int priority = GetThreadPriority(hThread);
         DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
 
         threadInfos.push_back({te.th32ThreadID, te.tpBasePri, priority,
-                               threadName, hThread, currentAff});
+                               "", hThread, currentAff});
 
         // (A) 永続トラッキングチェック
         auto trackPidIt = m_trackedAudioThreads.find(pid);
@@ -1575,10 +1477,6 @@ bool ThreadIsolator::ScanAndIsolate() {
           if (tIt != trackPidIt->second.end()) {
             identifiedAudioTid = te.th32ThreadID;
             identifiedAudioLabel = tIt->second;
-            if (!threadName.empty() && identifiedAudioLabel != threadName) {
-              identifiedAudioLabel = threadName;
-              trackPidIt->second[te.th32ThreadID] = identifiedAudioLabel;
-            }
           }
         }
       }
@@ -1590,12 +1488,12 @@ bool ThreadIsolator::ScanAndIsolate() {
         for (const auto &ti : threadInfos) {
           if (ti.tid == mainThreadTid)
             continue; // メインスレッドは除外
-          if (ti.threadName.empty() && ti.priority == rule.audioPriority) {
+          if (ti.priority == rule.audioPriority) {
             DWORD_PTR currentAff = QueryThreadAffinityMask(ti.hThread);
             if (currentAff == audioMask) {
               identifiedAudioTid = ti.tid;
               identifiedAudioLabel =
-                  "Audio (TID: " + std::to_string(identifiedAudioTid) + ")";
+                  "PID " + std::to_string(pid) + " / TID " + std::to_string(identifiedAudioTid);
               m_trackedAudioThreads[pid][identifiedAudioTid] =
                   identifiedAudioLabel;
               char aLog[128];
@@ -1730,20 +1628,8 @@ bool ThreadIsolator::ScanAndIsolate() {
             } else {
               // 確定！
               identifiedAudioTid = cand1;
-              std::string candLabel = "";
-              for (const auto &ti : threadInfos) {
-                if (ti.tid == cand1) {
-                  if (!ti.threadName.empty()) {
-                    candLabel = ti.threadName;
-                  }
-                  break;
-                }
-              }
-              if (candLabel.empty()) {
-                candLabel =
-                    "Audio (TID: " + std::to_string(identifiedAudioTid) + ")";
-              }
-              identifiedAudioLabel = candLabel;
+              identifiedAudioLabel =
+                  "PID " + std::to_string(pid) + " / TID " + std::to_string(identifiedAudioTid);
               m_trackedAudioThreads[pid][identifiedAudioTid] =
                   identifiedAudioLabel;
               char hLog[128];
@@ -1853,8 +1739,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           if (ti.tid == identifiedAudioTid) {
             audioDetectedInAny = true;
             if (primaryAudioThreadName.empty()) {
-              primaryAudioThreadName =
-                  !ti.threadName.empty() ? ti.threadName : identifiedAudioLabel;
+              primaryAudioThreadName = identifiedAudioLabel;
               primaryAudioPid = pid;
               primaryAudioTid = ti.tid;
             }

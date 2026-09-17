@@ -501,7 +501,7 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
         std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
         ListView_SetItemText(hList, static_cast<int>(i), 3, const_cast<LPSTR>(otherThanStr.c_str()));
 
-        // 4: Audio Thread (カッコなし)
+        // 4: Audio Core PID/TID
         std::string thName = r.detectedThreadName.empty() 
             ? (r.isRunning ? "Scanning..." : "Not running") 
             : r.detectedThreadName;
@@ -561,7 +561,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
         std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 3, otherThanStr);
 
-        // 4: Audio Thread (カッコなし)
+        // 4: Audio Core PID/TID
         std::string thName = r.detectedThreadName.empty() 
             ? (r.isRunning ? "Scanning..." : "Not running") 
             : r.detectedThreadName;
@@ -1737,11 +1737,11 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         lvc.pszText = const_cast<LPSTR>("Other than");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // 4: Audio Thread
-        lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = static_cast<int>(125 * scale);
+        // 4: Audio Core PID/TID
+        lvc.fmt = LVCFMT_CENTER;
+        lvc.cx = static_cast<int>(135 * scale);
         lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Audio Thread");
+        lvc.pszText = const_cast<LPSTR>("Audio Core PID/TID");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
         // 5: Pause / Verify (一時停止・検証チェックボックス: テキストはCustomHeaderProcで⏸描画)

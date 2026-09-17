@@ -152,12 +152,6 @@ private:
     std::unordered_map<DWORD, std::vector<DWORD>> m_cachedProcessTids;
     std::unordered_map<DWORD, int> m_lastProcessThreadCount;
 
-    // GetThreadDescription 関数ポインタ
-    typedef HRESULT(WINAPI* PFN_GetThreadDescription)(HANDLE, PWSTR*);
-    PFN_GetThreadDescription m_pfnGetThreadDescription;
-
-    std::string QueryThreadNameA(HANDLE hThread);
-    bool IsNamedAudioThread(const std::string& threadName);
 
 public:
     // ヒューリスティック探索中 (500ms タイマー要求中) かどうか判定
