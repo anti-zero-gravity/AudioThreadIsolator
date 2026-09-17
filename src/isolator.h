@@ -124,10 +124,15 @@ private:
 
     // Chromium Audio Service スレッド追従管理 (テスト仕様: 蓄積保持)
     struct ChromiumThreadTrackInfo {
-        uint8_t flag = 0; // 0: 未検査, 1: 非オーディオ, 2: オーディオ (WASAPI確定)
+        uint8_t flag = 0; // 0: 未検査, 1: 非オーディオ, 2: オーディオ (確定)
         ULONG64 lastCycles = 0;
     };
+    struct ChromiumAudioState {
+        bool initialEvaluated = false;
+        int sampleTurns = 0; // 500ms 単位 (4ターン = 2000ms で初回差分判定)
+    };
     std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>> m_chromiumThreadTracks;
+    std::unordered_map<DWORD, ChromiumAudioState> m_chromiumAudioStates;
     std::unordered_set<DWORD> m_chromiumEvictedPids;
 
     // 永続オーディオスレッドトラッキング (キー: PID, 値: (キー: TID, 値: スレッド表示名))
