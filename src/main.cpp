@@ -1580,7 +1580,13 @@ static WNDPROC s_pfnOriginalListProc = nullptr;
 
 static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_ERASEBKGND) {
-        return 1; // 背景消去メッセージによるクリアをスキップし、LVS_EX_DOUBLEBUFFER に一任
+        // リサイズ時や露出時にアイテム未存在の余白領域を白(COLOR_WINDOW)で確実に消去し、
+        // リサイズ前の古い凡例等の残像・透け込みを防止する
+        HDC hdc = reinterpret_cast<HDC>(wParam);
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+        FillRect(hdc, &rcClient, GetSysColorBrush(COLOR_WINDOW));
+        return 1;
     }
     if (msg == WM_LBUTTONDOWN) {
         LVHITTESTINFO lvhti = { 0 };
@@ -1916,6 +1922,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             if (listW < 100) listW = 100;
             if (listH < 100) listH = 100;
             SetWindowPos(hList, nullptr, rcList.left, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
+            InvalidateRect(hList, nullptr, TRUE);
         }
 
         auto MoveRight = [&](int ctrlId) {

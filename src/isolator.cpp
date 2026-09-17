@@ -1546,12 +1546,21 @@ bool ThreadIsolator::ScanAndIsolate() {
         if (!hThread)
           continue;
 
-        std::string threadName = QueryThreadNameA(hThread);
-        if (threadName.empty() && identifiedAudioTid == 0) {
-          threadName = QueryFmodOrUnityThreadName(hProcess, hThread);
-        }
-        if (threadName.empty() && identifiedAudioTid == 0) {
-          threadName = QueryCallstackAudioSignature(hProcess, hThread);
+        std::string threadName = "";
+        if (identifiedAudioTid != 0) {
+          // オーディオスレッド確定済み: 確定スレッド以外の通常スレッドに対する毎秒の名前取得(GetThreadDescription)をスキップ
+          if (te.th32ThreadID == identifiedAudioTid) {
+            threadName = !identifiedAudioLabel.empty() ? identifiedAudioLabel : QueryThreadNameA(hThread);
+          }
+        } else {
+          // 未確定時のみ名前を取得して探索
+          threadName = QueryThreadNameA(hThread);
+          if (threadName.empty()) {
+            threadName = QueryFmodOrUnityThreadName(hProcess, hThread);
+          }
+          if (threadName.empty()) {
+            threadName = QueryCallstackAudioSignature(hProcess, hThread);
+          }
         }
         int priority = GetThreadPriority(hThread);
         DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
@@ -1778,47 +1787,41 @@ bool ThreadIsolator::ScanAndIsolate() {
           bool isSpecificToAudio = ((ti.currentAffinity & ~audioMask) == 0);
           bool wasPreviouslyEvacuated =
               (m_appliedThreads.find(ti.tid) != m_appliedThreads.end());
-          char dbgBuf[256];
-          snprintf(dbgBuf, sizeof(dbgBuf),
-                   "IntruderCheck: PID=%lu, TID=%lu, aff=0x%llX, "
-                   "audioMask=0x%llX, specific=%d, evac=%d",
-                   pid, ti.tid, (unsigned long long)ti.currentAffinity,
-                   (unsigned long long)audioMask, isSpecificToAudio,
-                   wasPreviouslyEvacuated);
-          LogDebug(dbgBuf);
           if (isSpecificToAudio || wasPreviouslyEvacuated) {
             intruderTids.push_back(ti.tid);
+            char dbgBuf[256];
+            snprintf(dbgBuf, sizeof(dbgBuf),
+                     "IntruderCheck: PID=%lu, TID=%lu, aff=0x%llX, "
+                     "audioMask=0x%llX, specific=%d, evac=%d",
+                     pid, ti.tid, (unsigned long long)ti.currentAffinity,
+                     (unsigned long long)audioMask, isSpecificToAudio,
+                     wasPreviouslyEvacuated);
+            LogDebug(dbgBuf);
           }
         }
 
-        // 通常スレッドの Ideal Processor を通常コアに設定
-        DWORD normalIdeal = 0;
-        for (int c = 0; c < coreCount; ++c) {
-          if ((normalMask & (1ULL << c)) != 0) {
-            normalIdeal = static_cast<DWORD>(c);
-            if ((ti.tid % coreCount) <= static_cast<DWORD>(c))
-              break;
-          }
-        }
-        SetThreadIdealProcessor(ti.hThread, normalIdeal);
-
-        // 通常コア群 (effectiveNormal) へ退避
-        DWORD_PTR prevMask = SetThreadAffinityMask(ti.hThread, effectiveNormal);
-        if (prevMask != 0) {
-          m_appliedThreads[ti.tid] = effectiveNormal;
-          if (prevMask != effectiveNormal) {
-            stateChanged = true;
+        // 通常コア群 (effectiveNormal) へ退避 (差分適用: すでに一致している場合はシステムコールをスキップ)
+        // ※ 通常スレッドに対する SetThreadIdealProcessor は廃止し、Windows 標準スケジューラの動的負荷分散に一任
+        if (ti.currentAffinity != effectiveNormal) {
+          DWORD_PTR prevMask = SetThreadAffinityMask(ti.hThread, effectiveNormal);
+          if (prevMask != 0) {
+            m_appliedThreads[ti.tid] = effectiveNormal;
+            if (prevMask != effectiveNormal) {
+              stateChanged = true;
+            }
           }
         }
       }
 
       bool hasIntruders = !intruderTids.empty();
       rule.hasIntruderThreads = hasIntruders;
-      char hLog[128];
-      snprintf(hLog, sizeof(hLog),
-               "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d", pid,
-               intruderTids.size(), hasIntruders);
-      LogDebug(hLog);
+      if (hasIntruders) {
+        char hLog[128];
+        snprintf(hLog, sizeof(hLog),
+                 "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d", pid,
+                 intruderTids.size(), hasIntruders);
+        LogDebug(hLog);
+      }
 
       // Half判定時の自動昇格 (プロセス起動時、Bypass復帰時、スレッド再特定時など):
       // 設定が Idle (-15) だったならば、Lowest (-2) に自動昇格
