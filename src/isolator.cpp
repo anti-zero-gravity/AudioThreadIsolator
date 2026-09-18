@@ -4,6 +4,8 @@
 #include "isolator.h"
 #include <algorithm>
 #include <cctype>
+#include <cmath>
+#include <cstdint>
 #include <map>
 #include <regex>
 #include <set>
@@ -18,6 +20,15 @@ static std::string ToLowerA(std::string str) {
     return static_cast<char>(std::tolower(c));
   });
   return str;
+}
+
+static ULONG64 CalculateDeltaThreshold(double ruleDelta, double globalDelta, int intervalMs) {
+  double d = (ruleDelta > 0.0) ? ruleDelta : globalDelta;
+  if (d <= 0.0) d = 5.0;
+  d = std::ceil(d * 10.0) / 10.0;
+  ULONG64 base = static_cast<ULONG64>(d * 1000000.0);
+  if (intervalMs <= 0) return base;
+  return (base * static_cast<ULONG64>(intervalMs)) / 1000ULL;
 }
 
 typedef LONG NTSTATUS;
@@ -299,24 +310,40 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
     return "";
   }
 
-  // 64bit Windows: TEB + 0x08 is StackBase, TEB + 0x10 is StackLimit
+  BOOL isWow64 = FALSE;
+  IsWow64Process(hProcess, &isWow64);
+
   DWORD_PTR stackBase = 0;
   DWORD_PTR stackLimit = 0;
   SIZE_T bytesRead = 0;
-  if (!ReadProcessMemory(
-          hProcess,
-          reinterpret_cast<LPCVOID>(
-              reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 8),
-          &stackBase, sizeof(stackBase), &bytesRead) ||
-      bytesRead != sizeof(stackBase)) {
-    return "";
-  }
-  ReadProcessMemory(hProcess,
-                    reinterpret_cast<LPCVOID>(
-                        reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 16),
-                    &stackLimit, sizeof(stackLimit), &bytesRead);
 
-  if (stackBase < 0x10000)
+  if (isWow64) {
+    // WOW64 (32bit on 64bit Windows): TEB32 is TEB64 + 0x2000, StackBase is TEB32 + 4
+    uintptr_t teb32 = reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 0x2000;
+    uint32_t base32 = 0;
+    uint32_t limit32 = 0;
+    if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(teb32 + 4), &base32, sizeof(base32), &bytesRead) && bytesRead == sizeof(base32)) {
+      stackBase = base32;
+    }
+    if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(teb32 + 8), &limit32, sizeof(limit32), &bytesRead) && bytesRead == sizeof(limit32)) {
+      stackLimit = limit32;
+    }
+  } else {
+    // 64bit Windows: TEB + 0x08 is StackBase, TEB + 0x10 is StackLimit
+    if (ReadProcessMemory(
+            hProcess,
+            reinterpret_cast<LPCVOID>(
+                reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 8),
+            &stackBase, sizeof(stackBase), &bytesRead) &&
+        bytesRead == sizeof(stackBase)) {
+      ReadProcessMemory(hProcess,
+                        reinterpret_cast<LPCVOID>(
+                            reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 16),
+                        &stackLimit, sizeof(stackLimit), &bytesRead);
+    }
+  }
+
+  if (stackBase < 0x1000)
     return "";
 
   // スタック領域を走査 (直近のアクティブなフレーム群を含む最大 32KB を走査)
@@ -338,17 +365,31 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
     return "";
   }
 
-  size_t u64Count = bytesRead / sizeof(DWORD_PTR);
-  const DWORD_PTR *ptrs = reinterpret_cast<const DWORD_PTR *>(stackBuf.data());
+  std::vector<DWORD_PTR> ptrs;
+  if (isWow64) {
+    size_t count32 = bytesRead / sizeof(uint32_t);
+    const uint32_t *p32 = reinterpret_cast<const uint32_t *>(stackBuf.data());
+    for (size_t i = 0; i < count32; ++i) {
+      if (p32[i] >= 0x10000 && p32[i] <= 0xFFFFFFFF) {
+        ptrs.push_back(p32[i]);
+      }
+    }
+  } else {
+    size_t count64 = bytesRead / sizeof(DWORD_PTR);
+    const DWORD_PTR *p64 = reinterpret_cast<const DWORD_PTR *>(stackBuf.data());
+    for (size_t i = 0; i < count64; ++i) {
+      if (p64[i] >= 0x10000 && p64[i] <= 0x7FFFFFFFFFFFULL) {
+        ptrs.push_back(p64[i]);
+      }
+    }
+  }
 
   // モジュール名解決キャッシュ (同一 AllocationBase に対する API
   // 呼び出しの重複を防ぐ)
   std::unordered_map<DWORD_PTR, std::string> modNameCache;
 
-  for (size_t i = 0; i < u64Count; ++i) {
+  for (size_t i = 0; i < ptrs.size(); ++i) {
     DWORD_PTR p = ptrs[i];
-    if (p < 0x100000 || p > 0x7FFFFFFFFFFFULL)
-      continue;
 
     MEMORY_BASIC_INFORMATION mbi = {0};
     if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(p), &mbi,
@@ -757,10 +798,8 @@ bool ThreadIsolator::CheckAndClearInitialNeedSave() {
 }
 
 int ThreadIsolator::NormalizePollingInterval(int ms) {
-  if (ms <= 150) return 100;
-  if (ms <= 350) return 200;
-  if (ms <= 750) return 500;
-  return 1000;
+  if (ms <= 0) return 100;
+  return ((ms + 99) / 100) * 100;
 }
 
 bool ThreadIsolator::ToggleSuspendAudioThread(size_t index) {
@@ -1407,10 +1446,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      // Audio Service PID 未特定: 初動時またはBypass復帰時(!rule.chromiumScanAttempted)のみ走査試行
-      // 未特定の場合は sleeping... に移行し、毎秒の全子プロセス走査を停止してコストをゼロ化
+      // Audio Service PID 未特定時: 初動時または 5秒周期のプロセス一覧更新時 (shouldScanProcesses) に走査
+      // 平常ターンは走査せずコストゼロ化を維持
       if (audioServicePid == 0) {
-        if (!rule.chromiumScanAttempted) {
+        if (shouldScanProcesses || !rule.chromiumScanAttempted) {
           rule.chromiumScanAttempted = true;
           for (DWORD pid : it->second) {
             HANDLE hProc = OpenProcess(
@@ -1625,8 +1664,10 @@ bool ThreadIsolator::ScanAndIsolate() {
       // ── Step 2: 待機ループ (最小ルーティン) ──
       else if (audioState.step == 2) {
         int normalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
-        ULONG64 step2Threshold = static_cast<ULONG64>(5000000ULL) * normalMs / 1000ULL;
-        if (step2Threshold < 1000000ULL) step2Threshold = 1000000ULL;
+        ULONG64 baseDelta = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, 0);
+        ULONG64 minDelta = (baseDelta / 5ULL < 1000ULL) ? 1000ULL : (baseDelta / 5ULL);
+        ULONG64 step2Threshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, normalMs);
+        if (step2Threshold < minDelta) step2Threshold = minDelta;
 
         bool hasHighDelta = false;
         for (const auto &te : ptIt->second) {
@@ -1650,7 +1691,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
 
         if (hasHighDelta) {
-          // Delta >= 5M/1s 相当を検知: TID 昇順 n で配列 d(n) を構築し Step 3 へ
+          // Delta >= 閾値相当を検知: TID 昇順 n で配列 d(n) を構築し Step 3 へ
           audioState.d.clear();
           std::vector<DWORD> flag0Tids;
           for (const auto &te : ptIt->second) {
@@ -1683,8 +1724,10 @@ bool ThreadIsolator::ScanAndIsolate() {
       // ── Step 3 & Step 4: サンプリング蓄積ループ & 候補絞り込み判定 ──
       else if (audioState.step == 3) {
         int sampleIntervalMs = audioState.isDecline ? 1000 : (m_config.boostPollingIntervalMs > 0 ? m_config.boostPollingIntervalMs : 250);
-        ULONG64 sampleThreshold = static_cast<ULONG64>(5000000ULL) * sampleIntervalMs / 1000ULL;
-        if (sampleThreshold < 1000000ULL) sampleThreshold = 1000000ULL;
+        ULONG64 baseDelta = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, 0);
+        ULONG64 minDelta = (baseDelta / 5ULL < 1000ULL) ? 1000ULL : (baseDelta / 5ULL);
+        ULONG64 sampleThreshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, sampleIntervalMs);
+        if (sampleThreshold < minDelta) sampleThreshold = minDelta;
 
         // k 回目の Delta 計測
         for (auto &entry : audioState.d) {
@@ -1730,8 +1773,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         } else {
           // ── Step 4: 候補絞り込み判定 ──
           int normalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
-          ULONG64 step2Threshold = static_cast<ULONG64>(5000000ULL) * normalMs / 1000ULL;
-          if (step2Threshold < 1000000ULL) step2Threshold = 1000000ULL;
+          ULONG64 baseDelta4 = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, 0);
+          ULONG64 minDelta4 = (baseDelta4 / 5ULL < 1000ULL) ? 1000ULL : (baseDelta4 / 5ULL);
+          ULONG64 step2Threshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, normalMs);
+          if (step2Threshold < minDelta4) step2Threshold = minDelta4;
 
           // d(a) から順に Δ(0...k-1) がすべて 5M/s 相当の勢いか検査
           for (auto &entry : audioState.d) {
@@ -1969,52 +2014,110 @@ bool ThreadIsolator::ScanAndIsolate() {
           DWORD candTid = 0;
           ULONG64 maxDelta = 0;
 
-          for (const auto &ti : threadInfos) {
-            ULONG64 curCycle = 0;
-            if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
-              auto prevIt = sampleState.lastCycles.find(ti.tid);
-              ULONG64 d = 0;
-              if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
-                d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
-              }
-              sampleState.lastCycles[ti.tid] = curCycle;
+          if (rule.ignoreSigRank > 0) {
+            // === IgnoreSig モード: スタック走査バイパス & 3回連続 (n位, n+1位) 一致判定 ===
+            std::vector<std::pair<ULONG64, DWORD>> highDeltaThreads;
+            for (const auto &ti : threadInfos) {
+              ULONG64 curCycle = 0;
+              if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
+                auto prevIt = sampleState.lastCycles.find(ti.tid);
+                ULONG64 d = 0;
+                if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
+                  d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
+                }
+                sampleState.lastCycles[ti.tid] = curCycle;
 
-              // 未検査スレッドのモジュール/シグネチャ検査 (生涯1回)
-              if (d > 0 && sampleState.inspectedTids.find(ti.tid) == sampleState.inspectedTids.end()) {
-                sampleState.inspectedTids.insert(ti.tid);
-                std::string stackSig = QueryCallstackAudioSignature(hProcess, ti.hThread);
-
-                if (rule.appType == 3) {
-                  // モード 3: DAW型高負荷アプリ (Nuendo, Cubase 等)
-                  // 初回: シグネチャ合致で候補登録、さらに timeclit に flag = 1 を刻印
-                  if (!stackSig.empty()) {
-                    sampleState.audioCandidateTids.insert(ti.tid);
-                    bool isTimeCritical = (ti.priority == THREAD_PRIORITY_TIME_CRITICAL || ti.basePri >= 15);
-                    if (isTimeCritical) {
-                      m_threadFlags[pid][ti.tid] = 1; // 救済用フラグ
-                    }
-                  }
-                } else {
-                  // モード 1: 非 Chromium (ゲーム等)
-                  // 4KB スタック走査のみ (開始アドレス走査は完全撤廃、pxtone 含む)
-                  if (!stackSig.empty()) {
-                    sampleState.audioCandidateTids.insert(ti.tid);
-                  }
+                ULONG64 deltaThreshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, intervalMs);
+                if (d >= deltaThreshold) {
+                  highDeltaThreads.push_back({d, ti.tid});
                 }
               }
+            }
+            // Cycles Delta 降順ソート
+            std::sort(highDeltaThreads.begin(), highDeltaThreads.end(),
+                      [](const std::pair<ULONG64, DWORD> &a, const std::pair<ULONG64, DWORD> &b) {
+                        return a.first > b.first;
+                      });
 
-              // 判定: (flag == 1 || timeclit) かつ (オーディオ候補 かつ Delta >= 5M)
-              bool isCandidate = (sampleState.audioCandidateTids.count(ti.tid) > 0);
-              bool isEligible = true;
-              if (rule.appType == 3) {
-                isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
-                              ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
-                              ti.basePri >= 15);
+            if (highDeltaThreads.size() >= static_cast<size_t>(rule.ignoreSigRank)) {
+              DWORD curTidN = highDeltaThreads[rule.ignoreSigRank - 1].second;
+              DWORD curTidN1 = (highDeltaThreads.size() >= static_cast<size_t>(rule.ignoreSigRank + 1))
+                                   ? highDeltaThreads[rule.ignoreSigRank].second
+                                   : 0;
+
+              if (curTidN == rule.lastIgnoreSigTidN && curTidN1 == rule.lastIgnoreSigTidN1) {
+                rule.ignoreSigMatchCount++;
+                if (rule.ignoreSigMatchCount >= 3) {
+                  // 3回連続一致: 境界ブレなし・安定確定！
+                  candTid = curTidN;
+                  maxDelta = highDeltaThreads[rule.ignoreSigRank - 1].first;
+                  rule.ignoreSigMatchCount = 0;
+                  rule.lastIgnoreSigTidN = 0;
+                  rule.lastIgnoreSigTidN1 = 0;
+                }
+              } else {
+                rule.lastIgnoreSigTidN = curTidN;
+                rule.lastIgnoreSigTidN1 = curTidN1;
+                rule.ignoreSigMatchCount = 1;
               }
-              if (isCandidate && isEligible && d >= 5000000ULL) {
-                if (d > maxDelta) {
-                  maxDelta = d;
-                  candTid = ti.tid;
+            } else {
+              rule.ignoreSigMatchCount = 0;
+              rule.lastIgnoreSigTidN = 0;
+              rule.lastIgnoreSigTidN1 = 0;
+            }
+          } else {
+            // === 通常モード: 4KB スタック走査によるシグネチャ照合 & 最大 Delta 選定 ===
+            for (const auto &ti : threadInfos) {
+              ULONG64 curCycle = 0;
+              if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
+                auto prevIt = sampleState.lastCycles.find(ti.tid);
+                ULONG64 d = 0;
+                if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
+                  d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
+                }
+                sampleState.lastCycles[ti.tid] = curCycle;
+
+                // 秒換算 CyclesDelta の 1 ターン閾値
+                ULONG64 deltaThreshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, intervalMs);
+
+                // 未検査スレッドのモジュール/シグネチャ検査 (CyclesDelta 以上のスレッドに対してのみ検査、AppType: -1 はバイパス)
+                if (rule.appType != -1 && d >= deltaThreshold && sampleState.inspectedTids.find(ti.tid) == sampleState.inspectedTids.end()) {
+                  sampleState.inspectedTids.insert(ti.tid);
+                  std::string stackSig = QueryCallstackAudioSignature(hProcess, ti.hThread);
+
+                  if (rule.appType == 3) {
+                    // モード 3: DAW型高負荷アプリ (Nuendo, Cubase 等)
+                    // 初回: シグネチャ合致で候補登録、さらに timeclit に flag = 1 を刻印
+                    if (!stackSig.empty()) {
+                      sampleState.audioCandidateTids.insert(ti.tid);
+                      bool isTimeCritical = (ti.priority == THREAD_PRIORITY_TIME_CRITICAL || ti.basePri >= 15);
+                      if (isTimeCritical) {
+                        m_threadFlags[pid][ti.tid] = 1; // 救済用フラグ
+                      }
+                    }
+                  } else {
+                    // モード 1: 非 Chromium (ゲーム・Spotify等)
+                    // 4KB スタック走査のみ (開始アドレス走査は完全撤廃、pxtone 含む)
+                    if (!stackSig.empty()) {
+                      sampleState.audioCandidateTids.insert(ti.tid);
+                    }
+                  }
+                }
+
+                // 判定: (AppType: -1 || オーディオ候補) かつ (flag == 1 || timeclit) かつ (d > 0)
+                // audit_process.py 準拠: シグネチャ合致(またはAppType: -1)かつ稼働中のスレッドの中から最大 Delta を選定
+                bool isCandidate = (rule.appType == -1) || (sampleState.audioCandidateTids.count(ti.tid) > 0);
+                bool isEligible = true;
+                if (rule.appType == 3) {
+                  isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
+                                ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
+                                ti.basePri >= 15);
+                }
+                if (isCandidate && isEligible && d > 0) {
+                  if (d > maxDelta) {
+                    maxDelta = d;
+                    candTid = ti.tid;
+                  }
                 }
               }
             }
@@ -2039,79 +2142,108 @@ bool ThreadIsolator::ScanAndIsolate() {
                      "Audio thread identified in Searching...: PID=%lu, TID=%lu, delta=%llu",
                      pid, identifiedAudioTid, maxDelta);
             LogDebug(hLog);
-          } else {
-            if (rule.detectedThreadName != "Searching...") {
-              rule.detectedThreadName = "Searching...";
-              stateChanged = true;
-            }
-            rule.searchTurns--;
-            if (rule.searchTurns <= 0) {
-              // 2秒経過: カウントダウン Phase 2 へ移行
-              rule.searchPhase = 2;
-              rule.searchTurns = 8 * turnsPerSec; // 8秒間
-              rule.detectedThreadName = "Standby 10";
-              stateChanged = true;
-            }
           }
         } else if (rule.searchPhase == 2) {
-          // --- Phase 2: Standby 10..3 (8秒間: 8 * turnsPerSec ターン) ---
-          // スレッド走査・計測・退避は一切行わず、秒数表示更新のみで完全休止 (CPU負荷 0.0%)
-          int sec = 3 + (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
-          std::string sName = "Standby " + std::to_string(sec);
-          if (rule.detectedThreadName != sName) {
-            rule.detectedThreadName = sName;
-            stateChanged = true;
-          }
-          rule.searchTurns--;
-          if (rule.searchTurns <= 0) {
-            // カウントダウン終了: 終盤再確定 Phase 3 へ移行
-            rule.searchPhase = 3;
-            rule.searchTurns = 2 * turnsPerSec; // 2秒間 (Standby 2..1)
-            rule.detectedThreadName = "Standby 2";
-            stateChanged = true;
-            // 基準サイクルタイムを再サンプリング
-            for (const auto &ti : threadInfos) {
-              ULONG64 curCycle = 0;
-              if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
-                sampleState.lastCycles[ti.tid] = curCycle;
-              }
-            }
-          }
+          // --- Phase 2: Standby 10..3 ---
+          // スレッド走査・計測・退避は行わず待機
         } else if (rule.searchPhase == 3) {
-          // --- Phase 3: 終盤再確定 Standby 2..1 (2秒間: 2 * turnsPerSec ターン) ---
-          int sec = (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
-          if (sec < 1) sec = 1;
-          std::string sName = "Standby " + std::to_string(sec);
-          if (rule.detectedThreadName != sName) {
-            rule.detectedThreadName = sName;
-            stateChanged = true;
-          }
-
+          // --- Phase 3: 終盤再確定 Standby 2..1 (2秒間) ---
           DWORD candTid = 0;
           ULONG64 maxDelta = 0;
 
-          for (const auto &ti : threadInfos) {
-            ULONG64 curCycle = 0;
-            if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
-              auto prevIt = sampleState.lastCycles.find(ti.tid);
-              ULONG64 d = 0;
-              if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
-                d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
-              }
-              sampleState.lastCycles[ti.tid] = curCycle;
+          if (rule.ignoreSigRank > 0) {
+            // === IgnoreSig モード: スタック走査バイパス & 3回連続 (n位, n+1位) 一致判定 ===
+            std::vector<std::pair<ULONG64, DWORD>> highDeltaThreads;
+            for (const auto &ti : threadInfos) {
+              ULONG64 curCycle = 0;
+              if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
+                auto prevIt = sampleState.lastCycles.find(ti.tid);
+                ULONG64 d = 0;
+                if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
+                  d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
+                }
+                sampleState.lastCycles[ti.tid] = curCycle;
 
-              // 判定: (flag == 1 || timeclit) かつ (オーディオ候補 かつ Delta >= 5M)
-              bool isCandidate = (sampleState.audioCandidateTids.count(ti.tid) > 0);
-              bool isEligible = true;
-              if (rule.appType == 3) {
-                isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
-                              ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
-                              ti.basePri >= 15);
+                ULONG64 deltaThreshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, intervalMs);
+                if (d >= deltaThreshold) {
+                  highDeltaThreads.push_back({d, ti.tid});
+                }
               }
-              if (isCandidate && isEligible && d >= 5000000ULL) {
-                if (d > maxDelta) {
-                  maxDelta = d;
-                  candTid = ti.tid;
+            }
+            // Cycles Delta 降順ソート
+            std::sort(highDeltaThreads.begin(), highDeltaThreads.end(),
+                      [](const std::pair<ULONG64, DWORD> &a, const std::pair<ULONG64, DWORD> &b) {
+                        return a.first > b.first;
+                      });
+
+            if (highDeltaThreads.size() >= static_cast<size_t>(rule.ignoreSigRank)) {
+              DWORD curTidN = highDeltaThreads[rule.ignoreSigRank - 1].second;
+              DWORD curTidN1 = (highDeltaThreads.size() >= static_cast<size_t>(rule.ignoreSigRank + 1))
+                                   ? highDeltaThreads[rule.ignoreSigRank].second
+                                   : 0;
+
+              if (curTidN == rule.lastIgnoreSigTidN && curTidN1 == rule.lastIgnoreSigTidN1) {
+                rule.ignoreSigMatchCount++;
+                if (rule.ignoreSigMatchCount >= 3) {
+                  // 3回連続一致: 境界ブレなし・安定確定！
+                  candTid = curTidN;
+                  maxDelta = highDeltaThreads[rule.ignoreSigRank - 1].first;
+                  rule.ignoreSigMatchCount = 0;
+                  rule.lastIgnoreSigTidN = 0;
+                  rule.lastIgnoreSigTidN1 = 0;
+                }
+              } else {
+                rule.lastIgnoreSigTidN = curTidN;
+                rule.lastIgnoreSigTidN1 = curTidN1;
+                rule.ignoreSigMatchCount = 1;
+              }
+            } else {
+              rule.ignoreSigMatchCount = 0;
+              rule.lastIgnoreSigTidN = 0;
+              rule.lastIgnoreSigTidN1 = 0;
+            }
+          } else {
+            // === 通常モード: 4KB スタック走査によるシグネチャ照合 & 最大 Delta 選定 ===
+            for (const auto &ti : threadInfos) {
+              ULONG64 curCycle = 0;
+              if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
+                auto prevIt = sampleState.lastCycles.find(ti.tid);
+                ULONG64 d = 0;
+                if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
+                  d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
+                }
+                sampleState.lastCycles[ti.tid] = curCycle;
+
+                ULONG64 deltaThreshold = CalculateDeltaThreshold(rule.cyclesDelta, m_config.defaultCyclesDelta, intervalMs);
+                if (rule.appType != -1 && d >= deltaThreshold && sampleState.inspectedTids.find(ti.tid) == sampleState.inspectedTids.end()) {
+                  sampleState.inspectedTids.insert(ti.tid);
+                  std::string stackSig = QueryCallstackAudioSignature(hProcess, ti.hThread);
+                  if (rule.appType == 3) {
+                    if (!stackSig.empty()) {
+                      sampleState.audioCandidateTids.insert(ti.tid);
+                      if (ti.priority == THREAD_PRIORITY_TIME_CRITICAL || ti.basePri >= 15) {
+                        m_threadFlags[pid][ti.tid] = 1;
+                      }
+                    }
+                  } else {
+                    if (!stackSig.empty()) {
+                      sampleState.audioCandidateTids.insert(ti.tid);
+                    }
+                  }
+                }
+
+                bool isCandidate = (rule.appType == -1) || (sampleState.audioCandidateTids.count(ti.tid) > 0);
+                bool isEligible = true;
+                if (rule.appType == 3) {
+                  isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
+                                ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
+                                ti.basePri >= 15);
+                }
+                if (isCandidate && isEligible && d > 0) {
+                  if (d > maxDelta) {
+                    maxDelta = d;
+                    candTid = ti.tid;
+                  }
                 }
               }
             }
@@ -2136,27 +2268,7 @@ bool ThreadIsolator::ScanAndIsolate() {
                      "Audio thread identified in Standby 2..1: PID=%lu, TID=%lu, delta=%llu",
                      pid, identifiedAudioTid, maxDelta);
             LogDebug(hLog);
-          } else {
-            rule.searchTurns--;
-            if (rule.searchTurns <= 0) {
-              // 終盤再確定でも未検出: Phase 4 (sleeping...) へ移行
-              rule.searchPhase = 4;
-              rule.searchTurns = 0;
-              rule.detectedThreadName = "sleeping...";
-              rule.isAudioIsolated = false;
-              rule.activeAudioTid = 0;
-              stateChanged = true;
-              m_samplingStates.erase(pid);
-            }
           }
-        } else if (rule.searchPhase == 4) {
-          // --- Phase 4: sleeping... (完全放置ナッジ) ---
-          if (rule.detectedThreadName != "sleeping...") {
-            rule.detectedThreadName = "sleeping...";
-            stateChanged = true;
-          }
-          rule.isAudioIsolated = false;
-          rule.activeAudioTid = 0;
         }
       }
 
@@ -2370,7 +2482,55 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.wasHalfAutoPromoted = false;
         stateChanged = true;
       }
-      if (rule.detectedThreadName.empty()) {
+      // 未特定時のフェーズ進行 (全PID走査完了後にプロセスグループ単位で1ターン進行)
+      if (rule.searchPhase == 1) {
+        if (rule.detectedThreadName != "Searching...") {
+          rule.detectedThreadName = "Searching...";
+          stateChanged = true;
+        }
+        rule.searchTurns--;
+        if (rule.searchTurns <= 0) {
+          rule.searchPhase = 2;
+          rule.searchTurns = 8 * turnsPerSec;
+          rule.detectedThreadName = "Standby 10";
+          stateChanged = true;
+        }
+      } else if (rule.searchPhase == 2) {
+        int sec = 3 + (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
+        std::string sName = "Standby " + std::to_string(sec);
+        if (rule.detectedThreadName != sName) {
+          rule.detectedThreadName = sName;
+          stateChanged = true;
+        }
+        rule.searchTurns--;
+        if (rule.searchTurns <= 0) {
+          rule.searchPhase = 3;
+          rule.searchTurns = 2 * turnsPerSec;
+          rule.detectedThreadName = "Standby 2";
+          stateChanged = true;
+        }
+      } else if (rule.searchPhase == 3) {
+        int sec = (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
+        if (sec < 1) sec = 1;
+        std::string sName = "Standby " + std::to_string(sec);
+        if (rule.detectedThreadName != sName) {
+          rule.detectedThreadName = sName;
+          stateChanged = true;
+        }
+        rule.searchTurns--;
+        if (rule.searchTurns <= 0) {
+          rule.searchPhase = 4;
+          rule.searchTurns = 0;
+          rule.detectedThreadName = "sleeping...";
+          stateChanged = true;
+          m_samplingStates.clear();
+        }
+      } else if (rule.searchPhase == 4) {
+        if (rule.detectedThreadName != "sleeping...") {
+          rule.detectedThreadName = "sleeping...";
+          stateChanged = true;
+        }
+      } else {
         rule.detectedThreadName = "Searching...";
         rule.searchPhase = 1;
         rule.searchTurns = 2 * turnsPerSec;

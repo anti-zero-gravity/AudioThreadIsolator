@@ -5,10 +5,10 @@
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
 // Main Dialog
-IDD_MAIN_DIALOG DIALOGEX 0, 0, 486, 112
-STYLE DS_SETFONT | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME | WS_VISIBLE | WS_CLIPCHILDREN
+IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 112
+STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "Audio Thread Isolator v1.0.2"
+CAPTION "Audio Thread Isolator v1.0.3"
 FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_PROCESSES, "SysListView32", 
@@ -45,7 +45,7 @@ BEGIN
 END
 
 // Global Settings Dialog
-IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 152
+IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 132
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
 CAPTION "Global Settings"
 FONT 9, "Segoe UI", 400, 0, 0x0
@@ -54,20 +54,20 @@ BEGIN
                     LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
                     12, 10, 256, 28
 
-    LTEXT           "Default Audio Core(s) (#, ...):", -1, 14, 48, 140, 10
-    EDITTEXT        IDC_EDIT_AUDIO_CORE, 232, 46, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Default Audio Core(s) (#, ...):", -1, 14, 44, 140, 10
+    EDITTEXT        IDC_EDIT_AUDIO_CORE, 232, 42, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
 
-    LTEXT           "Other than Audio (Mask):", -1, 14, 68, 140, 10
-    EDITTEXT        IDC_EDIT_NORMAL_CORES, 232, 66, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Other than Audio (Mask):", -1, 14, 60, 140, 10
+    EDITTEXT        IDC_EDIT_NORMAL_CORES, 232, 58, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
 
-    LTEXT           "Audio Thread Priority:", -1, 14, 88, 140, 10
-    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 173, 86, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Audio Thread Priority:", -1, 14, 76, 140, 10
+    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 173, 74, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
 
-    LTEXT           "Polling Interval (ms):", -1, 14, 108, 140, 10
-    EDITTEXT        IDC_EDIT_POLLING_MS, 242, 106, 26, 14, ES_AUTOHSCROLL | ES_NUMBER | ES_RIGHT
+    LTEXT           "Polling Interval (ms):", -1, 14, 92, 140, 10
+    EDITTEXT        IDC_EDIT_POLLING_MS, 242, 90, 26, 14, ES_AUTOHSCROLL | ES_NUMBER | ES_RIGHT
 
-    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 172, 128, 45, 15
-    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 223, 128, 45, 15
+    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 172, 110, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 223, 110, 45, 15
 END
 
 // Process Rule Edit Dialog
@@ -115,8 +115,8 @@ END
 
 // Version Information
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,2,0
-PRODUCTVERSION  1,0,2,0
+FILEVERSION     1,0,3,0
+PRODUCTVERSION  1,0,3,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -128,11 +128,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "Audio Thread Isolator\0"
-            VALUE "FileVersion",      "1.0.2.0\0"
+            VALUE "FileVersion",      "1.0.3.0\0"
             VALUE "InternalName",     "ATI\0"
             VALUE "OriginalFilename", "ATI.exe\0"
             VALUE "ProductName",      "Audio Thread Isolator\0"
-            VALUE "ProductVersion",   "1.0.2\0"
+            VALUE "ProductVersion",   "1.0.3\0"
         END
     END
     BLOCK "VarFileInfo"

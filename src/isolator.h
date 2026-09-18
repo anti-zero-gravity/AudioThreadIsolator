@@ -44,6 +44,11 @@ struct ProcessRule {
     bool enableHeuristics = true;
     // appType アプリ種別判定 (0: 未判定, 1: 非Chromium, 2: Chromium系, 3: DAW型高負荷)
     int appType = 0;
+    int ignoreSigRank = 0;                // 0: 通常シグネチャ判定, 1以上: シグネチャ無視・Delta第n位採用
+    DWORD lastIgnoreSigTidN = 0;          // IgnoreSig 前回計測時の第n位 TID
+    DWORD lastIgnoreSigTidN1 = 0;         // IgnoreSig 前回計測時の第(n+1)位 TID
+    int ignoreSigMatchCount = 0;          // IgnoreSig 連続一致回数 (3回で確定)
+    double cyclesDelta = 0.0;             // 個別 Cycles Delta 走査閾値 (M/s, 0.0: Global継承)
     bool isDeclineBoost = false;          // Decline:1 (ポーリングブーストを拒否し1000msで計測)
     DWORD audioServicePid = 0;            // Chromiumモード: 特定済み Audio Service の PID (ランタイムのみ)
 
@@ -78,6 +83,8 @@ struct GlobalConfig {
     DWORD_PTR normalAffinityMask;     // 通常スレッド退避先マスク (0: 隔離コア以外の全コア自動)
     int pollingIntervalMs;            // 監視周期 (デフォルト 1000ms)
     int boostPollingIntervalMs = 250; // ブースト監視周期 (デフォルト 250ms)
+    double defaultCyclesDelta = 5.0;  // 4KBスタック走査を発行する秒換算負荷閾値 (M/s, デフォルト 5.0)
+    std::string rawDefaultCyclesDeltaStr = ""; // INIの生文字列 (空欄状態の保持・再出力用)
     bool enableHeuristics = false;    // 非MMCSSスレッド探索用ヒューリスティック監視有効化 (デフォルト: false)
     std::vector<ProcessRule> rules;   // 監視プロセス一覧
 };

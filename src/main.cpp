@@ -9,6 +9,7 @@
 #include <string>
 #include <vector>
 #include <sstream>
+#include <cmath>
 
 #include "resource.h"
 #include "isolator.h"
@@ -334,6 +335,17 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
     );
     if (config.boostPollingIntervalMs <= 0) config.boostPollingIntervalMs = 250;
 
+    char deltaBuf[64] = { 0 };
+    GetPrivateProfileStringA("Global", "DefaultCyclesDelta", "", deltaBuf, sizeof(deltaBuf), iniPath.c_str());
+    config.rawDefaultCyclesDeltaStr = deltaBuf;
+    if (deltaBuf[0] != '\0') {
+        double dVal = atof(deltaBuf);
+        dVal = std::ceil(dVal * 10.0) / 10.0;
+        config.defaultCyclesDelta = (dVal > 0.0) ? dVal : 5.0;
+    } else {
+        config.defaultCyclesDelta = 5.0;
+    }
+
     g_alwaysOnTop = (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
     config.enableHeuristics = true;
 
@@ -405,6 +417,12 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             rule.isBypassed = (atoi(v.c_str()) != 0);
                         } else if (k == "AppType" || k == "Normchrom") {
                             rule.appType = atoi(v.c_str());
+                        } else if (k == "Delta" || k == "CyclesDelta") {
+                            double dVal = atof(v.c_str());
+                            dVal = std::ceil(dVal * 10.0) / 10.0;
+                            rule.cyclesDelta = (dVal > 0.0) ? dVal : 0.0;
+                        } else if (k == "IgnoreSig" || k == "IgnoreSigRank") {
+                            rule.ignoreSigRank = atoi(v.c_str());
                         } else if (k == "AudioPid") {
                             rule.lastAudioPid = static_cast<DWORD>(atoi(v.c_str()));
                         } else if (k == "AudioTid") {
@@ -453,6 +471,11 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
     );
 
     WritePrivateProfileStringA(
+        "Global", "DefaultCyclesDelta", 
+        config.rawDefaultCyclesDeltaStr.c_str(), iniPath.c_str()
+    );
+
+    WritePrivateProfileStringA(
         "Global", "AlwaysOnTop", 
         g_alwaysOnTop ? "1" : "0", iniPath.c_str()
     );
@@ -463,12 +486,26 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
             ? rule.audioAffinityMask 
             : ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
         std::string val;
-        if (rule.appType > 0) {
+        if (rule.appType != 0) {
             val += "AppType:" + std::to_string(rule.appType);
+        }
+        if (rule.cyclesDelta > 0.0) {
+            if (!val.empty()) val += ", ";
+            char dBuf[32];
+            if (std::floor(rule.cyclesDelta) == rule.cyclesDelta) {
+                snprintf(dBuf, sizeof(dBuf), "%.0f", rule.cyclesDelta);
+            } else {
+                snprintf(dBuf, sizeof(dBuf), "%.1f", rule.cyclesDelta);
+            }
+            val += "Delta:" + std::string(dBuf);
         }
         if (rule.isDeclineBoost) {
             if (!val.empty()) val += ", ";
             val += "Decline:1";
+        }
+        if (rule.ignoreSigRank > 0) {
+            if (!val.empty()) val += ", ";
+            val += "IgnoreSig:" + std::to_string(rule.ignoreSigRank);
         }
         if (!val.empty()) val += ", ";
         val += "AudioCore:" + FormatMaskToCoreList(rMask);
@@ -800,7 +837,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
         float scale = GetDpiScaleForWindow(hDlg);
         lpMMI->ptMinTrackSize.x = static_cast<LONG>(380 * scale);
-        lpMMI->ptMinTrackSize.y = static_cast<LONG>(205 * scale);
+        lpMMI->ptMinTrackSize.y = static_cast<LONG>(180 * scale);
         return 0;
     }
 
@@ -1697,7 +1734,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.2");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.3");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -2700,7 +2737,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     g_hSingleInstanceMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.2");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
         if (hExisting) {
             ShowWindow(hExisting, SW_SHOWNORMAL);

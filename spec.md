@@ -304,10 +304,39 @@
   - 新規出現スレッド（初登場）は通常コア群へ先行配置し、サイクルベースライン（`lastCycles`）を記録。
   - 計 3 回とも同一 TID が首位・活動中であれば、新 TID を `flag = 2` としてオーディオコアへ追加（`audioMask`、優先度、IdealProcessor を適用）。旧オーディオスレッドの退避やアフィニティ剥奪は行わず維持。
   - モジュール名逆引き（`VirtualQueryEx` / `GetMappedFileNameA`）および `CrUtilityMain` 判定処理は全廃。
+  - **Chromium Audio Service 遅延自動検出仕様 (v1.0.3)**:
+    - ブラウザ起動直後の無音待機（`sleeping...`）から、初回の音声再生によって後から Audio Service プロセス（`audio.mojom.AudioService`）が生成された場合、手動クリック（Restart ナッジ）不要で自動検知・隔離へ移行。
+    - 5 秒周期のプロセス一覧更新（`shouldScanProcesses`）に連動して走査を発行し、平常ターンの走査負荷ゼロを維持。
 - **リセット仕様**:
   - Audio Service PID の変更時、または Bypass 解除からの復帰時は、管理テーブルおよび PID キャッシュをリセットして初回スレッド登録から再実行。
 - **非Chromiumプロセスの親プロセスマスク拡張制御**:
   - 親プロセスマスクの拡張確認（`GetProcessAffinityMask` / `SetProcessAffinityMask`）は、対象 PID の初回検出時のみに実行し、定常ループでの重複システムコール呼び出しを削減。
+
+### 3.12 非 Chromium (AppType: 1) における 4KB スタック走査最適化および可変 CyclesDelta 仕様 (v1.0.3)
+- **対象アプリ**: ゲーム、一般メディアプレイヤー、Spotify、Voicemeeter などの独立 AudioService 子プロセスを持たない非 Chromium アプリ。
+- **物理処理フロー**:
+  1. **全スレッドの Cycles Delta (Δ) 計測**:
+     - 対象プロセスの全スレッドについて `QueryThreadCycleTime` を計測し、前回サンプリングからのサイクル差分 `d` を算出。
+  2. **可変 CyclesDelta 走査トリガーによる 4KB スタック検査**:
+     - アイドル時や微小負荷（`d > 0`）でのフライング検査による誤判定・誤キャッシュ抑止。
+     - 指定された閾値（デフォルト: 秒換算 5M/s、Voicemeeter 等の低負荷アプリでは個別 `Delta: 1` ＝ 1M/s）以上の活動（`d >= deltaThreshold`）を記録したスレッドに対してのみ 4KB スタック走査を発行。
+     - スレッドの TEB から `StackBase` を取得し、スタック領域（`[StackBase - 4096, StackBase)`）の物理メモリから Windows 標準の WASAPI（`audioses.dll`）、DirectSound（`dsound.dll`）、XAudio2、ASIO ドライバ DLL 等のリターンアドレスを走査。合致したスレッドを候補（`audioCandidateTids`）として登録。
+  3. **オーディオスレッドの確定**:
+     - 候補スレッド群の中で、稼働中（`d > 0`）かつ最も高い Delta を記録したスレッドを `Primary Audio Thread` として確定・隔離。
+- **マルチプロセス一元ターン進行**:
+  - Spotify のように同名プロセスが複数 PID 存在する場合でも、ターン数デクリメントは全 PID 走査完了後にプロセスグループ単位で 1 回のみ実行し、正規の探索時間（Searching... 2秒間）を担保。
+
+### 3.13 IgnoreSig:n (シグネチャ無視・3回連続境界一致判定) 仕様 (v1.0.3)
+- **対象アプリ**: Voicemeeter や独自オーディオエンジン等、4KB スタック走査による標準 DLL シグネチャが合致しないアプリ。
+- **物理処理フロー**:
+  1. **4KB スタック走査のバイパス**:
+     - シグネチャ照合（DLL 判定）を完全スキップし、スタック検査コストを削減。
+  2. **閾値判定と Cycles Delta 降順ソート**:
+     - `d >= deltaThreshold`（秒換算閾値）を満たす稼働スレッドのみを母集団として Cycles Delta の降順にソート。
+  3. **3回連続境界一致判定**:
+     - 第 $n$ 位（$\text{TID}_n$）と直下の第 $n+1$ 位（$\text{TID}_{n+1}$）のペアが 3 回連続（3 ターン）で同一を維持した瞬間に $\text{TID}_n$ をオーディオスレッドとして確定。
+     - 第 $n+1$ 位が存在しない（候補がちょうど $n$ 本）場合は $\text{TID}_{n+1} = 0$ として追従。
+     - 僅差で隣接するスレッドとの順位逆転（チャタリング）を防止し、起動直後のスレッド増減期を自律的にやり過ごす安定期フィルターとして機能。
 
 ---
 
@@ -324,17 +353,24 @@ DefaultAudioCore = 1
 DefaultAudioPriority = -15
 NormalCores = 0x3D
 PollingIntervalMs = 500
+DefaultCyclesDelta =
+; ※ DefaultCyclesDelta: 4KB スタック走査を発行する秒換算負荷閾値 (M/s)。
+;   空欄または未指定時は 5.0 (5M/s = 5,000,000 cycles/s)。数値指定時は小数点第1桁まで有効 (例: 4.5、4.56は切り上げて4.6)。
+;   一般ユーザーが触る必要がない隠しパラメータのため GUI には表示せず INI のみで管理。
 AlwaysOnTop = 0
 
 [Processes]
-; フォーマット: <exe名> = AudioCore:<core>, AudioPriority:<priority>[, NormalCores:0x...][, Bypass:1][, AudioPid:<pid>, AudioTid:<tid>]
+; フォーマット: <exe名> = [AppType:<type>, ][IgnoreSig:<rank>, ][Delta:<m_per_sec>, ]AudioCore:<core>, AudioPriority:<priority>[, NormalCores:0x...][, Bypass:1][, AudioPid:<pid>, AudioTid:<tid>]
 ; 単一コア例: mpv.exe = AudioCore:1, AudioPriority:-15
 ; 複数コア例: mpv.exe = AudioCore:1, 2, AudioPriority:-15
 ; 監視除外例: mpv.exe = AudioCore:5, AudioPriority:-2, Bypass:1
+; 低負荷WASAPIアプリ個別指定例: voicemeeterpro.exe = AppType:1, Delta:1, AudioCore:5, AudioPriority:-15
+; シグネチャ無視・Delta第2位選定例: voicemeeterpro.exe = AppType:1, IgnoreSig:2, AudioCore:5, AudioPriority:-2
 ; 終了時隔離状態の記録例: chrome.exe = AudioCore:5, AudioPriority:-15, AudioPid:1234, AudioTid:5678
 ; ※ AudioPid / AudioTid は終了時に正常隔離（Isolated）中だったプロセスのみ書き込まれ、未起動やBypass時は消去（空）されます。
 ; ※ 起動時の照合（PID/TID生存・アフィニティ一致判定）後、不一致・不在時は全件判定完了後に1回だけINIを一括更新（都度I/O防止）します。
 ```
 
-
-
+> [!NOTE]
+> **CyclesDelta 項目に関する重要注意事項（ユーザー向け）**:
+> **note: CyclesDelta項目はオーディオスレッド確定条件の核なので実稼働時の推移観察なしに数値変更テストを試みないこと。**
