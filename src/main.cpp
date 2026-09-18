@@ -33,6 +33,7 @@ static int s_inPlaceItemIndex = -1;
 static bool s_inPlaceCancelled = false;
 static HANDLE g_hSingleInstanceMutex = nullptr;
 
+#ifdef _DEBUG
 void LogDebug(const char* msg) {
     char exePath[MAX_PATH] = { 0 };
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
@@ -44,6 +45,9 @@ void LogDebug(const char* msg) {
         fclose(fp);
     }
 }
+#else
+void LogDebug(const char*) {}
+#endif
 
 // --- 高DPI (Per-Monitor V2) 初期化・スケーリングヘルパー ---
 static void InitializeHighDpi() {
@@ -145,7 +149,7 @@ static std::string GetIniFilePath() {
     char exePath[MAX_PATH] = { 0 };
     GetModuleFileNameA(nullptr, exePath, MAX_PATH);
     PathRemoveFileSpecA(exePath);
-    PathAppendA(exePath, "settings.ini");
+    PathAppendA(exePath, "ATI.ini");
     return std::string(exePath);
 }
 
@@ -321,9 +325,9 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
     }
 
     config.pollingIntervalMs = GetPrivateProfileIntA(
-        "Global", "PollingIntervalMs", 1000, iniPath.c_str()
+        "Global", "PollingIntervalMs", 500, iniPath.c_str()
     );
-    if (config.pollingIntervalMs < 100) config.pollingIntervalMs = 100;
+    config.pollingIntervalMs = ati::ThreadIsolator::NormalizePollingInterval(config.pollingIntervalMs);
 
     g_alwaysOnTop = (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
     config.enableHeuristics = true;
@@ -396,6 +400,10 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             rule.isBypassed = (atoi(v.c_str()) != 0);
                         } else if (k == "IsChromium") {
                             rule.isChromium = atoi(v.c_str());
+                        } else if (k == "AudioPid") {
+                            rule.lastAudioPid = static_cast<DWORD>(atoi(v.c_str()));
+                        } else if (k == "AudioTid") {
+                            rule.lastAudioTid = static_cast<DWORD>(atoi(v.c_str()));
                         }
                     }
                 }
@@ -457,6 +465,11 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         }
         if (rule.isChromium >= 0) {
             val += ", IsChromium:" + std::to_string(rule.isChromium);
+        }
+        // 正常隔離中かつ稼働中のプロセスのみ、次回照合用として AudioPid / AudioTid を記録 (未起動やBypass時は消去)
+        if (rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && rule.activeAudioTid != 0) {
+            val += ", AudioPid:" + std::to_string(rule.activePid);
+            val += ", AudioTid:" + std::to_string(rule.activeAudioTid);
         }
         WritePrivateProfileStringA(
             "Processes", rule.processName.c_str(), val.c_str(), iniPath.c_str()
@@ -1024,7 +1037,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
             BOOL ok = FALSE;
             int poll = GetDlgItemInt(hDlg, IDC_EDIT_POLLING_MS, &ok, FALSE);
-            if (ok && poll >= 100) s_tmpConfig.pollingIntervalMs = poll;
+            if (ok) s_tmpConfig.pollingIntervalMs = ati::ThreadIsolator::NormalizePollingInterval(poll);
 
             g_isolator.UpdateConfig(s_tmpConfig);
             SaveConfig(s_tmpConfig, g_iniPath);
@@ -1658,14 +1671,10 @@ static void RestartApplication(HWND hDlg) {
     DestroyWindow(hDlg);
 }
 
+static bool s_inSizeMove = false;
+
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg != WM_SETCURSOR && msg != WM_NCHITTEST && msg != WM_MOUSEMOVE && msg != WM_NCMOUSEMOVE && msg != 0x0113 /* WM_TIMER */) {
-        char msgBuf[128];
-        snprintf(msgBuf, sizeof(msgBuf), "MainDlgProc: msg=0x%04X, wParam=0x%llX, lParam=0x%llX", msg, (unsigned long long)wParam, (unsigned long long)lParam);
-        LogDebug(msgBuf);
-    }
-
     switch (msg) {
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
@@ -2080,50 +2089,79 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         return TRUE;
     }
 
+    case WM_ENTERSIZEMOVE: {
+        s_inSizeMove = true;
+        return TRUE;
+    }
+
+    case WM_EXITSIZEMOVE: {
+        s_inSizeMove = false;
+        // ドラッグ移動・リサイズ終了時に最新の画面状態を描画
+        auto rules = g_isolator.GetRulesSnapshot();
+        HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+        if (hList) {
+            UpdateListViewDynamic(hList, rules);
+            InvalidateRect(hList, nullptr, FALSE);
+        }
+        InvalidateRect(hDlg, nullptr, FALSE);
+        return TRUE;
+    }
+
     case WM_TIMER: {
         if (wParam == TIMER_POLLING_ID) {
             s_pulseTick = !s_pulseTick;
+
+            // バックグラウンド監視・TID捕捉・アフィニティ制御はドラッグ中も休まず実行
             bool changed = g_isolator.ScanAndIsolate();
 
-            // 動的タイマー切り替え（Heuristics 探索中は 500ms、通常時は INI 準拠）
+            // 起動時の初期照合クリーンアップ完了時に1回だけINIを一括更新
+            if (g_isolator.CheckAndClearInitialNeedSave()) {
+                SaveConfig(g_isolator.GetConfig(), g_iniPath);
+            }
+
+            // タイマー設定 (ユーザー設定の 100/200/500/1000ms に固定)
             static UINT s_currentInterval = 0;
             auto cfg = g_isolator.GetConfig();
-            UINT desiredInterval = g_isolator.IsHeuristicsActive() ? 500 : cfg.pollingIntervalMs;
+            UINT desiredInterval = cfg.pollingIntervalMs;
             if (s_currentInterval != desiredInterval) {
                 SetTimer(hDlg, TIMER_POLLING_ID, desiredInterval, nullptr);
                 s_currentInterval = desiredInterval;
             }
 
-            auto rules = g_isolator.GetRulesSnapshot();
-            bool anyRunning = false;
-            for (const auto& r : rules) {
-                if (r.isRunning) {
-                    anyRunning = true;
-                    break;
-                }
-            }
-
-            HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-            if (hList) {
-                if (changed) {
-                    UpdateListViewDynamic(hList, rules);
-                }
-                if (anyRunning) {
-                    RECT rcClient;
-                    GetClientRect(hList, &rcClient);
-                    int col0W = ListView_GetColumnWidth(hList, 0);
-                    RECT rcCol0 = { 0, 0, col0W, rcClient.bottom };
-                    InvalidateRect(hList, &rcCol0, FALSE);
+            // ドラッグ移動中（s_inSizeMove == true）は DWM との衝突を防ぐため再描画を一時スキップ
+            if (!s_inSizeMove) {
+                auto rules = g_isolator.GetRulesSnapshot();
+                bool anyActiveDot = false;
+                for (const auto& r : rules) {
+                    if (r.isRunning && !r.isBypassed) {
+                        anyActiveDot = true;
+                        break;
+                    }
                 }
 
-                // 全対象 Not running かつ変化なしの時は、下部凡例領域の不要な再描画を行わず CPU/GPU 負荷とチラつきを抑止
-                if (changed || anyRunning) {
-                    RECT rcList;
-                    GetWindowRect(hList, &rcList);
-                    MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
-                    float scale = GetDpiScaleForWindow(hDlg);
-                    RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + static_cast<int>(20 * scale) };
-                    InvalidateRect(hDlg, &rcStatus, FALSE);
+                HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+                if (hList) {
+                    if (changed) {
+                        UpdateListViewDynamic(hList, rules);
+                    }
+                    // 画面上に実際に ● (通常監視中の稼働プロセス) が存在する場合のみ点滅再描画
+                    if (anyActiveDot) {
+                        RECT rcClient;
+                        GetClientRect(hList, &rcClient);
+                        int col0W = ListView_GetColumnWidth(hList, 0);
+                        RECT rcCol0 = { 0, 0, col0W, rcClient.bottom };
+                        InvalidateRect(hList, &rcCol0, FALSE);
+                    }
+
+                    // 全対象 Not running / Bypassed かつ変化なしの時は、下部凡例領域の不要な再描画を行わず CPU/GPU 負荷とチラつきを抑止
+                    if (changed || anyActiveDot) {
+                        RECT rcList;
+                        GetWindowRect(hList, &rcList);
+                        MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
+                        float scale = GetDpiScaleForWindow(hDlg);
+                        RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + static_cast<int>(20 * scale) };
+                        InvalidateRect(hDlg, &rcStatus, FALSE);
+                    }
                 }
             }
         }
@@ -2337,10 +2375,21 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         float scale = GetDpiScaleForWindow(hDlg);
                         int cbLimit = rcSub.left + static_cast<int>(22 * scale);
                         if (lvhti.pt.x <= cbLimit) {
+                            const auto& targetRule = rules[lvhti.iItem];
+
+                            // sleeping... 状態のナッジ点滅 ● クリック時: Bypass ではなく直ちに Searching... から再探索を開始
+                            if (targetRule.isRunning && !targetRule.isBypassed && targetRule.detectedThreadName == "sleeping...") {
+                                g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
+                                g_isolator.ScanAndIsolate();
+                                auto updatedRules = g_isolator.GetRulesSnapshot();
+                                UpdateListViewDynamic(hList, updatedRules);
+                                InvalidateRect(hList, nullptr, FALSE);
+                                return TRUE;
+                            }
+
                             // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
                             // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
                             // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
-                            const auto& targetRule = rules[lvhti.iItem];
                             {
                                 bool wasRunning = targetRule.isRunning;
                                 g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
@@ -2401,15 +2450,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
                     plvcd->clrTextBk = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHT) : rowBkCol;
                     plvcd->clrText = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(0, 0, 0);
-
-                    if (plvcd->iSubItem == 4) {
-                        auto rules = g_isolator.GetRulesSnapshot();
-                        if (row >= 0 && row < static_cast<int>(rules.size())) {
-                            if (rules[row].detectedThreadName == ">9999") {
-                                plvcd->clrText = RGB(220, 50, 50);
-                            }
-                        }
-                    }
 
                     if (plvcd->iSubItem == 0) {
                         auto rules = g_isolator.GetRulesSnapshot();
@@ -2625,6 +2665,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         KillTimer(hDlg, TIMER_POLLING_ID);
         RemoveTrayIcon();
         g_isolator.ResumeAllSuspendedThreads();
+        SaveConfig(g_isolator.GetConfig(), g_iniPath);
         PostQuitMessage(0);
         return TRUE;
     }

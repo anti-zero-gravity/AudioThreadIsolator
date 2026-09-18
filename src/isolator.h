@@ -58,6 +58,14 @@ struct ProcessRule {
     bool hasIntruderThreads = false;      // オーディオ専有コアへの侵入・同居スレッドを検知・制圧中か
     bool wasHalfAutoPromoted = false;     // Half-Isolated判定によるLowest(-2)への自動昇格が実行済みか
     bool chromiumScanAttempted = false;   // Chromium起動時/Bypass復帰時のAudioService特定走査を試行済みか(未特定時はStandbyへ移行し毎秒走査を抑止)
+
+    // 前回終了時ステータス記録と照合 (起動時引き継ぎ用)
+    DWORD lastAudioPid = 0;               // 前回終了時ステータス記録: オーディオPID
+    DWORD lastAudioTid = 0;               // 前回終了時ステータス記録: オーディオTID
+
+    // 新探索フロー状態管理
+    int searchPhase = 0;                  // 0: 未開始/確定完了, 1: Searching...(2秒/4ターン), 2: カウントダウン(Standby 10..3), 3: 終盤再確定(Standby 2..1), 4: sleeping...
+    int searchTurns = 0;                  // 各フェーズでの残りターン数 (500ms単位)
 };
 
 
@@ -90,9 +98,16 @@ public:
     void UpdateRule(size_t index, const ProcessRule& rule);
     void ToggleProcessHeuristics(size_t index);
     void ToggleProcessBypass(size_t index);
+    void RestartSearch(size_t index);
     bool ToggleSuspendAudioThread(size_t index);
     void ResumeAllSuspendedThreads();
     std::vector<ProcessRule> GetRulesSnapshot();
+
+    // 起動時照合によるINI更新要求チェック
+    bool CheckAndClearInitialNeedSave();
+
+    // ポーリング間隔の正規化 (100, 200, 500, 1000 ms のみに限定)
+    static int NormalizePollingInterval(int ms);
 
     // システム情報ヘルパー
     static int GetSystemCoreCount();
@@ -112,12 +127,16 @@ private:
     mutable std::mutex m_mutex;
     GlobalConfig m_config;
     std::string m_heuristicsStatusText;
+    bool m_initialNeedSave = false;
     
     // キー: TID, 値: 適用済みマスク
     std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;
 
     // Chromium モード: アフィニティ適用済み子プロセス PID セット (差分検出用)
     std::unordered_set<DWORD> m_chromiumMaskedPids;
+
+    // 非Chromium: 親プロセスマスク拡張済み PID セット (差分検出・定常時API呼び出し削減用)
+    std::unordered_set<DWORD> m_nonChromiumMaskedPids;
 
     // Chromium モード: コマンドライン走査済み子プロセス PID セット (毎秒総当たり走査防止)
     std::unordered_set<DWORD> m_chromiumScannedPids;
@@ -129,7 +148,6 @@ private:
     };
     struct ChromiumAudioState {
         bool initialEvaluated = false;
-        int sampleTurns = 0; // 500ms 単位 (4ターン = 2000ms で初回差分判定)
     };
     std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>> m_chromiumThreadTracks;
     std::unordered_map<DWORD, ChromiumAudioState> m_chromiumAudioStates;
@@ -141,10 +159,8 @@ private:
     // スレッドCPU時間サンプリング (キー: PID, 値: (キー: TID, 値: 前回計測の合計CPU時間))
     std::unordered_map<DWORD, std::unordered_map<DWORD, ULONGLONG>> m_prevThreadCpuTimes;
 
-    // 10秒間サンプリング状態保持 (キー: PID)
     struct ProcessSamplingState {
-        int sampleTurns = 0;                                   // 経過ターン数 (500ms単位)
-        int maxTurns = 20;                                     // 判定閾値 (初期値20=10秒、失速時+10=5秒延長)
+        std::unordered_map<DWORD, ULONG64> lastCycles;         // サイクルタイム前回計測値
         std::unordered_map<DWORD, ULONGLONG> lastCpuTime;
         std::unordered_map<DWORD, ULONGLONG> accumulatedDelta; // 累積デルタ
         std::unordered_map<DWORD, ULONGLONG> latestDelta;      // 直近ターンの瞬間デルタ

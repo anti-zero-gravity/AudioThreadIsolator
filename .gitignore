@@ -35,6 +35,7 @@ build/
 *.opendb
 
 # Local Configuration and Logs
+ATI.ini
 settings.ini
 debug.log*
 *.bak
