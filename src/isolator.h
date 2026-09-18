@@ -42,8 +42,9 @@ struct ProcessRule {
     bool isBypassed = false;
     // 個別ヒューリスティック探索フラグ (デフォルト: true)
     bool enableHeuristics = true;
-    // Chromium系ブラウザ判定 (exe ファイル "chromeos" ASCII 走査結果、INI 永続化)
-    int isChromium = -1;                  // -1: 未判定, 0: 非Chromium, 1: Chromium系
+    // appType アプリ種別判定 (0: 未判定, 1: 非Chromium, 2: Chromium系, 3: DAW型高負荷)
+    int appType = 0;
+    bool isDeclineBoost = false;          // Decline:1 (ポーリングブーストを拒否し1000msで計測)
     DWORD audioServicePid = 0;            // Chromiumモード: 特定済み Audio Service の PID (ランタイムのみ)
 
     // リアルタイム動的状態 (GUI表示用)
@@ -76,6 +77,7 @@ struct GlobalConfig {
     int defaultAudioPriority;         // デフォルトオーディオ優先度 (-15: THREAD_PRIORITY_IDLE)
     DWORD_PTR normalAffinityMask;     // 通常スレッド退避先マスク (0: 隔離コア以外の全コア自動)
     int pollingIntervalMs;            // 監視周期 (デフォルト 1000ms)
+    int boostPollingIntervalMs = 250; // ブースト監視周期 (デフォルト 250ms)
     bool enableHeuristics = false;    // 非MMCSSスレッド探索用ヒューリスティック監視有効化 (デフォルト: false)
     std::vector<ProcessRule> rules;   // 監視プロセス一覧
 };
@@ -145,13 +147,27 @@ private:
     struct ChromiumThreadTrackInfo {
         uint8_t flag = 0; // 0: 未検査, 1: 非オーディオ, 2: オーディオ (確定)
         ULONG64 lastCycles = 0;
+        ULONG64 lastDelta = 0;
+    };
+    struct ThreadSamplingEntry {
+        DWORD tid = 0;
+        int64_t deltas[10] = { 0 }; // Δ(0) ... Δ(9)。脱落時は deltas[0] = -1
+        ULONG64 lastCycle = 0;
     };
     struct ChromiumAudioState {
+        int step = 1;               // 1: 初期ベースライン, 2: 待機ループ, 3: サンプリング中
+        int k = 0;                  // サンプリングインデックス (1..9)
+        std::vector<ThreadSamplingEntry> d; // d(n)
+        bool samplingActive = false;// Step 3 サンプリング中 (タイマー加速/Decline制御用)
+        bool isDecline = false;
         bool initialEvaluated = false;
     };
     std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>> m_chromiumThreadTracks;
     std::unordered_map<DWORD, ChromiumAudioState> m_chromiumAudioStates;
     std::unordered_set<DWORD> m_chromiumEvictedPids;
+
+    // スレッド属性フラグ (キー: PID, 値: (キー: TID, 値: フラグ 1:timeclit救済))
+    std::unordered_map<DWORD, std::unordered_map<DWORD, uint8_t>> m_threadFlags;
 
     // 永続オーディオスレッドトラッキング (キー: PID, 値: (キー: TID, 値: スレッド表示名))
     std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>> m_trackedAudioThreads;
@@ -173,10 +189,13 @@ private:
     std::unordered_map<DWORD, std::vector<DWORD>> m_cachedProcessTids;
     std::unordered_map<DWORD, int> m_lastProcessThreadCount;
 
-
 public:
     // ヒューリスティック探索中 (500ms タイマー要求中) かどうか判定
     bool IsHeuristicsActive() const;
+    // 250ms 高速検証タイマー要求中かどうか判定
+    bool IsFastPollingRequired() const;
+    // 動的タイマー要求周期 (ms) を取得
+    UINT GetDesiredPollingIntervalMs() const;
 };
 
 } // namespace ati

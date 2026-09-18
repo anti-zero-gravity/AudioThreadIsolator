@@ -202,6 +202,77 @@ static void EnsurePsapiLoaded() {
   }
 }
 
+static std::unordered_set<std::string> s_registeredAsioDlls;
+static bool s_asioDriversLoaded = false;
+
+static void EnsureAsioDriversLoaded() {
+  if (s_asioDriversLoaded)
+    return;
+  s_asioDriversLoaded = true;
+  const LPCSTR subkeys[] = {"SOFTWARE\\ASIO", "SOFTWARE\\WOW6432Node\\ASIO"};
+  for (const auto &subKeyPath : subkeys) {
+    HKEY hAsio = NULL;
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKeyPath, 0, KEY_READ, &hAsio) ==
+        ERROR_SUCCESS) {
+      DWORD index = 0;
+      char childName[256];
+      DWORD childLen = sizeof(childName);
+      while (RegEnumKeyExA(hAsio, index++, childName, &childLen, NULL, NULL,
+                            NULL, NULL) == ERROR_SUCCESS) {
+        childLen = sizeof(childName);
+        HKEY hDriver = NULL;
+        if (RegOpenKeyExA(hAsio, childName, 0, KEY_READ, &hDriver) ==
+            ERROR_SUCCESS) {
+          char clsidStr[128] = {0};
+          DWORD clsidLen = sizeof(clsidStr);
+          if (RegQueryValueExA(hDriver, "CLSID", NULL, NULL, (LPBYTE)clsidStr,
+                               &clsidLen) == ERROR_SUCCESS) {
+            std::string clsidPaths[] = {
+                std::string("SOFTWARE\\Classes\\CLSID\\") + clsidStr +
+                    "\\InprocServer32",
+                std::string("SOFTWARE\\Classes\\WOW6432Node\\CLSID\\") +
+                    clsidStr + "\\InprocServer32",
+                std::string("SOFTWARE\\WOW6432Node\\Classes\\CLSID\\") +
+                    clsidStr + "\\InprocServer32"};
+            for (const auto &cPath : clsidPaths) {
+              HKEY hInproc = NULL;
+              if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, cPath.c_str(), 0, KEY_READ,
+                                &hInproc) == ERROR_SUCCESS) {
+                char dllPath[MAX_PATH] = {0};
+                DWORD dllLen = sizeof(dllPath);
+                if (RegQueryValueExA(hInproc, NULL, NULL, NULL, (LPBYTE)dllPath,
+                                     &dllLen) == ERROR_SUCCESS) {
+                  std::string lowerPath = ToLowerA(dllPath);
+                  size_t slash = lowerPath.find_last_of("\\/");
+                  std::string fileName = (slash != std::string::npos)
+                                             ? lowerPath.substr(slash + 1)
+                                             : lowerPath;
+                  if (!fileName.empty()) {
+                    s_registeredAsioDlls.insert(fileName);
+                  }
+                }
+                CloseHandle(hInproc);
+              }
+            }
+          }
+          CloseHandle(hDriver);
+        }
+      }
+      CloseHandle(hAsio);
+    }
+  }
+}
+
+static bool IsRegisteredAsioDll(const std::string &modPath) {
+  EnsureAsioDriversLoaded();
+  if (modPath.find("asio") != std::string::npos)
+    return true;
+  size_t slash = modPath.find_last_of("\\/");
+  std::string fileName =
+      (slash != std::string::npos) ? modPath.substr(slash + 1) : modPath;
+  return s_registeredAsioDlls.find(fileName) != s_registeredAsioDlls.end();
+}
+
 // コールスタック上のモジュールおよび参照シグネチャ走査 (WASAPI / ASIO /
 // DirectSound / Godot 等)
 static std::string QueryCallstackAudioSignature(HANDLE hProcess,
@@ -310,8 +381,8 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
             if (modName.find("audioses") != std::string::npos) {
               return "WASAPI (audioses.dll)";
             }
-            // (3) ASIO ドライバ DLL
-            if (modName.find("asio") != std::string::npos) {
+            // (3) ASIO ドライバ DLL (汎用 asio または レジストリ登録 DLL)
+            if (IsRegisteredAsioDll(modName)) {
               return "ASIO Driver";
             }
             // (4) DirectSound
@@ -322,9 +393,9 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
             if (modName.find("xaudio2") != std::string::npos) {
               return "XAudio2";
             }
-            // (6) WaveOut
-            if (modName.find("winmm") != std::string::npos) {
-              return "WaveOut (winmm.dll)";
+            // (6) pxtone (洞窟物語・オルガーニャ等の音源エンジン)
+            if (modName.find("pxtone") != std::string::npos) {
+              return "pxtone (Organya)";
             }
           }
         }
@@ -357,9 +428,6 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
                         lowerStr.find("audiodriverwasapi") !=
                             std::string::npos) {
                       return "WASAPI (Godot AudioDriver)";
-                    }
-                    if (lowerStr.find("audioserver") != std::string::npos) {
-                      return "AudioServer (Godot)";
                     }
                   }
                 }
@@ -939,7 +1007,7 @@ bool ThreadIsolator::ScanAndIsolate() {
   bool hasUnstartedApp = false;
   for (const auto &r : m_config.rules) {
     if (!r.isBypassed) {
-      if (!r.isRunning || (r.isChromium == 1 && r.audioServicePid == 0)) {
+      if (!r.isRunning || (r.appType == 2 && r.audioServicePid == 0)) {
         hasUnstartedApp = true;
         break;
       }
@@ -1014,7 +1082,7 @@ bool ThreadIsolator::ScanAndIsolate() {
 
     auto rIt = runningProcesses.find(ToLowerA(r.processName));
     if (rIt != runningProcesses.end()) {
-      if (r.isChromium == 1) {
+      if (r.appType == 2) {
         // Chromium 系: スレッド走査が必要なのは特定済みの AudioService PID のみ
         if (r.audioServicePid != 0) {
           activeTargetPids.insert(r.audioServicePid);
@@ -1040,15 +1108,27 @@ bool ThreadIsolator::ScanAndIsolate() {
           continue;
 
         HANDLE hCurThread = NULL;
-        while (s_pfnNtGetNextThread(hProc, hCurThread, THREAD_QUERY_INFORMATION, 0, 0, &hCurThread) == 0) {
-          DWORD tid = GetThreadId(hCurThread);
-          if (tid != 0) {
-            THREADENTRY32 te = {0};
-            te.dwSize = sizeof(te);
-            te.th32OwnerProcessID = pid;
-            te.th32ThreadID = tid;
-            processThreads[pid].push_back(te);
+        HANDLE hNextThread = NULL;
+        while (s_pfnNtGetNextThread(hProc, hCurThread, THREAD_QUERY_INFORMATION, 0, 0, &hNextThread) == 0) {
+          if (hCurThread) {
+            CloseHandle(hCurThread);
           }
+          hCurThread = hNextThread;
+
+          DWORD exitCode = 0;
+          if (GetExitCodeThread(hCurThread, &exitCode) && exitCode == STILL_ACTIVE) {
+            DWORD tid = GetThreadId(hCurThread);
+            if (tid != 0) {
+              THREADENTRY32 te = {0};
+              te.dwSize = sizeof(te);
+              te.th32OwnerProcessID = pid;
+              te.th32ThreadID = tid;
+              processThreads[pid].push_back(te);
+            }
+          }
+        }
+        if (hCurThread) {
+          CloseHandle(hCurThread);
         }
         CloseHandle(hProc);
       }
@@ -1096,7 +1176,7 @@ bool ThreadIsolator::ScanAndIsolate() {
                       rule.isRunning = true;
                       rule.detectedThreadName = "PID " + std::to_string(rule.lastAudioPid) + " / TID " + std::to_string(rule.lastAudioTid);
                       m_trackedAudioThreads[rule.lastAudioPid][rule.lastAudioTid] = rule.detectedThreadName;
-                      if (rule.isChromium == 1) {
+                      if (rule.appType == 2) {
                         rule.audioServicePid = rule.lastAudioPid;
                         m_chromiumThreadTracks[rule.lastAudioPid][rule.lastAudioTid].flag = 2;
                         m_chromiumAudioStates[rule.lastAudioPid].initialEvaluated = true;
@@ -1238,20 +1318,42 @@ bool ThreadIsolator::ScanAndIsolate() {
       continue;
     }
 
-    // Chromium 系ブラウザ自動判定 (初回のみ exe ファイルを走査)
-    if (rule.isChromium == -1) {
+    // モード 0: 初回自動判定 (0: 未判定, 1: 非Chromium, 2: Chromium系, 3: DAW型高負荷)
+    if (rule.appType == 0) {
       HANDLE hFirstProc = OpenProcess(
           PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, it->second[0]);
       if (hFirstProc) {
-        rule.isChromium = DetectChromiumExe(hFirstProc) ? 1 : 0;
+        if (DetectChromiumExe(hFirstProc)) {
+          rule.appType = 2; // Chromium 系
+        }
         CloseHandle(hFirstProc);
-        char cLog[128];
-        snprintf(cLog, sizeof(cLog), "Chromium detect: '%s' -> isChromium=%d",
-                 rule.processName.c_str(), rule.isChromium);
-        LogDebug(cLog);
-      } else {
-        rule.isChromium = 0;
       }
+      if (rule.appType == 0) {
+        // Time Critical (優先度 15 / basePri >= 15) スレッド数を計数
+        int tcCount = 0;
+        auto ptIt = processThreads.find(it->second[0]);
+        if (ptIt != processThreads.end()) {
+          for (const auto &te : ptIt->second) {
+            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (hTh) {
+              int pri = GetThreadPriority(hTh);
+              if (pri == THREAD_PRIORITY_TIME_CRITICAL || te.tpBasePri >= 15) {
+                tcCount++;
+              }
+              CloseHandle(hTh);
+            }
+          }
+        }
+        if (tcCount >= 2) {
+          rule.appType = 3; // DAW 型高負荷アプリ (Nuendo, Cubase 等)
+        } else {
+          rule.appType = 1; // 通常の非 Chromium (ゲーム・一般アプリ)
+        }
+      }
+      char cLog[128];
+      snprintf(cLog, sizeof(cLog), "AppType detect: '%s' -> appType=%d",
+               rule.processName.c_str(), rule.appType);
+      LogDebug(cLog);
     }
 
     int totalThreadCount = 0;
@@ -1275,9 +1377,8 @@ bool ThreadIsolator::ScanAndIsolate() {
     }
     DWORD_PTR parentMask = audioMask | baseNormal;
 
-    // ── Chromium 専用パス: Audio Service のみスレッド走査、他は AffinityMask
-    // のみ ──
-    if (rule.isChromium == 1) {
+    // ── Chromium 専用パス: Audio Service のみスレッド走査、他は AffinityMask のみ ──
+    if (rule.appType == 2) {
       DWORD audioServicePid = rule.audioServicePid;
 
       // キャッシュ済み Audio Service PID の生存チェック
@@ -1439,12 +1540,24 @@ bool ThreadIsolator::ScanAndIsolate() {
       int activeAudioCount = 0;
       DWORD lastAudioTid = 0;
 
-      // 新スレッド (初登場) を検知した場合は通常コアへ退避し、サイクルベースラインを記録
+      // 生存スレッドの TID セットを構築し、OS上で終了したスレッドのみ tracks から削除
+      std::unordered_set<DWORD> aliveTids;
+      for (const auto &te : ptIt->second) {
+        aliveTids.insert(te.th32ThreadID);
+      }
+      for (auto itTr = tracks.begin(); itTr != tracks.end();) {
+        if (aliveTids.find(itTr->first) == aliveTids.end()) {
+          itTr = tracks.erase(itTr);
+        } else {
+          ++itTr;
+        }
+      }
+
+      // 新スレッド (初登場) を検知した場合、サイクルベースラインを記録
       for (const auto &te : ptIt->second) {
         if (tracks.find(te.th32ThreadID) == tracks.end()) {
-          HANDLE hTh = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+          HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
           if (hTh) {
-            SetThreadAffinityMask(hTh, normalMask);
             ULONG64 curC = 0;
             QueryThreadCycleTime(hTh, &curC);
             tracks[te.th32ThreadID].flag = 0;
@@ -1454,54 +1567,20 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      // スパイク防止検証ヘルパー:
-      // flag != 2 の新TIDで Delta > 5M を発見後、250ms 間隔で追加2回計測
-      // 計3回すべて同一TIDが首位かつ活動中なら真と判定
-      auto verifySpikeTriad = [&](DWORD candTid) -> bool {
-        for (int r = 0; r < 2; ++r) {
-          Sleep(250);
-          DWORD rTopTid = 0;
-          ULONG64 rMaxDelta = 0;
-          for (const auto &te : ptIt->second) {
-            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-            if (hTh) {
-              ULONG64 curC = 0;
-              if (QueryThreadCycleTime(hTh, &curC)) {
-                auto &tr = tracks[te.th32ThreadID];
-                if (tr.lastCycles > 0 && curC >= tr.lastCycles) {
-                  ULONG64 d = curC - tr.lastCycles;
-                  if (d > rMaxDelta) {
-                    rMaxDelta = d;
-                    rTopTid = te.th32ThreadID;
-                  }
-                }
-                tr.lastCycles = curC;
-              }
-              CloseHandle(hTh);
-            }
-          }
-          if (rTopTid != candTid || rMaxDelta < 1000000ULL) {
-            return false;
-          }
-        }
-        return true;
-      };
-
       // オーディオ確定・隔離ヘルパー:
-      // 対象スレッドを flag = 2 として audioMask を適用し、他スレッドは flag = 1 として normalMask を適用
+      // 確定スレッドに audioMask を適用。他スレッド (flag != 2) は normalMask へ退避
       auto applyAudioIsolation = [&](DWORD audioTid) {
+        tracks[audioTid].flag = 2;
+        HANDLE hTh = OpenThread(
+            THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, audioTid);
+        if (hTh) {
+          SetThreadAffinityMask(hTh, audioMask);
+          SetThreadPriority(hTh, rule.audioPriority);
+          SetThreadIdealProcessor(hTh, static_cast<DWORD>(rule.audioCore));
+          CloseHandle(hTh);
+        }
         for (const auto &te : ptIt->second) {
-          if (te.th32ThreadID == audioTid) {
-            tracks[te.th32ThreadID].flag = 2;
-            HANDLE hTh = OpenThread(
-                THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-            if (hTh) {
-              SetThreadAffinityMask(hTh, audioMask);
-              SetThreadPriority(hTh, rule.audioPriority);
-              SetThreadIdealProcessor(hTh, static_cast<DWORD>(rule.audioCore));
-              CloseHandle(hTh);
-            }
-          } else {
+          if (te.th32ThreadID != audioTid && tracks[te.th32ThreadID].flag != 2) {
             tracks[te.th32ThreadID].flag = 1;
             HANDLE hOther = OpenThread(THREAD_SET_INFORMATION, FALSE, te.th32ThreadID);
             if (hOther) {
@@ -1519,124 +1598,210 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.searchPhase = 0;
         rule.searchTurns = 0;
         audioState.initialEvaluated = true;
+        audioState.samplingActive = false;
+        audioState.step = 1;
+        audioState.d.clear();
         stateChanged = true;
       };
 
-      if (!rule.isAudioIsolated) {
-        // 未確定状態: sleeping... に落とさず PID / Searching... を維持して待機・監視
+      // ── Step 1: 初期ベースライン記録 ──
+      if (audioState.step == 1) {
+        for (const auto &te : ptIt->second) {
+          if (tracks[te.th32ThreadID].flag == 0) {
+            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (hTh) {
+              ULONG64 curC = 0;
+              QueryThreadCycleTime(hTh, &curC);
+              tracks[te.th32ThreadID].lastCycles = curC;
+              tracks[te.th32ThreadID].lastDelta = 0;
+              CloseHandle(hTh);
+            }
+          }
+        }
+        audioState.step = 2;
+        audioState.samplingActive = false;
+        audioState.d.clear();
+      }
+      // ── Step 2: 待機ループ (最小ルーティン) ──
+      else if (audioState.step == 2) {
+        int normalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
+        ULONG64 step2Threshold = static_cast<ULONG64>(5000000ULL) * normalMs / 1000ULL;
+        if (step2Threshold < 1000000ULL) step2Threshold = 1000000ULL;
+
+        bool hasHighDelta = false;
+        for (const auto &te : ptIt->second) {
+          if (tracks[te.th32ThreadID].flag == 0) {
+            HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (hTh) {
+              ULONG64 curC = 0;
+              if (QueryThreadCycleTime(hTh, &curC)) {
+                if (tracks[te.th32ThreadID].lastCycles > 0 && curC >= tracks[te.th32ThreadID].lastCycles) {
+                  ULONG64 delta = curC - tracks[te.th32ThreadID].lastCycles;
+                  tracks[te.th32ThreadID].lastDelta = delta;
+                  if (delta >= step2Threshold) {
+                    hasHighDelta = true;
+                  }
+                }
+                tracks[te.th32ThreadID].lastCycles = curC;
+              }
+              CloseHandle(hTh);
+            }
+          }
+        }
+
+        if (hasHighDelta) {
+          // Delta >= 5M/1s 相当を検知: TID 昇順 n で配列 d(n) を構築し Step 3 へ
+          audioState.d.clear();
+          std::vector<DWORD> flag0Tids;
+          for (const auto &te : ptIt->second) {
+            if (tracks[te.th32ThreadID].flag == 0) {
+              flag0Tids.push_back(te.th32ThreadID);
+            }
+          }
+          std::sort(flag0Tids.begin(), flag0Tids.end());
+
+          for (DWORD t : flag0Tids) {
+            ThreadSamplingEntry entry;
+            entry.tid = t;
+            entry.deltas[0] = static_cast<int64_t>(tracks[t].lastDelta);
+            entry.lastCycle = tracks[t].lastCycles;
+            audioState.d.push_back(entry);
+          }
+
+          audioState.k = 1;
+          audioState.samplingActive = true;
+          audioState.isDecline = rule.isDeclineBoost;
+          audioState.step = 3;
+
+          std::string sLabel = "PID " + std::to_string(audioServicePid) + " / Sampling (1/9)...";
+          if (rule.detectedThreadName != sLabel) {
+            rule.detectedThreadName = sLabel;
+            stateChanged = true;
+          }
+        }
+      }
+      // ── Step 3 & Step 4: サンプリング蓄積ループ & 候補絞り込み判定 ──
+      else if (audioState.step == 3) {
+        int sampleIntervalMs = audioState.isDecline ? 1000 : (m_config.boostPollingIntervalMs > 0 ? m_config.boostPollingIntervalMs : 250);
+        ULONG64 sampleThreshold = static_cast<ULONG64>(5000000ULL) * sampleIntervalMs / 1000ULL;
+        if (sampleThreshold < 1000000ULL) sampleThreshold = 1000000ULL;
+
+        // k 回目の Delta 計測
+        for (auto &entry : audioState.d) {
+          if (entry.deltas[0] == -1) continue; // 脱落済み
+
+          if (aliveTids.find(entry.tid) == aliveTids.end()) {
+            entry.deltas[0] = -1; // スレッド消滅脱落
+            continue;
+          }
+
+          HANDLE hTh = OpenThread(THREAD_QUERY_INFORMATION, FALSE, entry.tid);
+          if (!hTh) {
+            entry.deltas[0] = -1;
+            continue;
+          }
+
+          ULONG64 curC = 0;
+          if (QueryThreadCycleTime(hTh, &curC)) {
+            if (entry.lastCycle > 0 && curC >= entry.lastCycle) {
+              ULONG64 delta = curC - entry.lastCycle;
+              if (audioState.k < 10) {
+                entry.deltas[audioState.k] = static_cast<int64_t>(delta);
+              }
+            } else {
+              if (audioState.k < 10) entry.deltas[audioState.k] = 0;
+            }
+            entry.lastCycle = curC;
+          } else {
+            entry.deltas[0] = -1;
+          }
+          CloseHandle(hTh);
+        }
+
+        audioState.k++;
+
+        // k < 3 なら Step 3 継続
+        if (audioState.k < 3) {
+          std::string sLabel = "PID " + std::to_string(audioServicePid) + " / Sampling (" + std::to_string(audioState.k) + "/9)...";
+          if (rule.detectedThreadName != sLabel) {
+            rule.detectedThreadName = sLabel;
+            stateChanged = true;
+          }
+        } else {
+          // ── Step 4: 候補絞り込み判定 ──
+          int normalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
+          ULONG64 step2Threshold = static_cast<ULONG64>(5000000ULL) * normalMs / 1000ULL;
+          if (step2Threshold < 1000000ULL) step2Threshold = 1000000ULL;
+
+          // d(a) から順に Δ(0...k-1) がすべて 5M/s 相当の勢いか検査
+          for (auto &entry : audioState.d) {
+            if (entry.deltas[0] == -1) continue;
+
+            for (int i = 0; i < audioState.k; ++i) {
+              ULONG64 req = (i == 0) ? step2Threshold : sampleThreshold;
+              if (entry.deltas[i] < static_cast<int64_t>(req)) {
+                entry.deltas[0] = -1; // 基準割れ脱落
+                break;
+              }
+            }
+          }
+
+          // 残存候補 (!=-1) のカウント
+          int survivorCount = 0;
+          DWORD survivorTid = 0;
+          for (const auto &entry : audioState.d) {
+            if (entry.deltas[0] != -1) {
+              survivorCount++;
+              survivorTid = entry.tid;
+            }
+          }
+
+          if (survivorCount == 1) {
+            // 【確定】1つだけに絞り込み成功！
+            applyAudioIsolation(survivorTid);
+            char tLog[128];
+            snprintf(tLog, sizeof(tLog),
+                     "Chromium audio thread verified: PID=%lu, TID=%lu (sampling k=%d)",
+                     audioServicePid, survivorTid, audioState.k);
+            LogDebug(tLog);
+          } else if (survivorCount == 0 || audioState.k > 9) {
+            // 全滅 または k > 9 で絞り込めず: リセットして Step 1 へ
+            audioState.samplingActive = false;
+            audioState.step = 1;
+            audioState.d.clear();
+          } else {
+            // survivorCount > 1: 複数候補残存、Step 3 継続してさらにサンプリング
+            std::string sLabel = "PID " + std::to_string(audioServicePid) + " / Sampling (" + std::to_string(audioState.k) + "/9)...";
+            if (rule.detectedThreadName != sLabel) {
+              rule.detectedThreadName = sLabel;
+              stateChanged = true;
+            }
+          }
+        }
+      }
+
+      // 生存しているオーディオ確定スレッド (flag == 2) の確認
+      for (const auto &te : ptIt->second) {
+        auto tIt = tracks.find(te.th32ThreadID);
+        if (tIt != tracks.end() && tIt->second.flag == 2) {
+          activeAudioCount++;
+          lastAudioTid = te.th32ThreadID;
+        }
+      }
+
+      if (activeAudioCount == 0) {
+        // オーディオスレッド消滅: sleeping... に落とさず PID / Searching... を維持して待機
+        rule.isAudioIsolated = false;
         rule.searchPhase = 1;
+        rule.searchTurns = 0;
         rule.activePid = audioServicePid;
         rule.activeAudioTid = 0;
-
-        DWORD topTid = 0;
-        ULONG64 maxDelta = 0;
-
-        for (const auto &te : ptIt->second) {
-          auto &tr = tracks[te.th32ThreadID];
-          HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-          if (hThread) {
-            ULONG64 curCycles = 0;
-            if (QueryThreadCycleTime(hThread, &curCycles)) {
-              if (tr.lastCycles > 0 && curCycles >= tr.lastCycles) {
-                ULONG64 delta = curCycles - tr.lastCycles;
-                if (delta >= 5000000ULL && delta > maxDelta) {
-                  maxDelta = delta;
-                  topTid = te.th32ThreadID;
-                }
-              }
-              tr.lastCycles = curCycles;
-            }
-            CloseHandle(hThread);
-          }
-        }
-
-        if (topTid != 0 && verifySpikeTriad(topTid)) {
-          // 計3回確認完了: flag = 2 として確定・隔離
-          applyAudioIsolation(topTid);
-          char tLog[128];
-          snprintf(tLog, sizeof(tLog),
-                   "Chromium audio thread verified in Searching...: PID=%lu, TID=%lu, delta=%llu",
-                   audioServicePid, topTid, maxDelta);
-          LogDebug(tLog);
-        } else {
-          // 5M以上の活動が未出現またはスパイク破棄: sleeping... に落とさず PID / Searching... を維持
-          std::string searchLabel = "PID " + std::to_string(audioServicePid) + " / Searching...";
-          if (rule.detectedThreadName != searchLabel) {
-            rule.detectedThreadName = searchLabel;
-            stateChanged = true;
-          }
-        }
-      } else {
-        // --- 定常時フェーズ: エフェメラルスレッド追従 (3回検証による確実な交代) ---
-        DWORD newTopTid = 0;
-        ULONG64 newMaxDelta = 0;
-
-        for (const auto &te : ptIt->second) {
-          auto &tr = tracks[te.th32ThreadID];
-          HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-          if (hThread) {
-            ULONG64 curCycles = 0;
-            if (QueryThreadCycleTime(hThread, &curCycles)) {
-              if (tr.lastCycles > 0 && curCycles >= tr.lastCycles) {
-                ULONG64 delta = curCycles - tr.lastCycles;
-                // flag != 2 の新TIDかつ 5M 超を走査
-                if (tr.flag != 2 && delta >= 5000000ULL && delta > newMaxDelta) {
-                  newMaxDelta = delta;
-                  newTopTid = te.th32ThreadID;
-                }
-              }
-              tr.lastCycles = curCycles;
-            }
-            CloseHandle(hThread);
-          }
-        }
-
-        if (newTopTid != 0 && verifySpikeTriad(newTopTid)) {
-          // 計3回確認完了: 通過スレッドに flag = 2 を付与し audio affinity を適用 (旧スレッドの退避は行わない)
-          tracks[newTopTid].flag = 2;
-          HANDLE hTh = OpenThread(
-              THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, newTopTid);
-          if (hTh) {
-            SetThreadAffinityMask(hTh, audioMask);
-            SetThreadPriority(hTh, rule.audioPriority);
-            SetThreadIdealProcessor(hTh, static_cast<DWORD>(rule.audioCore));
-            CloseHandle(hTh);
-          }
-          activeAudioCount++;
-          lastAudioTid = newTopTid;
-          rule.activeAudioTid = newTopTid;
-          rule.detectedThreadName = "PID " + std::to_string(audioServicePid) + " / TID " + std::to_string(newTopTid);
+        std::string searchLabel = "PID " + std::to_string(audioServicePid) + " / Searching...";
+        if (rule.detectedThreadName != searchLabel && !audioState.samplingActive) {
+          rule.detectedThreadName = searchLabel;
           stateChanged = true;
-
-          char sLog[128];
-          snprintf(sLog, sizeof(sLog),
-                   "Chromium ephemeral audio thread isolated: PID=%lu, TID=%lu, delta=%llu",
-                   audioServicePid, newTopTid, newMaxDelta);
-          LogDebug(sLog);
         }
-
-        // 生存しているオーディオ確定スレッド (flag == 2) の確認
-        for (const auto &te : ptIt->second) {
-          auto tIt = tracks.find(te.th32ThreadID);
-          if (tIt != tracks.end() && tIt->second.flag == 2) {
-            activeAudioCount++;
-            lastAudioTid = te.th32ThreadID;
-          }
-        }
-
-        if (activeAudioCount == 0) {
-          // オーディオスレッド消滅: sleeping... に落とさず PID / Searching... を維持して待機
-          rule.isAudioIsolated = false;
-          rule.searchPhase = 1;
-          rule.searchTurns = 0;
-          rule.activePid = audioServicePid;
-          rule.activeAudioTid = 0;
-          std::string searchLabel = "PID " + std::to_string(audioServicePid) + " / Searching...";
-          if (rule.detectedThreadName != searchLabel) {
-            rule.detectedThreadName = searchLabel;
-            stateChanged = true;
-          }
-        }
+      }
 
         if (activeAudioCount > 0) {
           if (rule.activePid != audioServicePid) {
@@ -1653,7 +1818,6 @@ bool ThreadIsolator::ScanAndIsolate() {
             stateChanged = true;
           }
         }
-      }
 
       CloseHandle(hAsProc);
 
@@ -1818,33 +1982,36 @@ bool ThreadIsolator::ScanAndIsolate() {
               // 未検査スレッドのモジュール/シグネチャ検査 (生涯1回)
               if (d > 0 && sampleState.inspectedTids.find(ti.tid) == sampleState.inspectedTids.end()) {
                 sampleState.inspectedTids.insert(ti.tid);
-                EnsurePsapiLoaded();
-                void *sAddr = QueryThreadStartAddress(ti.hThread);
-                std::string modName = "";
-                if (sAddr && s_pfnGetMappedFileNameA) {
-                  char mPath[MAX_PATH] = {0};
-                  MEMORY_BASIC_INFORMATION mbi = {0};
-                  if (VirtualQueryEx(hProcess, sAddr, &mbi, sizeof(mbi)) && mbi.AllocationBase) {
-                    if (s_pfnGetMappedFileNameA(hProcess, mbi.AllocationBase, mPath, sizeof(mPath)) > 0) {
-                      modName = ToLowerA(mPath);
+                std::string stackSig = QueryCallstackAudioSignature(hProcess, ti.hThread);
+
+                if (rule.appType == 3) {
+                  // モード 3: DAW型高負荷アプリ (Nuendo, Cubase 等)
+                  // 初回: シグネチャ合致で候補登録、さらに timeclit に flag = 1 を刻印
+                  if (!stackSig.empty()) {
+                    sampleState.audioCandidateTids.insert(ti.tid);
+                    bool isTimeCritical = (ti.priority == THREAD_PRIORITY_TIME_CRITICAL || ti.basePri >= 15);
+                    if (isTimeCritical) {
+                      m_threadFlags[pid][ti.tid] = 1; // 救済用フラグ
                     }
                   }
-                }
-                std::string stackSig = QueryCallstackAudioSignature(hProcess, ti.hThread);
-                if (!stackSig.empty() ||
-                    modName.find("dsound.dll") != std::string::npos ||
-                    modName.find("winmm.dll") != std::string::npos ||
-                    modName.find("pxtone") != std::string::npos ||
-                    modName.find("audioses") != std::string::npos ||
-                    modName.find("instantaud") != std::string::npos ||
-                    modName.find("audio") != std::string::npos ||
-                    modName.find("sound") != std::string::npos) {
-                  sampleState.audioCandidateTids.insert(ti.tid);
+                } else {
+                  // モード 1: 非 Chromium (ゲーム等)
+                  // 4KB スタック走査のみ (開始アドレス走査は完全撤廃、pxtone 含む)
+                  if (!stackSig.empty()) {
+                    sampleState.audioCandidateTids.insert(ti.tid);
+                  }
                 }
               }
 
-              // 判定: Delta >= 5M、またはオーディオ候補で delta > 0
-              if (d >= 5000000ULL || (sampleState.audioCandidateTids.count(ti.tid) && d > 0)) {
+              // 判定: (flag == 1 || timeclit) かつ (オーディオ候補 かつ Delta >= 5M)
+              bool isCandidate = (sampleState.audioCandidateTids.count(ti.tid) > 0);
+              bool isEligible = true;
+              if (rule.appType == 3) {
+                isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
+                              ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
+                              ti.basePri >= 15);
+              }
+              if (isCandidate && isEligible && d >= 5000000ULL) {
                 if (d > maxDelta) {
                   maxDelta = d;
                   candTid = ti.tid;
@@ -1933,7 +2100,15 @@ bool ThreadIsolator::ScanAndIsolate() {
               }
               sampleState.lastCycles[ti.tid] = curCycle;
 
-              if (d >= 5000000ULL || (sampleState.audioCandidateTids.count(ti.tid) && d > 0)) {
+              // 判定: (flag == 1 || timeclit) かつ (オーディオ候補 かつ Delta >= 5M)
+              bool isCandidate = (sampleState.audioCandidateTids.count(ti.tid) > 0);
+              bool isEligible = true;
+              if (rule.appType == 3) {
+                isEligible = (m_threadFlags[pid][ti.tid] == 1 ||
+                              ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
+                              ti.basePri >= 15);
+              }
+              if (isCandidate && isEligible && d >= 5000000ULL) {
                 if (d > maxDelta) {
                   maxDelta = d;
                   candTid = ti.tid;
@@ -2236,6 +2411,30 @@ bool ThreadIsolator::IsHeuristicsActive() const {
     }
   }
   return false;
+}
+
+bool ThreadIsolator::IsFastPollingRequired() const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  for (const auto &pair : m_chromiumAudioStates) {
+    if (pair.second.samplingActive && !pair.second.isDecline) {
+      return true;
+    }
+  }
+  return false;
+}
+
+UINT ThreadIsolator::GetDesiredPollingIntervalMs() const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  for (const auto &pair : m_chromiumAudioStates) {
+    if (pair.second.samplingActive) {
+      if (pair.second.isDecline) {
+        return 1000;
+      }
+      int boostMs = m_config.boostPollingIntervalMs > 0 ? m_config.boostPollingIntervalMs : 250;
+      return static_cast<UINT>(boostMs);
+    }
+  }
+  return static_cast<UINT>(m_config.pollingIntervalMs > 0 ? m_config.pollingIntervalMs : 500);
 }
 
 } // namespace ati

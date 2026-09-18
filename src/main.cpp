@@ -329,6 +329,11 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
     );
     config.pollingIntervalMs = ati::ThreadIsolator::NormalizePollingInterval(config.pollingIntervalMs);
 
+    config.boostPollingIntervalMs = GetPrivateProfileIntA(
+        "Global", "BoostPollingIntervalMs", 250, iniPath.c_str()
+    );
+    if (config.boostPollingIntervalMs <= 0) config.boostPollingIntervalMs = 250;
+
     g_alwaysOnTop = (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
     config.enableHeuristics = true;
 
@@ -398,12 +403,14 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             rule.targetPriority = static_cast<DWORD>(atoi(v.c_str()));
                         } else if (k == "Bypass" || k == "Ignore") {
                             rule.isBypassed = (atoi(v.c_str()) != 0);
-                        } else if (k == "IsChromium") {
-                            rule.isChromium = atoi(v.c_str());
+                        } else if (k == "AppType" || k == "Normchrom") {
+                            rule.appType = atoi(v.c_str());
                         } else if (k == "AudioPid") {
                             rule.lastAudioPid = static_cast<DWORD>(atoi(v.c_str()));
                         } else if (k == "AudioTid") {
                             rule.lastAudioTid = static_cast<DWORD>(atoi(v.c_str()));
+                        } else if (k == "Decline") {
+                            rule.isDeclineBoost = (atoi(v.c_str()) != 0);
                         }
                     }
                 }
@@ -441,6 +448,11 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
     );
 
     WritePrivateProfileStringA(
+        "Global", "BoostPollingIntervalMs", 
+        std::to_string(config.boostPollingIntervalMs > 0 ? config.boostPollingIntervalMs : 250).c_str(), iniPath.c_str()
+    );
+
+    WritePrivateProfileStringA(
         "Global", "AlwaysOnTop", 
         g_alwaysOnTop ? "1" : "0", iniPath.c_str()
     );
@@ -450,7 +462,16 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         DWORD_PTR rMask = rule.audioAffinityMask 
             ? rule.audioAffinityMask 
             : ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
-        std::string val = "AudioCore:" + FormatMaskToCoreList(rMask);
+        std::string val;
+        if (rule.appType > 0) {
+            val += "AppType:" + std::to_string(rule.appType);
+        }
+        if (rule.isDeclineBoost) {
+            if (!val.empty()) val += ", ";
+            val += "Decline:1";
+        }
+        if (!val.empty()) val += ", ";
+        val += "AudioCore:" + FormatMaskToCoreList(rMask);
         val += ", AudioPriority:" + std::to_string(rule.audioPriority);
         if (rule.normalAffinityMask != 0) {
             char nHex[32] = { 0 };
@@ -460,16 +481,13 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         if (rule.targetPriority != 0) {
             val += ", TargetPriority:" + std::to_string(rule.targetPriority);
         }
-        if (rule.isBypassed) {
-            val += ", Bypass:1";
-        }
-        if (rule.isChromium >= 0) {
-            val += ", IsChromium:" + std::to_string(rule.isChromium);
-        }
         // 正常隔離中かつ稼働中のプロセスのみ、次回照合用として AudioPid / AudioTid を記録 (未起動やBypass時は消去)
         if (rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && rule.activeAudioTid != 0) {
             val += ", AudioPid:" + std::to_string(rule.activePid);
             val += ", AudioTid:" + std::to_string(rule.activeAudioTid);
+        }
+        if (rule.isBypassed) {
+            val += ", Bypass:1";
         }
         WritePrivateProfileStringA(
             "Processes", rule.processName.c_str(), val.c_str(), iniPath.c_str()
@@ -2119,10 +2137,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 SaveConfig(g_isolator.GetConfig(), g_iniPath);
             }
 
-            // タイマー設定 (ユーザー設定の 100/200/500/1000ms に固定)
+            // タイマー設定 (通常周期、または高速検証要求時は 250ms)
             static UINT s_currentInterval = 0;
             auto cfg = g_isolator.GetConfig();
-            UINT desiredInterval = cfg.pollingIntervalMs;
+            UINT desiredInterval = g_isolator.GetDesiredPollingIntervalMs();
             if (s_currentInterval != desiredInterval) {
                 SetTimer(hDlg, TIMER_POLLING_ID, desiredInterval, nullptr);
                 s_currentInterval = desiredInterval;
