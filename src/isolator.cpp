@@ -662,8 +662,13 @@ void ThreadIsolator::RestartSearch(size_t index) {
   if (turnsPerSec < 1) turnsPerSec = 1;
 
   rule.searchPhase = 1;
-  rule.searchTurns = 2 * turnsPerSec;
-  rule.detectedThreadName = "Searching...";
+  rule.searchTurns = 0;
+  if (rule.audioServicePid != 0) {
+    rule.detectedThreadName = "PID " + std::to_string(rule.audioServicePid) + " / Searching...";
+    rule.activePid = rule.audioServicePid;
+  } else {
+    rule.detectedThreadName = "Searching...";
+  }
   rule.isAudioIsolated = false;
   rule.activeAudioTid = 0;
   rule.chromiumScanAttempted = false;
@@ -1321,8 +1326,9 @@ bool ThreadIsolator::ScanAndIsolate() {
               m_chromiumThreadTracks.erase(pid);
               m_chromiumAudioStates.erase(pid);
               rule.searchPhase = 1;
-              rule.searchTurns = 2 * turnsPerSec;
-              rule.detectedThreadName = "Searching...";
+              rule.searchTurns = 0;
+              rule.activePid = pid;
+              rule.detectedThreadName = "PID " + std::to_string(pid) + " / Searching...";
               char asLog[128];
               snprintf(asLog, sizeof(asLog),
                        "Chromium AudioService found: PID=%lu", pid);
@@ -1517,149 +1523,48 @@ bool ThreadIsolator::ScanAndIsolate() {
       };
 
       if (!rule.isAudioIsolated) {
-        // 未確定状態: 新ステートマシン
-        if (rule.searchPhase == 0) {
-          rule.searchPhase = 1;
-          rule.searchTurns = 2 * turnsPerSec;
-          rule.detectedThreadName = "Searching...";
-          stateChanged = true;
+        // 未確定状態: sleeping... に落とさず PID / Searching... を維持して待機・監視
+        rule.searchPhase = 1;
+        rule.activePid = audioServicePid;
+        rule.activeAudioTid = 0;
+
+        DWORD topTid = 0;
+        ULONG64 maxDelta = 0;
+
+        for (const auto &te : ptIt->second) {
+          auto &tr = tracks[te.th32ThreadID];
+          HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+          if (hThread) {
+            ULONG64 curCycles = 0;
+            if (QueryThreadCycleTime(hThread, &curCycles)) {
+              if (tr.lastCycles > 0 && curCycles >= tr.lastCycles) {
+                ULONG64 delta = curCycles - tr.lastCycles;
+                if (delta >= 5000000ULL && delta > maxDelta) {
+                  maxDelta = delta;
+                  topTid = te.th32ThreadID;
+                }
+              }
+              tr.lastCycles = curCycles;
+            }
+            CloseHandle(hThread);
+          }
         }
 
-        if (rule.searchPhase == 1) {
-          // --- Phase 1: Searching... (2秒間: 2 * turnsPerSec ターン) ---
-          DWORD topTid = 0;
-          ULONG64 maxDelta = 0;
-
-          for (const auto &te : ptIt->second) {
-            auto &tr = tracks[te.th32ThreadID];
-            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-            if (hThread) {
-              ULONG64 curCycles = 0;
-              if (QueryThreadCycleTime(hThread, &curCycles)) {
-                if (tr.lastCycles > 0 && curCycles >= tr.lastCycles) {
-                  ULONG64 delta = curCycles - tr.lastCycles;
-                  if (delta >= 5000000ULL && delta > maxDelta) {
-                    maxDelta = delta;
-                    topTid = te.th32ThreadID;
-                  }
-                }
-                tr.lastCycles = curCycles;
-              }
-              CloseHandle(hThread);
-            }
-          }
-
-          if (topTid != 0 && verifySpikeTriad(topTid)) {
-            // 計3回確認完了: flag = 2 として確定・隔離
-            applyAudioIsolation(topTid);
-            char tLog[128];
-            snprintf(tLog, sizeof(tLog),
-                     "Chromium audio thread verified in Searching...: PID=%lu, TID=%lu, delta=%llu",
-                     audioServicePid, topTid, maxDelta);
-            LogDebug(tLog);
-          } else {
-            // 5M以上の活動が未出現またはスパイク破棄
-            if (rule.detectedThreadName != "Searching...") {
-              rule.detectedThreadName = "Searching...";
-              stateChanged = true;
-            }
-            rule.searchTurns--;
-            if (rule.searchTurns <= 0) {
-              // 2秒経過: カウントダウン Phase 2 へ移行
-              rule.searchPhase = 2;
-              rule.searchTurns = 8 * turnsPerSec; // 10秒から3秒終了までの8秒間
-              rule.detectedThreadName = "Standby 10";
-              stateChanged = true;
-            }
-          }
-        } else if (rule.searchPhase == 2) {
-          // --- Phase 2: Standby 10..3 (8秒間: 8 * turnsPerSec ターン) ---
-          // スレッド走査・計測・退避は一切行わず、秒数表示更新のみで完全休止 (CPU負荷 0.0%)
-          int sec = 3 + (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
-          std::string sName = "Standby " + std::to_string(sec);
-          if (rule.detectedThreadName != sName) {
-            rule.detectedThreadName = sName;
+        if (topTid != 0 && verifySpikeTriad(topTid)) {
+          // 計3回確認完了: flag = 2 として確定・隔離
+          applyAudioIsolation(topTid);
+          char tLog[128];
+          snprintf(tLog, sizeof(tLog),
+                   "Chromium audio thread verified in Searching...: PID=%lu, TID=%lu, delta=%llu",
+                   audioServicePid, topTid, maxDelta);
+          LogDebug(tLog);
+        } else {
+          // 5M以上の活動が未出現またはスパイク破棄: sleeping... に落とさず PID / Searching... を維持
+          std::string searchLabel = "PID " + std::to_string(audioServicePid) + " / Searching...";
+          if (rule.detectedThreadName != searchLabel) {
+            rule.detectedThreadName = searchLabel;
             stateChanged = true;
           }
-          rule.searchTurns--;
-          if (rule.searchTurns <= 0) {
-            // カウントダウン終了: 終盤再確定 Phase 3 へ移行
-            rule.searchPhase = 3;
-            rule.searchTurns = 2 * turnsPerSec; // 2秒間 (Standby 2..1)
-            rule.detectedThreadName = "Standby 2";
-            stateChanged = true;
-            // 基準サイクルタイムを再サンプリング
-            for (const auto &te : ptIt->second) {
-              HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-              if (hThread) {
-                ULONG64 curCycles = 0;
-                if (QueryThreadCycleTime(hThread, &curCycles)) {
-                  tracks[te.th32ThreadID].lastCycles = curCycles;
-                }
-                CloseHandle(hThread);
-              }
-            }
-          }
-        } else if (rule.searchPhase == 3) {
-          // --- Phase 3: 終盤再確定 Standby 2..1 (2秒間: 2 * turnsPerSec ターン) ---
-          int sec = (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
-          if (sec < 1) sec = 1;
-          std::string sName = "Standby " + std::to_string(sec);
-          if (rule.detectedThreadName != sName) {
-            rule.detectedThreadName = sName;
-            stateChanged = true;
-          }
-
-          DWORD topTid = 0;
-          ULONG64 maxDelta = 0;
-
-          for (const auto &te : ptIt->second) {
-            auto &tr = tracks[te.th32ThreadID];
-            HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
-            if (hThread) {
-              ULONG64 curCycles = 0;
-              if (QueryThreadCycleTime(hThread, &curCycles)) {
-                if (tr.lastCycles > 0 && curCycles >= tr.lastCycles) {
-                  ULONG64 delta = curCycles - tr.lastCycles;
-                  if (delta >= 5000000ULL && delta > maxDelta) {
-                    maxDelta = delta;
-                    topTid = te.th32ThreadID;
-                  }
-                }
-                tr.lastCycles = curCycles;
-              }
-              CloseHandle(hThread);
-            }
-          }
-
-          if (topTid != 0 && verifySpikeTriad(topTid)) {
-            // 計3回確認完了: flag = 2 として確定・隔離
-            applyAudioIsolation(topTid);
-            char tLog[128];
-            snprintf(tLog, sizeof(tLog),
-                     "Chromium audio thread verified in Standby 2..1: PID=%lu, TID=%lu, delta=%llu",
-                     audioServicePid, topTid, maxDelta);
-            LogDebug(tLog);
-          } else {
-            rule.searchTurns--;
-            if (rule.searchTurns <= 0) {
-              // 終盤再確定でも未検出: Phase 4 (sleeping...) へ移行
-              rule.searchPhase = 4;
-              rule.searchTurns = 0;
-              rule.detectedThreadName = "sleeping...";
-              rule.isAudioIsolated = false;
-              rule.activeAudioTid = 0;
-              stateChanged = true;
-            }
-          }
-        } else if (rule.searchPhase == 4) {
-          // --- Phase 4: sleeping... (完全放置ナッジ) ---
-          if (rule.detectedThreadName != "sleeping...") {
-            rule.detectedThreadName = "sleeping...";
-            stateChanged = true;
-          }
-          rule.isAudioIsolated = false;
-          rule.activeAudioTid = 0;
         }
       } else {
         // --- 定常時フェーズ: エフェメラルスレッド追従 (3回検証による確実な交代) ---
@@ -1720,13 +1625,17 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
 
         if (activeAudioCount == 0) {
-          // オーディオスレッド消滅: 再探索 Searching... へ
+          // オーディオスレッド消滅: sleeping... に落とさず PID / Searching... を維持して待機
           rule.isAudioIsolated = false;
           rule.searchPhase = 1;
-          rule.searchTurns = 2 * turnsPerSec;
-          rule.detectedThreadName = "Searching...";
+          rule.searchTurns = 0;
+          rule.activePid = audioServicePid;
           rule.activeAudioTid = 0;
-          stateChanged = true;
+          std::string searchLabel = "PID " + std::to_string(audioServicePid) + " / Searching...";
+          if (rule.detectedThreadName != searchLabel) {
+            rule.detectedThreadName = searchLabel;
+            stateChanged = true;
+          }
         }
 
         if (activeAudioCount > 0) {

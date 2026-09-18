@@ -56,4 +56,8 @@ arc.md
 build.ps1
 measure.ps1
 
+# Trash folder
+trush/
+
+
 
