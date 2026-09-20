@@ -10,6 +10,9 @@
 #include <vector>
 #include <sstream>
 #include <cmath>
+#include <unordered_set>
+#include <algorithm>
+#include <tlhelp32.h>
 
 #include "resource.h"
 #include "isolator.h"
@@ -275,6 +278,20 @@ static std::string FormatMaskToCoreLabels(DWORD_PTR mask, const std::vector<ati:
     return res;
 }
 
+static std::string FormatAudioMaskDisplay(DWORD_PTR mask, const std::vector<ati::CoreInfo>& cores) {
+    if (mask == 0) return "-";
+    int bits = 0;
+    for (int c = 0; c < 64; ++c) {
+        if ((mask & (1ULL << c)) != 0) bits++;
+    }
+    if (bits > 4) {
+        char hexBuf[32] = { 0 };
+        snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(mask));
+        return hexBuf;
+    }
+    return FormatMaskToCoreLabels(mask, cores);
+}
+
 static std::string FormatOtherThanLabels(bool isRunning, bool isBypassed, bool isAudioIsolated, DWORD_PTR audioMask, DWORD_PTR normalMask, int coreCount, const std::vector<ati::CoreInfo>& cores) {
     if (!isRunning || isBypassed) {
         return "-";
@@ -288,9 +305,20 @@ static std::string FormatOtherThanLabels(bool isRunning, bool isBypassed, bool i
     if (excludedMask == 0) {
         return "All";
     }
-    std::string exclStr = FormatMaskToCoreLabels(excludedMask, cores);
-    if (exclStr == "-" || exclStr.empty()) return "All";
-    return "!" + exclStr;
+    int exclBits = 0;
+    for (int c = 0; c < 64; ++c) {
+        if ((excludedMask & (1ULL << c)) != 0) exclBits++;
+    }
+    // 除外コア数が 4 個以下の場合は除外コアを列挙 (例: !#1, !#1,5)
+    if (exclBits <= 4) {
+        std::string exclStr = FormatMaskToCoreLabels(excludedMask, cores);
+        if (exclStr == "-" || exclStr.empty()) return "All";
+        return "!" + exclStr;
+    }
+    // 除外コアが多数 (5個以上) の場合は、通常コア有効マスクを HEX 表記 (例: 0x1D)
+    char hexBuf[32] = { 0 };
+    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(effectiveNormal));
+    return hexBuf;
 }
 
 // --- 設定の読み書き (ANSI) ---
@@ -433,6 +461,10 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                     }
                 }
 
+                if (rule.isBypassed) {
+                    rule.detectedThreadName = "Bypassed";
+                }
+
                 config.rules.push_back(rule);
             }
             p += strlen(p) + 1;
@@ -558,9 +590,9 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
         // 1: Process Name
         ListView_SetItemText(hList, static_cast<int>(i), 1, const_cast<LPSTR>(r.processName.c_str()));
 
-        // 2: For Audio (稼働時は #5 / #1,2 形式、停止時は -)
+        // 2: For Audio (稼働時は #5 / #1,2 形式または多コア時は HEX 形式、停止時は -)
         DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
-        std::string forAudioStr = r.isRunning ? FormatMaskToCoreLabels(mask, cores) : "-";
+        std::string forAudioStr = r.isRunning ? FormatAudioMaskDisplay(mask, cores) : "-";
         ListView_SetItemText(hList, static_cast<int>(i), 2, const_cast<LPSTR>(forAudioStr.c_str()));
 
         // 3: Other than
@@ -570,9 +602,14 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
         ListView_SetItemText(hList, static_cast<int>(i), 3, const_cast<LPSTR>(otherThanStr.c_str()));
 
         // 4: Audio Core PID/TID
-        std::string thName = r.detectedThreadName.empty() 
-            ? (r.isRunning ? "Scanning..." : "Not running") 
-            : r.detectedThreadName;
+        std::string thName;
+        if (r.isBypassed) {
+            thName = "Bypassed";
+        } else if (r.detectedThreadName.empty()) {
+            thName = r.isRunning ? "Scanning..." : "Not running";
+        } else {
+            thName = r.detectedThreadName;
+        }
         ListView_SetItemText(hList, static_cast<int>(i), 4, const_cast<LPSTR>(thName.c_str()));
 
         // 5: Pause / Verify (カスタムドロー描画、テキストは空)
@@ -620,7 +657,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
 
         // 2: For Audio
         DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
-        std::string forAudioStr = r.isRunning ? FormatMaskToCoreLabels(mask, cores) : "-";
+        std::string forAudioStr = r.isRunning ? FormatAudioMaskDisplay(mask, cores) : "-";
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 2, forAudioStr);
 
         // 3: Other than
@@ -630,9 +667,14 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 3, otherThanStr);
 
         // 4: Audio Core PID/TID
-        std::string thName = r.detectedThreadName.empty() 
-            ? (r.isRunning ? "Scanning..." : "Not running") 
-            : r.detectedThreadName;
+        std::string thName;
+        if (r.isBypassed) {
+            thName = "Bypassed";
+        } else if (r.detectedThreadName.empty()) {
+            thName = r.isRunning ? "Scanning..." : "Not running";
+        } else {
+            thName = r.detectedThreadName;
+        }
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 4, thName);
 
         // 5: Pause / Verify (カスタムドロー描画、テキストは空)
@@ -660,7 +702,8 @@ static void InitTrayIcon(HWND hWnd) {
     g_nid.uID = 1;
     g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
     g_nid.uCallbackMessage = WM_TRAYICON_MSG;
-    g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
+    g_nid.hIcon = LoadIconA(g_hInstance, MAKEINTRESOURCEA(IDI_APP_ICON));
+    if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     strcpy_s(g_nid.szTip, "Audio Thread Isolator (ATI)");
 
     Shell_NotifyIconA(NIM_ADD, &g_nid);
@@ -670,16 +713,17 @@ static void RemoveTrayIcon() {
     Shell_NotifyIconA(NIM_DELETE, &g_nid);
 }
 
-// --- affinity 表用サブクラスプロシージャ (表の内部スクロールを完全防止し常に先頭固定) ---
+// --- affinity 表用サブクラスプロシージャ (横スクロール許可、縦スクロールのみ抑止、マウスホイール横スクロール連動) ---
 static LRESULT CALLBACK AffinityTableSubclassProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (msg == WM_MOUSEWHEEL || msg == WM_VSCROLL || msg == WM_HSCROLL) {
+    if (msg == WM_VSCROLL) {
+        return 0; // 縦スクロールのみ抑止
+    }
+    if (msg == WM_MOUSEWHEEL) {
+        // マウスホイールの回転を横スクロール (WM_HSCROLL) に変換してコア一覧を快適にスクロール
+        short zDelta = GET_WHEEL_DELTA_WPARAM(wParam);
+        UINT code = (zDelta < 0) ? SB_LINERIGHT : SB_LINELEFT;
+        SendMessageA(hWnd, WM_HSCROLL, MAKEWPARAM(code, 0), 0);
         return 0;
-    }
-    if (msg == LVM_SCROLL) {
-        return FALSE;
-    }
-    if (msg == LVM_ENSUREVISIBLE) {
-        return TRUE;
     }
     WNDPROC pfnOld = (WNDPROC)GetPropA(hWnd, "ATI_OrigTableProc");
     if (msg == WM_NCDESTROY) {
@@ -691,9 +735,8 @@ static LRESULT CALLBACK AffinityTableSubclassProc(HWND hWnd, UINT msg, WPARAM wP
     }
     if (pfnOld) {
         LRESULT res = CallWindowProcA(pfnOld, hWnd, msg, wParam, lParam);
-        // クリックやフォーカス変化後に常に最上部(行0)へ戻す
-        if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_SETFOCUS || msg == WM_KILLFOCUS) {
-            CallWindowProcA(pfnOld, hWnd, LVM_SCROLL, 0, -9999);
+        if (msg == WM_PAINT || msg == WM_SIZE || msg == WM_NCCALCSIZE) {
+            ShowScrollBar(hWnd, SB_VERT, FALSE);
         }
         return res;
     }
@@ -708,11 +751,309 @@ static void SubclassAffinityTable(HWND hList) {
     }
 }
 
-// --- 全体設定ダイアログ (ANSI - 表形式 + 右詰め入力欄 + リサイズ対応) ---
+// --- CPU Sets 構造体・API 型定義 (Windows 10/11) ---
+#pragma pack(push, 8)
+typedef struct _ATI_SYSTEM_CPU_SET_INFORMATION {
+    DWORD Size;
+    DWORD Type; // 0 = CpuSetInformation
+    union {
+        struct {
+            DWORD Id;
+            WORD  Group;
+            BYTE  LogicalProcessorIndex;
+            BYTE  CoreIndex;
+            BYTE  LastLevelCacheIndex;
+            BYTE  EfficiencyClass;
+            BYTE  AllFlags;
+            BYTE  Reserved;
+            BYTE  SchedulingClass;
+            DWORD64 AllocationTag;
+        } CpuSet;
+    };
+} ATI_SYSTEM_CPU_SET_INFORMATION;
+#pragma pack(pop)
+
+typedef BOOL (WINAPI *PFN_GetSystemCpuSetInformation)(
+    void* Information,
+    ULONG BufferLength,
+    PULONG ReturnedLength,
+    HANDLE Process,
+    ULONG Flags
+);
+
+typedef BOOL (WINAPI *PFN_SetProcessDefaultCpuSets)(
+    HANDLE Process,
+    const ULONG *CpuSetIds,
+    ULONG CpuSetIdCount
+);
+
+// 揮発性メモリフラグ (起動時のみ保持、終了で消滅)
+static BOOL s_bUnlistedMaskApplied = FALSE;
+
+// 特権昇格 (SeDebugPrivilege)
+static void EnableDebugPrivilege() {
+    HANDLE hToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        TOKEN_PRIVILEGES tp = { 0 };
+        LUID luid = { 0 };
+        if (LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+        }
+        CloseHandle(hToken);
+    }
+}
+
+// リスト外プロセスへの CPU Sets 適用処理
+static bool ApplyCpuSetsToUnlistedProcesses(HWND hParent, DWORD_PTR targetMask) {
+    EnableDebugPrivilege();
+
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    if (!hK32) return false;
+    auto pfnGetSystemCpuSetInformation = (PFN_GetSystemCpuSetInformation)GetProcAddress(hK32, "GetSystemCpuSetInformation");
+    auto pfnSetProcessDefaultCpuSets = (PFN_SetProcessDefaultCpuSets)GetProcAddress(hK32, "SetProcessDefaultCpuSets");
+    if (!pfnGetSystemCpuSetInformation || !pfnSetProcessDefaultCpuSets) {
+        MessageBoxA(hParent, "CPU Sets API is not supported on this Windows version.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    ULONG bufSize = 0;
+    pfnGetSystemCpuSetInformation(nullptr, 0, &bufSize, GetCurrentProcess(), 0);
+    if (bufSize == 0) {
+        MessageBoxA(hParent, "Failed to query system CPU Sets information.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    std::vector<BYTE> buf(bufSize);
+    if (!pfnGetSystemCpuSetInformation(buf.data(), bufSize, &bufSize, GetCurrentProcess(), 0)) {
+        MessageBoxA(hParent, "Failed to retrieve system CPU Sets.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    std::vector<ULONG> targetCpuSetIds;
+    ULONG offset = 0;
+    while (offset + sizeof(DWORD) * 2 <= bufSize) {
+        auto* pInfo = reinterpret_cast<const ATI_SYSTEM_CPU_SET_INFORMATION*>(buf.data() + offset);
+        if (pInfo->Size == 0) break;
+        if (pInfo->Type == 0) { // CpuSetInformation
+            BYTE logicalIdx = pInfo->CpuSet.LogicalProcessorIndex;
+            if (logicalIdx < 64 && ((targetMask & (1ULL << logicalIdx)) != 0)) {
+                targetCpuSetIds.push_back(pInfo->CpuSet.Id);
+            }
+        }
+        offset += pInfo->Size;
+    }
+
+    if (targetCpuSetIds.empty()) {
+        MessageBoxA(hParent, "No CPU Set IDs matched the target mask.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+        return false;
+    }
+
+    // ホワイトリスト構築
+    std::unordered_set<std::string> whitelist;
+    whitelist.insert("ati.exe");
+    whitelist.insert("system");
+    whitelist.insert("system idle process");
+    for (const auto& r : g_isolator.GetConfig().rules) {
+        std::string lowerName = r.processName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+        whitelist.insert(lowerName);
+    }
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) {
+        MessageBoxA(hParent, "Failed to create process snapshot.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
+        return false;
+    }
+
+    DWORD myPid = GetCurrentProcessId();
+    int successCount = 0;
+    int skippedCount = 0;
+    int deniedCount = 0;
+
+    PROCESSENTRY32 pe = { sizeof(pe) };
+    if (Process32First(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid) {
+                skippedCount++;
+                continue;
+            }
+            std::string exeLower = pe.szExeFile;
+            std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::tolower);
+            if (whitelist.count(exeLower) > 0) {
+                skippedCount++;
+                continue;
+            }
+
+            HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!hProcess) {
+                hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+            }
+            if (!hProcess) {
+                deniedCount++;
+                continue;
+            }
+
+            if (pfnSetProcessDefaultCpuSets(hProcess, targetCpuSetIds.data(), static_cast<ULONG>(targetCpuSetIds.size()))) {
+                successCount++;
+            } else {
+                deniedCount++;
+            }
+            CloseHandle(hProcess);
+        } while (Process32Next(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "CPU Sets applied successfully!\n\n"
+        "- Target Mask: 0x%llX (%zu cores)\n"
+        "- Applied Processes: %d\n"
+        "- Whitelisted / Protected (Skipped): %d",
+        static_cast<unsigned long long>(targetMask),
+        targetCpuSetIds.size(),
+        successCount,
+        skippedCount + deniedCount);
+
+    MessageBoxA(hParent, msg, "ATI System CPU Sets", MB_OK | MB_ICONINFORMATION);
+    return true;
+}
+
+// リスト外プロセスへの CPU Sets 解除処理
+static bool ReleaseCpuSetsFromUnlistedProcesses(HWND hParent) {
+    EnableDebugPrivilege();
+
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    if (!hK32) return false;
+    auto pfnSetProcessDefaultCpuSets = (PFN_SetProcessDefaultCpuSets)GetProcAddress(hK32, "SetProcessDefaultCpuSets");
+    if (!pfnSetProcessDefaultCpuSets) return false;
+
+    std::unordered_set<std::string> whitelist;
+    whitelist.insert("ati.exe");
+    whitelist.insert("system");
+    whitelist.insert("system idle process");
+    for (const auto& r : g_isolator.GetConfig().rules) {
+        std::string lowerName = r.processName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
+        whitelist.insert(lowerName);
+    }
+
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap == INVALID_HANDLE_VALUE) return false;
+
+    DWORD myPid = GetCurrentProcessId();
+    int releasedCount = 0;
+
+    PROCESSENTRY32 pe = { sizeof(pe) };
+    if (Process32First(hSnap, &pe)) {
+        do {
+            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid) continue;
+            std::string exeLower = pe.szExeFile;
+            std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::tolower);
+            if (whitelist.count(exeLower) > 0) continue;
+
+            HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+            if (!hProcess) {
+                hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+            }
+            if (!hProcess) continue;
+
+            if (pfnSetProcessDefaultCpuSets(hProcess, nullptr, 0)) {
+                releasedCount++;
+            }
+            CloseHandle(hProcess);
+        } while (Process32Next(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+
+    char msg[256];
+    snprintf(msg, sizeof(msg),
+        "CPU Sets restrictions released successfully!\n\n"
+        "- Restored Processes: %d\n"
+        "All general processes restored to default all-core scheduling.",
+        releasedCount);
+
+    MessageBoxA(hParent, msg, "ATI System CPU Sets", MB_OK | MB_ICONINFORMATION);
+    return true;
+}
+
+// Priority ComboBox オーナードロー補助 (右詰め描画)
+static BOOL HandlePriorityComboMeasureItem(HWND hDlg, LPARAM lParam, UINT ctlId) {
+    LPMEASUREITEMSTRUCT pmis = reinterpret_cast<LPMEASUREITEMSTRUCT>(lParam);
+    if (pmis && pmis->CtlID == ctlId) {
+        float scale = GetDpiScaleForWindow(hDlg);
+        pmis->itemHeight = static_cast<UINT>(18 * scale);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL HandlePriorityComboDrawItem(HWND hDlg, LPARAM lParam, UINT ctlId) {
+    LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
+    if (pdis && pdis->CtlID == ctlId) {
+        if (pdis->itemID == static_cast<UINT>(-1)) {
+            return TRUE;
+        }
+        HDC hdc = pdis->hDC;
+        RECT rc = pdis->rcItem;
+        bool isSelected = (pdis->itemState & ODS_SELECTED) != 0;
+        bool isDisabled = (pdis->itemState & ODS_DISABLED) != 0;
+        bool isComboEdit = (pdis->itemState & ODS_COMBOBOXEDIT) != 0;
+
+        COLORREF bkCol = isDisabled ? GetSysColor(COLOR_BTNFACE) : (isSelected ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW));
+        COLORREF textCol = isDisabled ? GetSysColor(COLOR_GRAYTEXT) : (isSelected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
+
+        HBRUSH hBr = CreateSolidBrush(bkCol);
+        FillRect(hdc, &rc, hBr);
+        DeleteObject(hBr);
+
+        char text[64] = { 0 };
+        SendMessageA(pdis->hwndItem, CB_GETLBTEXT, pdis->itemID, reinterpret_cast<LPARAM>(text));
+
+        HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0));
+        if (!hFont) hFont = reinterpret_cast<HFONT>(SendMessageA(hDlg, WM_GETFONT, 0, 0));
+        if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        HGDIOBJ oldFont = SelectObject(hdc, hFont);
+
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, textCol);
+
+        float scale = GetDpiScaleForWindow(hDlg);
+        int extraLeft = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px相当 (6pxから2px右へ戻す)
+        RECT rcText = rc;
+        if (isComboEdit) {
+            rcText.right -= 6;
+        } else {
+            // ドロップダウンリスト内: 矢印ボタン幅分オフセット + 200%環境で4px相当を左へ微調整
+            int arrowW = GetSystemMetrics(SM_CXVSCROLL);
+            rcText.right -= (arrowW + 6 + extraLeft);
+        }
+        DrawTextA(hdc, text, -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+        SelectObject(hdc, oldFont);
+
+        if (pdis->itemState & ODS_FOCUS) {
+            DrawFocusRect(hdc, &rc);
+        }
+        return TRUE;
+    }
+    return FALSE;
+}
+
+// --- 全体設定ダイアログ (ANSI - 表形式 + 2行説明 + 押しやすいApply + リサイズ対応) ---
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     static ati::GlobalConfig s_tmpConfig;
 
     switch (msg) {
+    case WM_MEASUREITEM: {
+        if (HandlePriorityComboMeasureItem(hDlg, lParam, IDC_COMBO_AUDIO_PRIORITY)) {
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_INITDIALOG: {
         s_tmpConfig = g_isolator.GetConfig();
         if (s_tmpConfig.defaultAudioAffinityMask == 0) {
@@ -782,7 +1123,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             // 1 .. coreCount: コアラベル (#0, #1, P0, E0 等)
             for (int c = 0; c < coreCount; ++c) {
                 lvc.fmt = LVCFMT_CENTER;
-                lvc.cx = static_cast<int>(24 * scale);
+                lvc.cx = static_cast<int>(34 * scale);
                 lvc.iSubItem = 1 + c;
                 lvc.pszText = const_cast<LPSTR>(cores[c].label.c_str());
                 ListView_InsertColumn(hList, 1 + c, &lvc);
@@ -795,16 +1136,19 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             lvi.pszText = const_cast<LPSTR>("Default Audio Core");
             ListView_InsertItem(hList, &lvi);
 
-            // 行 1: Other than Audio
+            // 行 1: Excluded
             lvi.iItem = 1;
-            lvi.pszText = const_cast<LPSTR>("Other than Audio");
+            lvi.pszText = const_cast<LPSTR>("Excluded");
             ListView_InsertItem(hList, &lvi);
 
+            ShowScrollBar(hList, SB_VERT, FALSE);
             ListView_Scroll(hList, 0, -9999);
         }
 
-        // 入力ボックスの初期値設定
-        SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, FormatMaskToCoreList(s_tmpConfig.defaultAudioAffinityMask).c_str());
+        // 入力ボックスの初期値設定 (0x HEX 表示)
+        char aHex[32] = { 0 };
+        snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.defaultAudioAffinityMask));
+        SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, aHex);
 
         char hexBuf[32] = { 0 };
         snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
@@ -826,18 +1170,73 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
         SetDlgItemInt(hDlg, IDC_EDIT_POLLING_MS, s_tmpConfig.pollingIntervalMs, FALSE);
 
-        // 開いた初回起動時から Cancel ボタン右端と整列させるため初期レイアウトを強制適用
+        // リリースボタンの活性・非活性状態を反映
+        HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
+        if (hBtnRel) {
+            EnableWindow(hBtnRel, s_bUnlistedMaskApplied);
+        }
+
+        // 初回レイアウトを強制適用
         RECT rcInit;
         GetClientRect(hDlg, &rcInit);
         SendMessageA(hDlg, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rcInit.right, rcInit.bottom));
         return TRUE;
     }
 
+    case WM_DRAWITEM: {
+        if (HandlePriorityComboDrawItem(hDlg, lParam, IDC_COMBO_AUDIO_PRIORITY)) {
+            return TRUE;
+        }
+        LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
+        if (pdis && pdis->CtlID == IDC_BTN_RELEASE_MASK) {
+            HDC hdc = pdis->hDC;
+            RECT rc = pdis->rcItem;
+            bool isPressed = (pdis->itemState & ODS_SELECTED) != 0;
+            bool isDisabled = (pdis->itemState & ODS_DISABLED) != 0;
+
+            HBRUSH hBr = CreateSolidBrush(isDisabled ? RGB(242, 242, 242) : (isPressed ? RGB(220, 230, 224) : RGB(244, 247, 245)));
+            FillRect(hdc, &rc, hBr);
+            DeleteObject(hBr);
+
+            COLORREF borderColor = isDisabled ? RGB(208, 208, 208) : (isPressed ? RGB(75, 110, 88) : RGB(95, 135, 110));
+            HPEN hPen = CreatePen(PS_SOLID, 1, borderColor);
+            HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
+            HBRUSH hOldBr = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+            RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 4, 4);
+            SelectObject(hdc, hOldBr);
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hPen);
+
+            SetBkMode(hdc, TRANSPARENT);
+            COLORREF textColor = isDisabled ? RGB(160, 160, 160) : RGB(60, 95, 75); // 落ち着いた鈍い緑
+            SetTextColor(hdc, textColor);
+
+            HFONT hBaseFont = (HFONT)SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0);
+            if (!hBaseFont) hBaseFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
+            if (!hBaseFont) hBaseFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+            LOGFONTA lf = { 0 };
+            GetObjectA(hBaseFont, sizeof(lf), &lf);
+            lf.lfWeight = FW_BOLD; // 太字で視認性を強化
+            HFONT hBoldFont = CreateFontIndirectA(&lf);
+            HFONT hOldFont = (HFONT)SelectObject(hdc, hBoldFont);
+
+            char text[64] = { 0 };
+            GetWindowTextA(pdis->hwndItem, text, sizeof(text));
+            DrawTextA(hdc, text, -1, &rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(hdc, hOldFont);
+            DeleteObject(hBoldFont);
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
         float scale = GetDpiScaleForWindow(hDlg);
-        lpMMI->ptMinTrackSize.x = static_cast<LONG>(380 * scale);
-        lpMMI->ptMinTrackSize.y = static_cast<LONG>(180 * scale);
+        lpMMI->ptMinTrackSize.x = static_cast<LONG>(460 * scale);
+        lpMMI->ptMinTrackSize.y = static_cast<LONG>(250 * scale);
         return 0;
     }
 
@@ -862,7 +1261,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             SetWindowPos(hList, nullptr, margin, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
-        // 入力コントロールの右寄せ追従
+        // Apply ボタンの右寄せ追従
         auto MoveRight = [&](int ctrlId) {
             HWND hCtrl = GetDlgItem(hDlg, ctrlId);
             if (hCtrl) {
@@ -876,12 +1275,44 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             }
         };
 
-        MoveRight(IDC_EDIT_AUDIO_CORE);
-        MoveRight(IDC_EDIT_NORMAL_CORES);
-        MoveRight(IDC_COMBO_AUDIO_PRIORITY);
-        MoveRight(IDC_EDIT_POLLING_MS);
+        MoveRight(IDC_BTN_APPLY_EXCLUDE_CORE);
+        MoveRight(IDC_BTN_APPLY_NORMAL_MASK);
 
-        // OK / Cancel ボタンの右下追従
+        // 説明テキストの幅追従（入力欄の右 〜 Apply ボタンの左）
+        auto AdjustDescWidth = [&](int descId, int btnId) {
+            HWND hDesc = GetDlgItem(hDlg, descId);
+            HWND hBtn = GetDlgItem(hDlg, btnId);
+            if (hDesc && hBtn) {
+                RECT rcDesc, rcBtn;
+                GetWindowRect(hDesc, &rcDesc);
+                GetWindowRect(hBtn, &rcBtn);
+                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcDesc), 2);
+                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcBtn), 2);
+                int descW = rcBtn.left - spacing - rcDesc.left;
+                if (descW > 0) {
+                    SetWindowPos(hDesc, nullptr, rcDesc.left, rcDesc.top, descW, rcDesc.bottom - rcDesc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                }
+            }
+        };
+
+        AdjustDescWidth(IDC_STATIC_EXCLUDE_DESC, IDC_BTN_APPLY_EXCLUDE_CORE);
+        AdjustDescWidth(IDC_STATIC_EXCLUDE_DESC2, IDC_BTN_APPLY_EXCLUDE_CORE);
+        AdjustDescWidth(IDC_STATIC_NORMAL_DESC, IDC_BTN_APPLY_NORMAL_MASK);
+        AdjustDescWidth(IDC_STATIC_NORMAL_DESC2, IDC_BTN_APPLY_NORMAL_MASK);
+
+        // 最下部ボタン列:
+        // 左下: Release Mask
+        HWND hBtnRelease = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
+        if (hBtnRelease) {
+            RECT rcRel;
+            GetWindowRect(hBtnRelease, &rcRel);
+            int relW = rcRel.right - rcRel.left;
+            int relH = rcRel.bottom - rcRel.top;
+            int relY = cy - margin - relH;
+            SetWindowPos(hBtnRelease, nullptr, margin, relY, relW, relH, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+
+        // 右下: Cancel / OK
         HWND hBtnCancel = GetDlgItem(hDlg, IDC_BTN_SETTINGS_CANCEL);
         HWND hBtnOk = GetDlgItem(hDlg, IDC_BTN_SETTINGS_OK);
         if (hBtnCancel && hBtnOk) {
@@ -1028,7 +1459,9 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                     }
-                    SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, FormatMaskToCoreList(s_tmpConfig.defaultAudioAffinityMask).c_str());
+                    char aHex[32] = { 0 };
+                    snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.defaultAudioAffinityMask));
+                    SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, aHex);
                     char hexBuf[32];
                     snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
                     SetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf);
@@ -1050,8 +1483,17 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             if (cmdId == IDC_EDIT_AUDIO_CORE) {
                 char buf[128] = { 0 };
                 GetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, buf, sizeof(buf));
+                std::string s(buf);
+                DWORD_PTR m = 0;
                 int fc = 0;
-                DWORD_PTR m = ParseCoreListToMask(buf, fc);
+                if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
+                    m = _strtoui64(s.c_str(), nullptr, 16);
+                    for (int c = 0; c < 64; ++c) {
+                        if ((m & (1ULL << c)) != 0) { fc = c; break; }
+                    }
+                } else {
+                    m = ParseCoreListToMask(s, fc);
+                }
                 if (m != 0) {
                     s_tmpConfig.defaultAudioAffinityMask = m;
                     s_tmpConfig.defaultAudioCore = fc;
@@ -1068,6 +1510,49 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             }
         }
 
+        if (cmdId == IDC_BTN_APPLY_EXCLUDE_CORE) {
+            int coreCount = ati::CpuTopology::GetSystemCoreCount();
+            DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
+            DWORD_PTR excludeMask = fullMask & ~s_tmpConfig.defaultAudioAffinityMask;
+            if (excludeMask == 0) {
+                MessageBoxA(hDlg, "Invalid target mask (cannot exclude all cores).", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+            } else {
+                if (ApplyCpuSetsToUnlistedProcesses(hDlg, excludeMask)) {
+                    s_bUnlistedMaskApplied = TRUE;
+                    HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
+                    if (hBtnRel) {
+                        EnableWindow(hBtnRel, TRUE);
+                        InvalidateRect(hBtnRel, nullptr, TRUE);
+                    }
+                }
+            }
+            return TRUE;
+        } else if (cmdId == IDC_BTN_APPLY_NORMAL_MASK) {
+            if (s_tmpConfig.normalAffinityMask == 0) {
+                MessageBoxA(hDlg, "Invalid normal affinity mask.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+            } else {
+                if (ApplyCpuSetsToUnlistedProcesses(hDlg, s_tmpConfig.normalAffinityMask)) {
+                    s_bUnlistedMaskApplied = TRUE;
+                    HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
+                    if (hBtnRel) {
+                        EnableWindow(hBtnRel, TRUE);
+                        InvalidateRect(hBtnRel, nullptr, TRUE);
+                    }
+                }
+            }
+            return TRUE;
+        } else if (cmdId == IDC_BTN_RELEASE_MASK) {
+            if (ReleaseCpuSetsFromUnlistedProcesses(hDlg)) {
+                s_bUnlistedMaskApplied = FALSE;
+                HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
+                if (hBtnRel) {
+                    EnableWindow(hBtnRel, FALSE);
+                    InvalidateRect(hBtnRel, nullptr, TRUE);
+                }
+            }
+            return TRUE;
+        }
+
         if (cmdId == IDC_BTN_SETTINGS_OK) {
             HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_AUDIO_PRIORITY);
             if (hCombo) {
@@ -1079,8 +1564,17 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
             char coreBuf[128] = { 0 };
             GetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, coreBuf, sizeof(coreBuf));
+            std::string s(coreBuf);
+            DWORD_PTR m = 0;
             int fc = 0;
-            DWORD_PTR m = ParseCoreListToMask(coreBuf, fc);
+            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
+                m = _strtoui64(s.c_str(), nullptr, 16);
+                for (int c = 0; c < 64; ++c) {
+                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
+                }
+            } else {
+                m = ParseCoreListToMask(s, fc);
+            }
             if (m != 0) {
                 s_tmpConfig.defaultAudioAffinityMask = m;
                 s_tmpConfig.defaultAudioCore = fc;
@@ -1129,6 +1623,18 @@ static ati::ProcessRule s_editRule;
 
 static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_MEASUREITEM: {
+        if (HandlePriorityComboMeasureItem(hDlg, lParam, IDC_COMBO_RULE_PRIO)) {
+            return TRUE;
+        }
+        break;
+    }
+    case WM_DRAWITEM: {
+        if (HandlePriorityComboDrawItem(hDlg, lParam, IDC_COMBO_RULE_PRIO)) {
+            return TRUE;
+        }
+        break;
+    }
     case WM_INITDIALOG: {
         SetDlgItemTextA(hDlg, IDC_STATIC_PROCESS_NAME, s_editRule.processName.c_str());
 
@@ -1183,7 +1689,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
             // 0: Item
             lvc.fmt = LVCFMT_LEFT;
-            lvc.cx = static_cast<int>(90 * scale);
+            lvc.cx = static_cast<int>(130 * scale);
             lvc.iSubItem = 0;
             lvc.pszText = const_cast<LPSTR>("Item");
             ListView_InsertColumn(hList, 0, &lvc);
@@ -1191,7 +1697,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             // 1 .. coreCount: コアラベル
             for (int c = 0; c < coreCount; ++c) {
                 lvc.fmt = LVCFMT_CENTER;
-                lvc.cx = static_cast<int>(24 * scale);
+                lvc.cx = static_cast<int>(34 * scale);
                 lvc.iSubItem = 1 + c;
                 lvc.pszText = const_cast<LPSTR>(cores[c].label.c_str());
                 ListView_InsertColumn(hList, 1 + c, &lvc);
@@ -1204,18 +1710,21 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             lvi.pszText = const_cast<LPSTR>("Audio Core");
             ListView_InsertItem(hList, &lvi);
 
-            // 行 1: Other than Audio
+            // 行 1: Excluded
             lvi.iItem = 1;
-            lvi.pszText = const_cast<LPSTR>("Other than Audio");
+            lvi.pszText = const_cast<LPSTR>("Excluded");
             ListView_InsertItem(hList, &lvi);
 
+            ShowScrollBar(hList, SB_VERT, FALSE);
             ListView_Scroll(hList, 0, -9999);
         }
 
         if (s_editRule.audioAffinityMask == 0) {
             s_editRule.audioAffinityMask = (1ULL << s_editRule.audioCore);
         }
-        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, FormatMaskToCoreList(s_editRule.audioAffinityMask).c_str());
+        char aHex[32] = { 0 };
+        snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_editRule.audioAffinityMask));
+        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, aHex);
 
         DWORD_PTR initialNormal = (s_editRule.normalAffinityMask != 0) 
             ? s_editRule.normalAffinityMask 
@@ -1272,8 +1781,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
         float scale = GetDpiScaleForWindow(hDlg);
-        lpMMI->ptMinTrackSize.x = static_cast<LONG>(280 * scale);
-        lpMMI->ptMinTrackSize.y = static_cast<LONG>(215 * scale);
+        lpMMI->ptMinTrackSize.x = static_cast<LONG>(400 * scale);
+        lpMMI->ptMinTrackSize.y = static_cast<LONG>(260 * scale);
         return 0;
     }
 
@@ -1296,23 +1805,6 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             int listH = rcList.bottom - rcList.top;
             SetWindowPos(hList, nullptr, margin, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
         }
-
-        auto MoveRight = [&](int ctrlId) {
-            HWND hCtrl = GetDlgItem(hDlg, ctrlId);
-            if (hCtrl) {
-                RECT rc;
-                GetWindowRect(hCtrl, &rc);
-                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rc), 2);
-                int w = rc.right - rc.left;
-                int h = rc.bottom - rc.top;
-                int newX = cx - margin - w;
-                SetWindowPos(hCtrl, nullptr, newX, rc.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        };
-
-        MoveRight(IDC_EDIT_RULE_CORE);
-        MoveRight(IDC_EDIT_RULE_NORMAL_CORES);
-        MoveRight(IDC_COMBO_RULE_PRIO);
 
         HWND hNote = GetDlgItem(hDlg, IDC_STATIC_HALF_ISOLATED_NOTE);
         if (hNote) {
@@ -1470,7 +1962,9 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                     }
-                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, FormatMaskToCoreList(s_editRule.audioAffinityMask).c_str());
+                    char aHex[32] = { 0 };
+                    snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_editRule.audioAffinityMask));
+                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, aHex);
                     char hexBuf[32] = { 0 };
                     snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_editRule.normalAffinityMask));
                     SetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, hexBuf);
@@ -1491,8 +1985,17 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         if (code == EN_CHANGE && cmdId == IDC_EDIT_RULE_CORE) {
             char buf[128] = { 0 };
             GetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, buf, sizeof(buf));
+            std::string s(buf);
+            DWORD_PTR m = 0;
             int fc = 0;
-            DWORD_PTR m = ParseCoreListToMask(buf, fc);
+            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
+                m = _strtoui64(s.c_str(), nullptr, 16);
+                for (int c = 0; c < 64; ++c) {
+                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
+                }
+            } else {
+                m = ParseCoreListToMask(s, fc);
+            }
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
@@ -1527,8 +2030,17 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
             char buf[128] = { 0 };
             GetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, buf, sizeof(buf));
+            std::string s(buf);
+            DWORD_PTR m = 0;
             int fc = 0;
-            DWORD_PTR m = ParseCoreListToMask(buf, fc);
+            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
+                m = _strtoui64(s.c_str(), nullptr, 16);
+                for (int c = 0; c < 64; ++c) {
+                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
+                }
+            } else {
+                m = ParseCoreListToMask(s, fc);
+            }
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
@@ -1731,6 +2243,70 @@ static bool s_inSizeMove = false;
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
+    case WM_MEASUREITEM: {
+        LPMEASUREITEMSTRUCT pmis = reinterpret_cast<LPMEASUREITEMSTRUCT>(lParam);
+        if (pmis && pmis->CtlID == IDC_COMBO_INPLACE_PRIO) {
+            float scale = GetDpiScaleForWindow(hDlg);
+            pmis->itemHeight = static_cast<UINT>(18 * scale);
+            return TRUE;
+        }
+        break;
+    }
+
+    case WM_DRAWITEM: {
+        LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
+        if (pdis && pdis->CtlID == IDC_COMBO_INPLACE_PRIO) {
+            if (pdis->itemID == static_cast<UINT>(-1)) return TRUE;
+
+            HDC hdc = pdis->hDC;
+            RECT rc = pdis->rcItem;
+            bool isSelected = (pdis->itemState & ODS_SELECTED) != 0;
+            bool isDisabled = (pdis->itemState & ODS_DISABLED) != 0;
+            bool isComboEdit = (pdis->itemState & ODS_COMBOBOXEDIT) != 0;
+
+            COLORREF bkCol = isDisabled ? GetSysColor(COLOR_BTNFACE) : (isSelected ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW));
+            COLORREF textCol = isDisabled ? GetSysColor(COLOR_GRAYTEXT) : (isSelected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
+
+            HBRUSH hBr = CreateSolidBrush(bkCol);
+            FillRect(hdc, &rc, hBr);
+            DeleteObject(hBr);
+
+            char text[64] = { 0 };
+            SendMessageA(pdis->hwndItem, CB_GETLBTEXT, pdis->itemID, reinterpret_cast<LPARAM>(text));
+
+            HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0));
+            if (!hFont) hFont = reinterpret_cast<HFONT>(SendMessageA(hDlg, WM_GETFONT, 0, 0));
+            if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+            HGDIOBJ oldFont = SelectObject(hdc, hFont);
+
+            SetBkMode(hdc, TRANSPARENT);
+            SetTextColor(hdc, textCol);
+
+            float scale = GetDpiScaleForWindow(hDlg);
+            SIZE szSp;
+            GetTextExtentPoint32A(hdc, "  ", 2, &szSp);
+            int extraPx = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px
+            int rightMargin = szSp.cx + extraPx;
+
+            RECT rcText = rc;
+            if (isComboEdit) {
+                rcText.right -= rightMargin;
+            } else {
+                int arrowW = GetSystemMetrics(SM_CXVSCROLL);
+                rcText.right -= (arrowW + rightMargin);
+            }
+            DrawTextA(hdc, text, -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+            SelectObject(hdc, oldFont);
+
+            if (pdis->itemState & ODS_FOCUS) {
+                DrawFocusRect(hdc, &rc);
+            }
+            return TRUE;
+        }
+        break;
+    }
+
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
@@ -1787,18 +2363,18 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         lvc.pszText = const_cast<LPSTR>("Process Name");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // 2: For Audio
+        // 2: Audio
         lvc.fmt = LVCFMT_CENTER;
         lvc.cx = static_cast<int>(68 * scale);
         lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("For Audio");
+        lvc.pszText = const_cast<LPSTR>("Audio");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // 3: Other than
+        // 3: Excluded
         lvc.fmt = LVCFMT_CENTER;
         lvc.cx = static_cast<int>(75 * scale);
         lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Other than");
+        lvc.pszText = const_cast<LPSTR>("Excluded");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
         // 4: Audio Core PID/TID
@@ -1815,9 +2391,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         lvc.pszText = const_cast<LPSTR>("");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // 6: Priority (50%幅広: 75 -> 113)
+        // 6: Priority (▼ボタンサイズ分拡大: 113 -> 130 * scale)
         lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = static_cast<int>(113 * scale);
+        lvc.cx = static_cast<int>(130 * scale);
         lvc.iSubItem = colIdx;
         lvc.pszText = const_cast<LPSTR>("Priority");
         ListView_InsertColumn(hList, colIdx++, &lvc);
@@ -1829,14 +2405,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         lvc.pszText = const_cast<LPSTR>("Threads");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // 8: Changes (文字切れ防止のため 60px 確保)
+        // 8: Changes (文字切れ防止のため初期幅 76*scale を確保)
         lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(60 * scale);
+        lvc.cx = static_cast<int>(76 * scale);
         lvc.iSubItem = colIdx;
         lvc.pszText = const_cast<LPSTR>("Changes");
         ListView_InsertColumn(hList, colIdx++, &lvc);
 
-        // カラム挿入後にヘッダー自動調整 (LVSCW_AUTOSIZE_USEHEADER) を適用 (固定幅の Col 0, 1, 5, 6, 8 は除外)
+        // カラム挿入後にヘッダー自動調整 (LVSCW_AUTOSIZE_USEHEADER) を適用 (固定幅の Col 0, 1, 5, 6 は除外)
         for (int i = 0; i < colIdx; ++i) {
             if (i == 0) {
                 ListView_SetColumnWidth(hList, i, static_cast<int>(24 * scale));
@@ -1851,11 +2427,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 continue;
             }
             if (i == 6) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(113 * scale));
-                continue;
-            }
-            if (i == 8) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(60 * scale));
+                ListView_SetColumnWidth(hList, i, static_cast<int>(130 * scale));
                 continue;
             }
             int initialW = ListView_GetColumnWidth(hList, i);
@@ -1864,7 +2436,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             if (autoW < initialW) {
                 ListView_SetColumnWidth(hList, i, initialW);
             } else {
-                ListView_SetColumnWidth(hList, i, autoW + static_cast<int>(6 * scale));
+                ListView_SetColumnWidth(hList, i, autoW + static_cast<int>(10 * scale));
             }
         }
 
@@ -1886,12 +2458,11 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             SetWindowPos(hDlg, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
-        // ATI 自身の自己隔離とプロセス優先度 Low (Idle) 化
-        SetPriorityClass(GetCurrentProcess(), IDLE_PRIORITY_CLASS);
+        // ATI 自身の自己隔離 (通常コア群への配置)
         if (config.normalAffinityMask != 0) {
             SetProcessAffinityMask(GetCurrentProcess(), config.normalAffinityMask);
         }
-        LogDebug("WM_INITDIALOG: Self isolation & idle priority applied");
+        LogDebug("WM_INITDIALOG: Self isolation applied");
 
         g_isolator.Initialize(config);
         LogDebug("WM_INITDIALOG: isolator Initialize done");
@@ -1902,7 +2473,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         // クイックアクセス用インプレース ComboBox の生成
         s_hInPlaceCombo = CreateWindowExA(
             0, "COMBOBOX", "",
-            WS_CHILD | CBS_DROPDOWNLIST | WS_VSCROLL,
+            WS_CHILD | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
             0, 0, 0, 0,
             hDlg,
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_COMBO_INPLACE_PRIO)),
@@ -1914,6 +2485,12 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             for (int i = 0; i < PRIO_OPTIONS_COUNT; ++i) {
                 SendMessageA(s_hInPlaceCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(PRIO_OPTIONS[i].label));
             }
+        }
+
+        HICON hAppIcon = LoadIconA(g_hInstance, MAKEINTRESOURCEA(IDI_APP_ICON));
+        if (hAppIcon) {
+            SendMessageA(hDlg, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(hAppIcon));
+            SendMessageA(hDlg, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(hAppIcon));
         }
 
         InitTrayIcon(hDlg);
@@ -1928,6 +2505,33 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             totalColW += ListView_GetColumnWidth(hList, i);
         }
 
+        // 登録行数を確認し、リストビューの高さを超えて縦スクロールバーが出現する場合はスクロールバー幅を加算
+        int vScrollW = 0;
+        int itemCount = ListView_GetItemCount(hList);
+        int itemH = static_cast<int>(18 * scale);
+        if (itemCount > 0) {
+            RECT rcItem = { 0 };
+            if (ListView_GetItemRect(hList, 0, &rcItem, LVIR_BOUNDS)) {
+                int h = rcItem.bottom - rcItem.top;
+                if (h > 0) itemH = h;
+            }
+        }
+        RECT rcListCl;
+        GetClientRect(hList, &rcListCl);
+        int listClH = rcListCl.bottom - rcListCl.top;
+        int headerH = 0;
+        if (hHeader) {
+            RECT rcHdr = { 0 };
+            GetWindowRect(hHeader, &rcHdr);
+            headerH = rcHdr.bottom - rcHdr.top;
+        }
+        int effectiveListH = listClH - headerH;
+        int visibleRows = (itemH > 0 && effectiveListH > 0) ? (effectiveListH / itemH) : 5;
+        if (itemCount > visibleRows) {
+            vScrollW = GetSystemMetrics(SM_CXVSCROLL);
+            if (vScrollW <= 0) vScrollW = static_cast<int>(17 * scale);
+        }
+
         RECT rcDlg, rcCl;
         GetWindowRect(hDlg, &rcDlg);
         GetClientRect(hDlg, &rcCl);
@@ -1939,7 +2543,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
         int marginInit = static_cast<int>(10 * scale);
         int rightColWInit = static_cast<int>(105 * scale);
-        int reqClientW = rcListInit.left + totalColW + static_cast<int>(4 * scale) + rightColWInit + marginInit;
+        int reqClientW = rcListInit.left + totalColW + vScrollW + static_cast<int>(4 * scale) + rightColWInit + marginInit;
         int curClientW = rcCl.right - rcCl.left;
 
         if (curClientW < reqClientW) {
@@ -2267,9 +2871,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         if (static_cast<size_t>(s_inPlaceItemIndex) < config.rules.size()) {
                             config.rules[s_inPlaceItemIndex].audioPriority = newPrio;
                             g_isolator.UpdateConfig(config);
-                            SaveConfig(config, g_iniPath);
 
-                            // 即時再隔離・スキャン実行
+                            // 即時再隔離・スキャン実行 (稼働中スレッドへ即時反映)
                             g_isolator.ScanAndIsolate();
 
                             // リストビュー表示を即時更新
@@ -2425,42 +3028,64 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                     }
                     auto rules = g_isolator.GetRulesSnapshot();
                     if (lvhti.iItem < static_cast<int>(rules.size())) {
-                        RECT rcSub;
-                        ListView_GetSubItemRect(hList, lvhti.iItem, 0, LVIR_BOUNDS, &rcSub);
-                        float scale = GetDpiScaleForWindow(hDlg);
-                        int cbLimit = rcSub.left + static_cast<int>(22 * scale);
-                        if (lvhti.pt.x <= cbLimit) {
-                            const auto& targetRule = rules[lvhti.iItem];
+                        const auto& targetRule = rules[lvhti.iItem];
 
-                            // sleeping... 状態のナッジ点滅 ● クリック時: Bypass ではなく直ちに Searching... から再探索を開始
-                            if (targetRule.isRunning && !targetRule.isBypassed && targetRule.detectedThreadName == "sleeping...") {
-                                g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
-                                g_isolator.ScanAndIsolate();
-                                auto updatedRules = g_isolator.GetRulesSnapshot();
-                                UpdateListViewDynamic(hList, updatedRules);
-                                InvalidateRect(hList, nullptr, FALSE);
-                                return TRUE;
-                            }
-
-                            // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
-                            // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
-                            // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
-                            {
-                                bool wasRunning = targetRule.isRunning;
-                                g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
-                                SaveConfig(g_isolator.GetConfig(), g_iniPath);
-
-                                // 起動中の Bypass 解除時は直ちにアイソレーターを即時実行
-                                if (wasRunning) {
-                                    g_isolator.ScanAndIsolate();
-                                }
-
-                                auto updatedRules = g_isolator.GetRulesSnapshot();
-                                UpdateListViewDynamic(hList, updatedRules);
-                                InvalidateRect(hList, nullptr, FALSE);
-                            }
+                        // sleeping... 状態のナッジ点滅 ● クリック時: bypass 解除時と同様に探索を即時リスタート
+                        if (targetRule.isRunning && !targetRule.isBypassed && targetRule.detectedThreadName == "sleeping...") {
+                            g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
+                            g_isolator.ScanAndIsolate();
+                            auto updatedRules = g_isolator.GetRulesSnapshot();
+                            UpdateListViewDynamic(hList, updatedRules);
+                            InvalidateRect(hList, nullptr, FALSE);
                             return TRUE;
                         }
+
+                        // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
+                        // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
+                        // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
+                        {
+                            bool wasRunning = targetRule.isRunning;
+                            g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
+                            SaveConfig(g_isolator.GetConfig(), g_iniPath);
+
+                            // 起動中の Bypass 解除時は直ちにアイソレーターを即時実行
+                            if (wasRunning) {
+                                g_isolator.ScanAndIsolate();
+                            }
+
+                            auto updatedRules = g_isolator.GetRulesSnapshot();
+                            UpdateListViewDynamic(hList, updatedRules);
+                            InvalidateRect(hList, nullptr, FALSE);
+                        }
+                        return TRUE;
+                    }
+                } else if (lvhti.iItem >= 0 && lvhti.iSubItem == 4) {
+                    // Col 4 (Audio Core PID/TID 列):
+                    // - sleeping... 状態時: bypass 解除時と同様に探索を即時リスタート
+                    // - Standby (稼働) 状態時: Bypass へ切り替え、! カラムに ☑ を表示
+                    if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
+                        ShowWindow(s_hInPlaceCombo, SW_HIDE);
+                        s_inPlaceItemIndex = -1;
+                    }
+                    auto rules = g_isolator.GetRulesSnapshot();
+                    if (lvhti.iItem < static_cast<int>(rules.size())) {
+                        const auto& targetRule = rules[lvhti.iItem];
+                        if (targetRule.detectedThreadName == "sleeping...") {
+                            g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
+                            g_isolator.ScanAndIsolate();
+                        } else {
+                            bool wasRunning = targetRule.isRunning;
+                            g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
+                            SaveConfig(g_isolator.GetConfig(), g_iniPath);
+                            if (wasRunning && targetRule.isBypassed) {
+                                // Bypass 解除時は直ちにスキャン実行
+                                g_isolator.ScanAndIsolate();
+                            }
+                        }
+                        auto updatedRules = g_isolator.GetRulesSnapshot();
+                        UpdateListViewDynamic(hList, updatedRules);
+                        InvalidateRect(hList, nullptr, FALSE);
+                        return TRUE;
                     }
                 } else if (lvhti.iItem >= 0 && lvhti.iSubItem == 5) {
                     if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
@@ -2588,6 +3213,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                 ListView_GetSubItemRect(hList, row, 3, LVIR_BOUNDS, &rcSub);
                                 HDC hdc = plvcd->nmcd.hdc;
 
+                                // クリッピング領域をセル矩形内に限定（隣接カラムへの文字漏れを防止）
+                                HRGN hClip = CreateRectRgn(rcSub.left, rcSub.top, rcSub.right, rcSub.bottom);
+                                SelectClipRgn(hdc, hClip);
+
                                 HBRUSH hBkBrush = (state & LVIS_SELECTED) 
                                     ? GetSysColorBrush(COLOR_HIGHLIGHT) 
                                     : CreateSolidBrush(rowBkCol);
@@ -2606,7 +3235,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
                                     SIZE szTotal;
                                     GetTextExtentPoint32A(hdc, text.c_str(), static_cast<int>(text.length()), &szTotal);
-                                    int startX = rcSub.left + (rcSub.right - rcSub.left - szTotal.cx) / 2;
+                                    int cellW = rcSub.right - rcSub.left;
+                                    // セル幅に収まる場合は中央揃え、溢れる場合は左端 (rcSub.left + 4) にクランプして左列への突き抜けを防止
+                                    int startX = (szTotal.cx < cellW) ? (rcSub.left + (cellW - szTotal.cx) / 2) : (rcSub.left + 4);
                                     int startY = rcSub.top + (rcSub.bottom - rcSub.top - szTotal.cy) / 2;
 
                                     if (text[0] == '!') {
@@ -2634,6 +3265,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
                                     SelectObject(hdc, oldFont);
                                 }
+
+                                // クリッピング解除
+                                SelectClipRgn(hdc, NULL);
+                                DeleteObject(hClip);
 
                                 SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
                                 return TRUE;
@@ -2671,6 +3306,50 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                 uState |= DFCS_CHECKED;
                             }
                             DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
+
+                            SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                            return TRUE;
+                        }
+                    } else if (plvcd->iSubItem == 6) {
+                        // Col 6: Priority (右詰め + 半角SP2個 + 4px[200%時]の余白)
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (row >= 0 && row < static_cast<int>(rules.size())) {
+                            const auto& r = rules[row];
+                            RECT rcSub;
+                            ListView_GetSubItemRect(hList, row, 6, LVIR_BOUNDS, &rcSub);
+                            HDC hdc = plvcd->nmcd.hdc;
+                            float scale = GetDpiScaleForWindow(hDlg);
+
+                            HBRUSH hBkBrush = (state & LVIS_SELECTED) 
+                                ? GetSysColorBrush(COLOR_HIGHLIGHT) 
+                                : CreateSolidBrush(rowBkCol);
+                            FillRect(hdc, &rcSub, hBkBrush);
+                            if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+
+                            char txtBuf[64] = { 0 };
+                            ListView_GetItemText(hList, row, 6, txtBuf, sizeof(txtBuf));
+                            std::string text(txtBuf);
+
+                            if (!text.empty()) {
+                                HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hList, WM_GETFONT, 0, 0));
+                                if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                                HGDIOBJ oldFont = SelectObject(hdc, hFont);
+                                SetBkMode(hdc, TRANSPARENT);
+
+                                COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
+                                SetTextColor(hdc, textCol);
+
+                                SIZE szSp;
+                                GetTextExtentPoint32A(hdc, "  ", 2, &szSp);
+                                int extraPx = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px
+                                int rightMargin = szSp.cx + extraPx;
+
+                                RECT rcText = rcSub;
+                                rcText.right -= rightMargin;
+                                DrawTextA(hdc, text.c_str(), -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+
+                                SelectObject(hdc, oldFont);
+                            }
 
                             SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
                             return TRUE;

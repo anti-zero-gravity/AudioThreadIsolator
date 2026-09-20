@@ -4,6 +4,9 @@
 
 LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 
+// Application Icon
+IDI_APP_ICON ICON "app.ico"
+
 // Main Dialog
 IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 112
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME
@@ -45,33 +48,40 @@ BEGIN
 END
 
 // Global Settings Dialog
-IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 280, 132
+IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 320, 170
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
 CAPTION "Global Settings"
 FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_SETTINGS_CORES, "SysListView32",
                     LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
-                    12, 10, 256, 28
+                    12, 10, 296, 40
 
-    LTEXT           "Default Audio Core(s) (#, ...):", -1, 14, 44, 140, 10
-    EDITTEXT        IDC_EDIT_AUDIO_CORE, 232, 42, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Default Audio Core (Mask):", -1, 14, 59, 106, 10
+    EDITTEXT        IDC_EDIT_AUDIO_CORE, 122, 57, 24, 12, ES_AUTOHSCROLL | ES_CENTER
+    LTEXT           "<- Except this: Apply mask", IDC_STATIC_EXCLUDE_DESC, 150, 55, 120, 8
+    RTEXT           "to ALL unlisted processes ->", IDC_STATIC_EXCLUDE_DESC2, 150, 64, 120, 8
+    PUSHBUTTON      "Apply", IDC_BTN_APPLY_EXCLUDE_CORE, 274, 54, 34, 18, WS_TABSTOP
 
-    LTEXT           "Other than Audio (Mask):", -1, 14, 60, 140, 10
-    EDITTEXT        IDC_EDIT_NORMAL_CORES, 232, 58, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Excluded (Mask):", -1, 14, 80, 106, 10
+    EDITTEXT        IDC_EDIT_NORMAL_CORES, 122, 78, 24, 12, ES_AUTOHSCROLL | ES_CENTER
+    LTEXT           "<- Apply this mask", IDC_STATIC_NORMAL_DESC, 150, 76, 120, 8
+    RTEXT           "to ALL unlisted processes ->", IDC_STATIC_NORMAL_DESC2, 150, 85, 120, 8
+    PUSHBUTTON      "Apply", IDC_BTN_APPLY_NORMAL_MASK, 274, 75, 34, 18, WS_TABSTOP
 
-    LTEXT           "Audio Thread Priority:", -1, 14, 76, 140, 10
-    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 173, 74, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Audio Thread Priority:", -1, 14, 102, 106, 10
+    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 122, 100, 85, 100, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
 
-    LTEXT           "Polling Interval (ms):", -1, 14, 92, 140, 10
-    EDITTEXT        IDC_EDIT_POLLING_MS, 242, 90, 26, 14, ES_AUTOHSCROLL | ES_NUMBER | ES_RIGHT
+    LTEXT           "Polling Interval (ms):", -1, 14, 122, 106, 10
+    EDITTEXT        IDC_EDIT_POLLING_MS, 122, 120, 24, 12, ES_AUTOHSCROLL | ES_NUMBER | ES_CENTER
 
-    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 172, 110, 45, 15
-    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 223, 110, 45, 15
+    CONTROL         "Release Mask", IDC_BTN_RELEASE_MASK, "Button", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, 12, 146, 62, 15
+    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 216, 146, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 265, 146, 45, 15
 END
 
 // Process Rule Edit Dialog
-IDD_RULE_EDIT_DIALOG DIALOGEX 0, 0, 280, 164
+IDD_RULE_EDIT_DIALOG DIALOGEX 0, 0, 280, 176
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
 CAPTION "Thread Isolation Settings"
 
@@ -82,22 +92,22 @@ BEGIN
 
     CONTROL         "", IDC_LIST_RULE_CORES, "SysListView32",
                     LVS_REPORT | LVS_SINGLESEL | WS_BORDER | WS_TABSTOP,
-                    12, 22, 256, 28
+                    12, 22, 256, 40
 
-    LTEXT           "Audio Core(s) (#, ...):", -1, 14, 58, 140, 10
-    EDITTEXT        IDC_EDIT_RULE_CORE, 232, 56, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Audio Core (Mask):", -1, 14, 70, 106, 10
+    EDITTEXT        IDC_EDIT_RULE_CORE, 122, 68, 50, 12, ES_AUTOHSCROLL | ES_CENTER
 
-    LTEXT           "Other than Audio (Mask):", -1, 14, 76, 140, 10
-    EDITTEXT        IDC_EDIT_RULE_NORMAL_CORES, 232, 74, 36, 14, ES_AUTOHSCROLL | ES_RIGHT
+    LTEXT           "Excluded (Mask):", -1, 14, 88, 106, 10
+    EDITTEXT        IDC_EDIT_RULE_NORMAL_CORES, 122, 86, 50, 12, ES_AUTOHSCROLL | ES_CENTER
 
-    LTEXT           "Audio Thread Priority:", -1, 14, 94, 140, 10
-    COMBOBOX        IDC_COMBO_RULE_PRIO, 173, 92, 95, 100, CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Audio Thread Priority:", -1, 14, 106, 106, 10
+    COMBOBOX        IDC_COMBO_RULE_PRIO, 122, 104, 85, 100, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
 
     LTEXT           "Note: If other threads return to the audio core, status becomes Half-Isolated.\nAudio priority is auto-promoted by 1 step, keeping intruder threads 1 level below it.", 
-                    IDC_STATIC_HALF_ISOLATED_NOTE, 14, 112, 254, 20
+                    IDC_STATIC_HALF_ISOLATED_NOTE, 14, 124, 254, 20
 
-    DEFPUSHBUTTON   "OK", IDC_BTN_RULE_OK, 172, 140, 45, 15
-    PUSHBUTTON      "Cancel", IDC_BTN_RULE_CANCEL, 223, 140, 45, 15
+    DEFPUSHBUTTON   "OK", IDC_BTN_RULE_OK, 172, 152, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_RULE_CANCEL, 223, 152, 45, 15
 END
 
 // Tray Context Menu

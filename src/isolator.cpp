@@ -738,15 +738,13 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
       }
       rule.isAudioIsolated = false;
       rule.hasIntruderThreads = false;
+      rule.detectedThreadName = "Bypassed";
       if (rule.isRunning) {
-        rule.detectedThreadName = "Bypassed";
         if (rule.activePid != 0) {
           m_trackedAudioThreads.erase(rule.activePid);
           m_prevThreadCpuTimes.erase(rule.activePid);
           m_samplingStates.erase(rule.activePid);
         }
-      } else {
-        rule.detectedThreadName = "";
       }
     } else {
       if (rule.isRunning) {
@@ -756,6 +754,8 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
         rule.detectedThreadName = "Searching...";
         rule.searchPhase = 1;
         rule.searchTurns = 2 * turnsPerSec;
+      } else {
+        rule.detectedThreadName = "";
       }
     }
   }
@@ -771,7 +771,7 @@ void ThreadIsolator::RestartSearch(size_t index) {
   if (turnsPerSec < 1) turnsPerSec = 1;
 
   rule.searchPhase = 1;
-  rule.searchTurns = 0;
+  rule.searchTurns = 2 * turnsPerSec;
   if (rule.audioServicePid != 0) {
     rule.detectedThreadName = "PID " + std::to_string(rule.audioServicePid) + " / Searching...";
     rule.activePid = rule.audioServicePid;
@@ -1305,7 +1305,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.isRunning = false;
         rule.activePid = 0;
         rule.activeAudioTid = 0;
-        rule.detectedThreadName = "";
+        rule.detectedThreadName = rule.isBypassed ? "Bypassed" : "";
         rule.isAudioIsolated = false;
         rule.wasHalfAutoPromoted = false;
         rule.chromiumScanAttempted = false;
@@ -1442,7 +1442,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           rule.activeAudioTid = 0;
           rule.chromiumScanAttempted = true;
           stateChanged = true;
-          LogDebug("Chromium AudioService PID expired, returned to sleeping...");
+          LogDebug(("Chromium AudioService PID expired, returned to " + rule.detectedThreadName).c_str());
         }
       }
 
@@ -1506,7 +1506,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      // Audio Service が特定されていない場合は sleeping... に遷移して仕事を終え待機
+      // Audio Service が特定されていない場合は sleeping... に遷移して待機
       if (audioServicePid == 0) {
         if (rule.detectedThreadName != "sleeping...") {
           rule.detectedThreadName = "sleeping...";
