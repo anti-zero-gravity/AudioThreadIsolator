@@ -6,6 +6,8 @@
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlwapi.h>
+#include <uxtheme.h>
+#include <vssym32.h>
 #include <string>
 #include <vector>
 #include <sstream>
@@ -2249,6 +2251,150 @@ static void RestartApplication(HWND hDlg) {
 
 static bool s_inSizeMove = false;
 static HFONT s_hMainFont = nullptr;
+static WNDPROC s_pfnOriginalCheckboxProc = nullptr;
+static bool s_bCheckboxHot = false;
+
+static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hWnd, &ps);
+
+        RECT rcClient;
+        GetClientRect(hWnd, &rcClient);
+
+        // 背景塗りつぶし (親ダイアログ標準背景色)
+        FillRect(hdc, &rcClient, GetSysColorBrush(COLOR_BTNFACE));
+
+        float scale = GetDpiScaleForWindow(hWnd);
+        UINT dpi = static_cast<UINT>(96 * scale);
+        if (dpi == 0) dpi = 96;
+
+        bool isChecked = (SendMessageA(hWnd, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        LRESULT bState = SendMessageA(hWnd, BM_GETSTATE, 0, 0);
+        bool isPushed = (bState & BST_PUSHED) != 0;
+
+        // UxTheme による正確な DPI アイコン描画
+        bool themeDrawn = false;
+        HMODULE hUxTheme = GetModuleHandleA("uxtheme.dll");
+        if (!hUxTheme) hUxTheme = LoadLibraryA("uxtheme.dll");
+        if (hUxTheme) {
+            typedef HTHEME (WINAPI *PFN_OpenThemeDataForDpi)(HWND, LPCWSTR, UINT);
+            typedef HTHEME (WINAPI *PFN_OpenThemeData)(HWND, LPCWSTR);
+            typedef HRESULT (WINAPI *PFN_DrawThemeBackground)(HTHEME, HDC, int, int, const RECT*, const RECT*);
+            typedef HRESULT (WINAPI *PFN_GetThemePartSize)(HTHEME, HDC, int, int, const RECT*, THEMESIZE, SIZE*);
+            typedef HRESULT (WINAPI *PFN_CloseThemeData)(HTHEME);
+
+            PFN_OpenThemeDataForDpi pfnOpenDpi = (PFN_OpenThemeDataForDpi)GetProcAddress(hUxTheme, "OpenThemeDataForDpi");
+            PFN_OpenThemeData pfnOpen = (PFN_OpenThemeData)GetProcAddress(hUxTheme, "OpenThemeData");
+            PFN_DrawThemeBackground pfnDrawBg = (PFN_DrawThemeBackground)GetProcAddress(hUxTheme, "DrawThemeBackground");
+            PFN_GetThemePartSize pfnGetSize = (PFN_GetThemePartSize)GetProcAddress(hUxTheme, "GetThemePartSize");
+            PFN_CloseThemeData pfnCloseTheme = (PFN_CloseThemeData)GetProcAddress(hUxTheme, "CloseThemeData");
+
+            if (pfnDrawBg && pfnCloseTheme) {
+                HTHEME hTheme = nullptr;
+                if (pfnOpenDpi) {
+                    hTheme = pfnOpenDpi(hWnd, L"BUTTON", dpi);
+                } else if (pfnOpen) {
+                    hTheme = pfnOpen(hWnd, L"BUTTON");
+                }
+
+                if (hTheme) {
+                    int stateId = isChecked 
+                        ? (isPushed ? CBS_CHECKEDPRESSED : (s_bCheckboxHot ? CBS_CHECKEDHOT : CBS_CHECKEDNORMAL))
+                        : (isPushed ? CBS_UNCHECKEDPRESSED : (s_bCheckboxHot ? CBS_UNCHECKEDHOT : CBS_UNCHECKEDNORMAL));
+
+                    SIZE sz = { static_cast<LONG>(13 * scale), static_cast<LONG>(13 * scale) };
+                    if (pfnGetSize) {
+                        SIZE szTheme = { 0, 0 };
+                        if (SUCCEEDED(pfnGetSize(hTheme, hdc, BP_CHECKBOX, stateId, nullptr, TS_TRUE, &szTheme)) && szTheme.cx > 0 && szTheme.cy > 0) {
+                            sz = szTheme;
+                        }
+                    }
+
+                    int cbX = 0;
+                    int cbY = (rcClient.bottom - rcClient.top - sz.cy) / 2;
+                    RECT rcBox = { cbX, cbY, cbX + sz.cx, cbY + sz.cy };
+
+                    if (SUCCEEDED(pfnDrawBg(hTheme, hdc, BP_CHECKBOX, stateId, &rcBox, nullptr))) {
+                        themeDrawn = true;
+                    }
+                    pfnCloseTheme(hTheme);
+
+                    // テキスト描画
+                    char text[64] = { 0 };
+                    GetWindowTextA(hWnd, text, sizeof(text));
+                    if (text[0] != '\0') {
+                        HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hWnd, WM_GETFONT, 0, 0));
+                        if (!hFont) hFont = s_hMainFont;
+                        HGDIOBJ oldFont = SelectObject(hdc, hFont);
+                        SetBkMode(hdc, TRANSPARENT);
+                        SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+
+                        RECT rcText = rcClient;
+                        rcText.left = cbX + sz.cx + static_cast<int>(4 * scale);
+                        DrawTextA(hdc, text, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                        SelectObject(hdc, oldFont);
+                    }
+                }
+            }
+        }
+
+        // フォールバック: DrawFrameControl
+        if (!themeDrawn) {
+            int cbSize = static_cast<int>(13 * scale);
+            int cbX = 0;
+            int cbY = (rcClient.bottom - rcClient.top - cbSize) / 2;
+            RECT rcBox = { cbX, cbY, cbX + cbSize, cbY + cbSize };
+            UINT uState = DFCS_BUTTONCHECK | (isChecked ? DFCS_CHECKED : 0) | (isPushed ? DFCS_PUSHED : 0);
+            DrawFrameControl(hdc, &rcBox, DFC_BUTTON, uState);
+
+            char text[64] = { 0 };
+            GetWindowTextA(hWnd, text, sizeof(text));
+            if (text[0] != '\0') {
+                HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hWnd, WM_GETFONT, 0, 0));
+                if (!hFont) hFont = s_hMainFont;
+                HGDIOBJ oldFont = SelectObject(hdc, hFont);
+                SetBkMode(hdc, TRANSPARENT);
+                SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
+
+                RECT rcText = rcClient;
+                rcText.left = cbX + cbSize + static_cast<int>(4 * scale);
+                DrawTextA(hdc, text, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+                SelectObject(hdc, oldFont);
+            }
+        }
+
+        EndPaint(hWnd, &ps);
+        return 0;
+    }
+
+    case WM_MOUSEMOVE: {
+        if (!s_bCheckboxHot) {
+            s_bCheckboxHot = true;
+            TRACKMOUSEEVENT tme = { sizeof(TRACKMOUSEEVENT), TME_LEAVE, hWnd, 0 };
+            TrackMouseEvent(&tme);
+            InvalidateRect(hWnd, nullptr, FALSE);
+        }
+        break;
+    }
+
+    case WM_MOUSELEAVE: {
+        s_bCheckboxHot = false;
+        InvalidateRect(hWnd, nullptr, FALSE);
+        break;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    default:
+        break;
+    }
+    return CallWindowProcA(s_pfnOriginalCheckboxProc, hWnd, msg, wParam, lParam);
+}
 
 static void UpdateDialogFonts(HWND hDlg, float scale) {
     int fontHeight = -MulDiv(9, static_cast<int>(96 * scale), 72);
@@ -2277,6 +2423,11 @@ static void UpdateDialogFonts(HWND hDlg, float scale) {
 
     if (s_hInPlaceCombo && IsWindow(s_hInPlaceCombo)) {
         SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(hNewFont), TRUE);
+    }
+
+    HWND hChk = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
+    if (hChk) {
+        InvalidateRect(hChk, nullptr, TRUE);
     }
 
     if (s_hMainFont) {
@@ -2337,7 +2488,7 @@ static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
     }
 
     int margin = ScaleI(10, scale);
-    int rightColW = ScaleI(105, scale);
+    int rightColW = ScaleI(115, scale);
     int bottomLegendH = ScaleI(38, scale);
     int sbW = GetSystemMetrics(SM_CXVSCROLL); // 垂直スクロールバー幅を常に確保
 
@@ -2373,7 +2524,7 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     if (cx <= 0 || cy <= 0) return;
 
     int margin = static_cast<int>(10 * scale);
-    int rightColW = static_cast<int>(105 * scale);
+    int rightColW = static_cast<int>(115 * scale);
     int bottomLegendH = static_cast<int>(38 * scale);
 
     // 1. ListView のリサイズ
@@ -2388,21 +2539,25 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
         SetWindowPos(hList, nullptr, listX, listY, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
-    // 2. ボタン寸法と整列配置
+    // 2. 右パネル有効領域の定義とコントロールの水平センタリング配置
+    int panelLeft = cx - margin - rightColW;
+    int panelW = rightColW;
+
     int btnW = static_cast<int>(80 * scale);
     int btnH = static_cast<int>(20 * scale);
     int chkW = static_cast<int>(105 * scale);
-    int chkH = static_cast<int>(18 * scale);
-    int btnX = cx - margin - btnW;
-    int chkX = cx - margin - chkW;
+    int chkH = static_cast<int>(22 * scale);
+
+    int btnX = panelLeft + (panelW - btnW) / 2;
+    int chkX = btnX;
 
     // Y 座標を上から整然と配置
     int curY = margin;
     HWND hChkTop = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
     if (hChkTop) {
-        SetWindowPos(hChkTop, nullptr, chkX, curY, chkW, chkH, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hChkTop, nullptr, chkX, curY, chkW, chkH, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    curY += chkH + static_cast<int>(8 * scale);
+    curY += chkH + static_cast<int>(6 * scale);
 
     auto PlaceBtn = [&](int ctrlId) {
         HWND hBtn = GetDlgItem(hDlg, ctrlId);
@@ -2554,7 +2709,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             { "Excluded",         LVCFMT_CENTER }, // 3: Excluded
             { "Audio Core PID/TID", LVCFMT_CENTER }, // 4: PID/TID
             { "",                 LVCFMT_CENTER }, // 5: || (Pause)
-            { "Priority",         LVCFMT_LEFT   }, // 6: Priority
+            { "Priority",         LVCFMT_CENTER }, // 6: Priority
             { "TIDs",             LVCFMT_CENTER }, // 7: TIDs
             { "Changes",          LVCFMT_CENTER }, // 8: Changes
         };
@@ -2591,9 +2746,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         LoadConfig(config, g_iniPath);
         LogDebug("WM_INITDIALOG: LoadConfig done");
 
-        // Always on Top の初期状態適用
+        // Always on Top の初期状態適用および DPI 追従描画サブクラス化
         HWND hChkTop = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
         if (hChkTop) {
+            if (!s_pfnOriginalCheckboxProc) {
+                s_pfnOriginalCheckboxProc = reinterpret_cast<WNDPROC>(
+                    SetWindowLongPtrA(hChkTop, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc))
+                );
+            }
             SendMessageA(hChkTop, BM_SETCHECK, g_alwaysOnTop ? BST_CHECKED : BST_UNCHECKED, 0);
         }
         if (g_alwaysOnTop) {
