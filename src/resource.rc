@@ -19,14 +19,13 @@ BEGIN
                     6, 6, 404, 82
 
     CONTROL         "Always on Top", IDC_CHK_ALWAYS_ON_TOP, "Button", 
-                    BS_AUTOCHECKBOX | WS_TABSTOP, 420, 6, 60, 9
+                    BS_AUTOCHECKBOX | WS_TABSTOP, 415, 6, 65, 9
 
-    PUSHBUTTON      "To Tray (&T)", IDC_BTN_HIDE, 420, 29, 52, 10
-    PUSHBUTTON      "Settings (&S)", IDC_BTN_SETTINGS, 420, 41, 52, 10
+    PUSHBUTTON      "Edit (&E)", IDC_BTN_EDIT, 420, 24, 52, 10
+    PUSHBUTTON      "Add (&A)", IDC_BTN_ADD, 420, 36, 52, 10
+    PUSHBUTTON      "Remove (&D)", IDC_BTN_REMOVE, 420, 48, 52, 10
     
-    PUSHBUTTON      "Add (&A)", IDC_BTN_ADD, 420, 56, 52, 10
-    PUSHBUTTON      "Edit (&E)", IDC_BTN_EDIT, 420, 68, 52, 10
-    PUSHBUTTON      "Remove (&D)", IDC_BTN_REMOVE, 420, 80, 52, 10
+    PUSHBUTTON      "Settings (&S)", IDC_BTN_SETTINGS, 420, 72, 52, 10
 
     PUSHBUTTON      "Exit (&X)", IDC_BTN_EXIT, 420, 96, 52, 10
 END

@@ -37,6 +37,12 @@ static int s_inPlaceItemIndex = -1;
 static bool s_inPlaceCancelled = false;
 static HANDLE g_hSingleInstanceMutex = nullptr;
 
+// ListView 列幅定義 (DPI 基準値: scale=1.0 時のピクセル幅)
+// Col: 0:!  1:ProcessName  2:Audio  3:Excluded  4:PID/TID  5:||  6:Priority  7:TIDs  8:Changes
+static const int kColBaseWidths[] = { 24, 116, 68, 75, 135, 24, 130, 55, 76 };
+static const int kColCount = sizeof(kColBaseWidths) / sizeof(kColBaseWidths[0]);
+static inline int ScaleI(int base, float s) { return static_cast<int>(base * s); }
+
 #ifdef _DEBUG
 void LogDebug(const char* msg) {
     char exePath[MAX_PATH] = { 0 };
@@ -619,7 +625,7 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
         std::string prioStr = GetPriorityString(r.audioPriority);
         ListView_SetItemText(hList, static_cast<int>(i), 6, const_cast<LPSTR>(prioStr.c_str()));
 
-        // 7: Threads
+        // 7: TIDs
         std::string threadsStr = r.isRunning ? std::to_string(r.currentThreadCount) : "-";
         ListView_SetItemText(hList, static_cast<int>(i), 7, const_cast<LPSTR>(threadsStr.c_str()));
 
@@ -684,7 +690,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
         std::string prioStr = GetPriorityString(r.audioPriority);
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 6, prioStr);
 
-        // 7: Threads
+        // 7: TIDs
         std::string threadsStr = r.isRunning ? std::to_string(r.currentThreadCount) : "-";
         SetSubItemTextIfChanged(hList, static_cast<int>(i), 7, threadsStr);
 
@@ -2200,7 +2206,10 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
                 int cellW = rcSub.right - rcSub.left;
                 int cellH = rcSub.bottom - rcSub.top;
                 int comboTotalH = cellH + static_cast<int>(180 * scale);
-                SetWindowPos(s_hInPlaceCombo, HWND_TOP, rcSub.left, rcSub.top, cellW, comboTotalH, SWP_SHOWWINDOW);
+                // ComboBox 本体の高さをセル枠内にフィットさせ、ドロップダウン項目の高さを拡大して文字切れを防止
+                SendMessageA(s_hInPlaceCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), static_cast<LPARAM>(cellH > 2 ? cellH - 2 : cellH));
+                SendMessageA(s_hInPlaceCombo, CB_SETITEMHEIGHT, 0, static_cast<LPARAM>(20 * scale));
+                SetWindowPos(s_hInPlaceCombo, HWND_TOP, rcSub.left, rcSub.top + 1, cellW, comboTotalH, SWP_SHOWWINDOW);
                 SetFocus(s_hInPlaceCombo);
                 SendMessageA(s_hInPlaceCombo, CB_SHOWDROPDOWN, TRUE, 0);
                 return 0; // デフォルトの行選択を抑止し ComboBox 展開に専念
@@ -2239,6 +2248,198 @@ static void RestartApplication(HWND hDlg) {
 }
 
 static bool s_inSizeMove = false;
+static HFONT s_hMainFont = nullptr;
+
+static void UpdateDialogFonts(HWND hDlg, float scale) {
+    int fontHeight = -MulDiv(9, static_cast<int>(96 * scale), 72);
+    HFONT hNewFont = CreateFontA(
+        fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+        CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, "Segoe UI"
+    );
+    if (!hNewFont) return;
+
+    SendMessageA(hDlg, WM_SETFONT, reinterpret_cast<WPARAM>(hNewFont), TRUE);
+
+    // 子コントロール巡回適用
+    EnumChildWindows(hDlg, [](HWND hWndChild, LPARAM lParam) -> BOOL {
+        SendMessageA(hWndChild, WM_SETFONT, static_cast<WPARAM>(lParam), TRUE);
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(hNewFont));
+
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    if (hList) {
+        HWND hHeader = ListView_GetHeader(hList);
+        if (hHeader) {
+            SendMessageA(hHeader, WM_SETFONT, reinterpret_cast<WPARAM>(hNewFont), TRUE);
+        }
+    }
+
+    if (s_hInPlaceCombo && IsWindow(s_hInPlaceCombo)) {
+        SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(hNewFont), TRUE);
+    }
+
+    if (s_hMainFont) {
+        DeleteObject(s_hMainFont);
+    }
+    s_hMainFont = hNewFont;
+}
+
+static void UpdateListViewColumnsDpi(HWND hDlg, float scale) {
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    if (!hList) return;
+
+    // Col 0〜7: 定数配列からスケール適用
+    int totalCol0To7 = 0;
+    for (int i = 0; i < kColCount - 1; ++i) {
+        int w = ScaleI(kColBaseWidths[i], scale);
+        ListView_SetColumnWidth(hList, i, w);
+        totalCol0To7 += w;
+    }
+
+    // Col 8 (Changes): ListView 残幅をフィル (横スクロール防止)
+    RECT rcListCl;
+    GetClientRect(hList, &rcListCl);
+    int listClientW = rcListCl.right - rcListCl.left;
+    int sbW = (GetWindowLongPtrA(hList, GWL_STYLE) & WS_VSCROLL) ? GetSystemMetrics(SM_CXVSCROLL) : 0;
+    int remainW = listClientW - totalCol0To7 - sbW;
+    int changesW = (remainW > 0) ? remainW : 0;
+    ListView_SetColumnWidth(hList, 8, changesW);
+}
+
+static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    if (!hList) return;
+
+    HWND hHeader = ListView_GetHeader(hList);
+
+    // 1. 各カラムの基本幅の合計 (Col 0〜8 全列)
+    int totalBaseColW = 0;
+    for (int i = 0; i < kColCount; ++i) totalBaseColW += ScaleI(kColBaseWidths[i], scale);
+
+    // 2. 登録行数と 1 行あたりの高さ
+    int itemCount = ListView_GetItemCount(hList);
+    int itemH = ScaleI(18, scale);
+    if (itemCount > 0) {
+        RECT rcItem = { 0 };
+        if (ListView_GetItemRect(hList, 0, &rcItem, LVIR_BOUNDS)) {
+            int h = rcItem.bottom - rcItem.top;
+            if (h > 0) itemH = h;
+        }
+    }
+
+    int headerH = ScaleI(20, scale);
+    if (hHeader) {
+        RECT rcHdr = { 0 };
+        GetWindowRect(hHeader, &rcHdr);
+        int h = rcHdr.bottom - rcHdr.top;
+        if (h > 0) headerH = h;
+    }
+
+    int margin = ScaleI(10, scale);
+    int rightColW = ScaleI(105, scale);
+    int bottomLegendH = ScaleI(38, scale);
+    int sbW = GetSystemMetrics(SM_CXVSCROLL); // 垂直スクロールバー幅を常に確保
+
+    // 登録行数がすべてスクロールバーなしで収まるために必要な ListView 高さ
+    int rows = (itemCount > 0) ? itemCount : 5;
+    int reqListH = headerH + rows * itemH + ScaleI(4, scale);
+
+    // 必要なクライアント矩形寸法 (垂直スクロールバー幅を加算して横はみ出し防止)
+    int reqClientW = margin + totalBaseColW + sbW + ScaleI(4, scale) + rightColW + margin;
+    int reqClientH = margin + reqListH + bottomLegendH + margin;
+
+    // 現在のウィンドウ矩形とクライアント矩形から外枠（ボーダー・タイトルバー）の差分を取得
+    RECT rcDlg, rcCl;
+    GetWindowRect(hDlg, &rcDlg);
+    GetClientRect(hDlg, &rcCl);
+    int borderW = (rcDlg.right - rcDlg.left) - (rcCl.right - rcCl.left);
+    int borderH = (rcDlg.bottom - rcDlg.top) - (rcCl.bottom - rcCl.top);
+
+    int curClientW = rcCl.right - rcCl.left;
+    int curClientH = rcCl.bottom - rcCl.top;
+
+    int newClientW = (curClientW < reqClientW) ? reqClientW : curClientW;
+    int newClientH = (curClientH < reqClientH) ? reqClientH : curClientH;
+
+    if (curClientW < reqClientW || curClientH < reqClientH) {
+        int newWndW = newClientW + borderW;
+        int newWndH = newClientH + borderH;
+        SetWindowPos(hDlg, nullptr, 0, 0, newWndW, newWndH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
+
+static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
+    if (cx <= 0 || cy <= 0) return;
+
+    int margin = static_cast<int>(10 * scale);
+    int rightColW = static_cast<int>(105 * scale);
+    int bottomLegendH = static_cast<int>(38 * scale);
+
+    // 1. ListView のリサイズ
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    if (hList) {
+        int listX = margin;
+        int listY = margin;
+        int listW = cx - margin - listX - rightColW;
+        int listH = cy - margin - listY - bottomLegendH;
+        if (listW < 100) listW = 100;
+        if (listH < 100) listH = 100;
+        SetWindowPos(hList, nullptr, listX, listY, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    // 2. ボタン寸法と整列配置
+    int btnW = static_cast<int>(80 * scale);
+    int btnH = static_cast<int>(20 * scale);
+    int chkW = static_cast<int>(105 * scale);
+    int chkH = static_cast<int>(18 * scale);
+    int btnX = cx - margin - btnW;
+    int chkX = cx - margin - chkW;
+
+    // Y 座標を上から整然と配置
+    int curY = margin;
+    HWND hChkTop = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
+    if (hChkTop) {
+        SetWindowPos(hChkTop, nullptr, chkX, curY, chkW, chkH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    curY += chkH + static_cast<int>(8 * scale);
+
+    auto PlaceBtn = [&](int ctrlId) {
+        HWND hBtn = GetDlgItem(hDlg, ctrlId);
+        if (hBtn) {
+            SetWindowPos(hBtn, nullptr, btnX, curY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+            curY += btnH + static_cast<int>(4 * scale);
+        }
+    };
+
+    // ToTray ボタンは廃止 (非表示化)
+    HWND hBtnHide = GetDlgItem(hDlg, IDC_BTN_HIDE);
+    if (hBtnHide) {
+        ShowWindow(hBtnHide, SW_HIDE);
+    }
+
+    // 現状の 12345 のボタン枠を上から順に: EDIT -> ADD -> REMOVE -> なし -> SETTINGS
+    PlaceBtn(IDC_BTN_EDIT);
+    PlaceBtn(IDC_BTN_ADD);
+    PlaceBtn(IDC_BTN_REMOVE);
+    curY += btnH + static_cast<int>(4 * scale); // 枠4: なし (1ボタン分の空き枠)
+    PlaceBtn(IDC_BTN_SETTINGS);
+
+    // Exit ボタンは最下部に配置 (SETTINGS との重なり防止)
+    HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
+    HWND hBtnSettings = GetDlgItem(hDlg, IDC_BTN_SETTINGS);
+    if (hBtnExit) {
+        int exitY = cy - margin - btnH;
+        if (hBtnSettings) {
+            RECT rcSet;
+            GetWindowRect(hBtnSettings, &rcSet);
+            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcSet), 2);
+            int minExitY = rcSet.bottom + static_cast<int>(6 * scale);
+            if (exitY < minExitY) exitY = minExitY;
+        }
+        SetWindowPos(hBtnExit, nullptr, btnX, exitY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+}
 
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
@@ -2247,7 +2448,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         LPMEASUREITEMSTRUCT pmis = reinterpret_cast<LPMEASUREITEMSTRUCT>(lParam);
         if (pmis && pmis->CtlID == IDC_COMBO_INPLACE_PRIO) {
             float scale = GetDpiScaleForWindow(hDlg);
-            pmis->itemHeight = static_cast<UINT>(18 * scale);
+            pmis->itemHeight = static_cast<UINT>(20 * scale);
             return TRUE;
         }
         break;
@@ -2323,17 +2524,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             }
         }
 
-        HFONT hFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
-        if (!hFont) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-        SendMessageA(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
+        float scale = GetDpiScaleForWindow(hDlg);
+        UpdateDialogFonts(hDlg, scale);
+
         HWND hHeader = ListView_GetHeader(hList);
-        if (hHeader) {
-            SendMessageA(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
-            if (!s_pfnOriginalHeaderProc) {
-                s_pfnOriginalHeaderProc = reinterpret_cast<WNDPROC>(
-                    SetWindowLongPtrA(hHeader, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomHeaderProc))
-                );
-            }
+        if (hHeader && !s_pfnOriginalHeaderProc) {
+            s_pfnOriginalHeaderProc = reinterpret_cast<WNDPROC>(
+                SetWindowLongPtrA(hHeader, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomHeaderProc))
+            );
         }
 
         ListView_SetExtendedListViewStyle(
@@ -2342,92 +2540,36 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         );
 
         // カラム挿入: 固定 8 列監視専用テーブル
-        float scale = GetDpiScaleForWindow(hDlg);
 
         LVCOLUMNA lvc = { 0 };
         lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
 
         int colIdx = 0;
 
-        // 0: ! (Ignore/Bypass Checkbox & Indicator, 最も左のカラム: テキストはCustomHeaderProcで赤単独描画)
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(24 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 1: Process Name (10% 拡大: 105 -> 116 * scale)
-        lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = static_cast<int>(116 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Process Name");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 2: Audio
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(68 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Audio");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 3: Excluded
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(75 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Excluded");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 4: Audio Core PID/TID
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(135 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Audio Core PID/TID");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 5: Pause / Verify (一時停止・検証チェックボックス: テキストはCustomHeaderProcで⏸描画)
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(24 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 6: Priority (▼ボタンサイズ分拡大: 113 -> 130 * scale)
-        lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = static_cast<int>(130 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Priority");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 7: Threads
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(55 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Threads");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
-
-        // 8: Changes (文字切れ防止のため初期幅 76*scale を確保)
-        lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = static_cast<int>(76 * scale);
-        lvc.iSubItem = colIdx;
-        lvc.pszText = const_cast<LPSTR>("Changes");
-        ListView_InsertColumn(hList, colIdx++, &lvc);
+        // カラムヘッダー定義 (列名・書式)
+        static const struct { const char* text; int fmt; } kColDefs[kColCount] = {
+            { "",                 LVCFMT_CENTER }, // 0: !
+            { "Process Name",     LVCFMT_LEFT   }, // 1: Process Name
+            { "Audio",            LVCFMT_CENTER }, // 2: Audio
+            { "Excluded",         LVCFMT_CENTER }, // 3: Excluded
+            { "Audio Core PID/TID", LVCFMT_CENTER }, // 4: PID/TID
+            { "",                 LVCFMT_CENTER }, // 5: || (Pause)
+            { "Priority",         LVCFMT_LEFT   }, // 6: Priority
+            { "TIDs",             LVCFMT_CENTER }, // 7: TIDs
+            { "Changes",          LVCFMT_CENTER }, // 8: Changes
+        };
+        for (int i = 0; i < kColCount; ++i) {
+            lvc.fmt = kColDefs[i].fmt;
+            lvc.cx = ScaleI(kColBaseWidths[i], scale);
+            lvc.iSubItem = colIdx;
+            lvc.pszText = const_cast<LPSTR>(kColDefs[i].text);
+            ListView_InsertColumn(hList, colIdx++, &lvc);
+        }
 
         // カラム挿入後にヘッダー自動調整 (LVSCW_AUTOSIZE_USEHEADER) を適用 (固定幅の Col 0, 1, 5, 6 は除外)
         for (int i = 0; i < colIdx; ++i) {
-            if (i == 0) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(24 * scale));
-                continue;
-            }
-            if (i == 1) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(116 * scale));
-                continue;
-            }
-            if (i == 5) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(24 * scale));
-                continue;
-            }
-            if (i == 6) {
-                ListView_SetColumnWidth(hList, i, static_cast<int>(130 * scale));
+            if (i == 0 || i == 1 || i == 5 || i == 6) {
+                ListView_SetColumnWidth(hList, i, ScaleI(kColBaseWidths[i], scale));
                 continue;
             }
             int initialW = ListView_GetColumnWidth(hList, i);
@@ -2436,7 +2578,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             if (autoW < initialW) {
                 ListView_SetColumnWidth(hList, i, initialW);
             } else {
-                ListView_SetColumnWidth(hList, i, autoW + static_cast<int>(10 * scale));
+                ListView_SetColumnWidth(hList, i, autoW + ScaleI(10, scale));
             }
         }
 
@@ -2481,7 +2623,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             nullptr
         );
         if (s_hInPlaceCombo) {
-            SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
+            SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(s_hMainFont), TRUE);
             for (int i = 0; i < PRIO_OPTIONS_COUNT; ++i) {
                 SendMessageA(s_hInPlaceCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(PRIO_OPTIONS[i].label));
             }
@@ -2499,60 +2641,13 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         SetTimer(hDlg, TIMER_POLLING_ID, config.pollingIntervalMs, nullptr);
         LogDebug("WM_INITDIALOG: SetTimer done");
 
-        // 初期レイアウト計算を強制適用 (全カラムがちょうどの長さで収まるよう初期幅・サイズを最適化)
-        int totalColW = 0;
-        for (int i = 0; i < colIdx; ++i) {
-            totalColW += ListView_GetColumnWidth(hList, i);
-        }
+        // 初期レイアウト計算を強制適用 (全カラム・全行が収まるようウィンドウ寸法を最適化)
+        AdjustWindowSizeToContent(hDlg, scale);
 
-        // 登録行数を確認し、リストビューの高さを超えて縦スクロールバーが出現する場合はスクロールバー幅を加算
-        int vScrollW = 0;
-        int itemCount = ListView_GetItemCount(hList);
-        int itemH = static_cast<int>(18 * scale);
-        if (itemCount > 0) {
-            RECT rcItem = { 0 };
-            if (ListView_GetItemRect(hList, 0, &rcItem, LVIR_BOUNDS)) {
-                int h = rcItem.bottom - rcItem.top;
-                if (h > 0) itemH = h;
-            }
-        }
-        RECT rcListCl;
-        GetClientRect(hList, &rcListCl);
-        int listClH = rcListCl.bottom - rcListCl.top;
-        int headerH = 0;
-        if (hHeader) {
-            RECT rcHdr = { 0 };
-            GetWindowRect(hHeader, &rcHdr);
-            headerH = rcHdr.bottom - rcHdr.top;
-        }
-        int effectiveListH = listClH - headerH;
-        int visibleRows = (itemH > 0 && effectiveListH > 0) ? (effectiveListH / itemH) : 5;
-        if (itemCount > visibleRows) {
-            vScrollW = GetSystemMetrics(SM_CXVSCROLL);
-            if (vScrollW <= 0) vScrollW = static_cast<int>(17 * scale);
-        }
-
-        RECT rcDlg, rcCl;
-        GetWindowRect(hDlg, &rcDlg);
+        RECT rcCl;
         GetClientRect(hDlg, &rcCl);
-        int borderW = (rcDlg.right - rcDlg.left) - (rcCl.right - rcCl.left);
-
-        RECT rcListInit;
-        GetWindowRect(hList, &rcListInit);
-        MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcListInit), 2);
-
-        int marginInit = static_cast<int>(10 * scale);
-        int rightColWInit = static_cast<int>(105 * scale);
-        int reqClientW = rcListInit.left + totalColW + vScrollW + static_cast<int>(4 * scale) + rightColWInit + marginInit;
-        int curClientW = rcCl.right - rcCl.left;
-
-        if (curClientW < reqClientW) {
-            int newWndW = reqClientW + borderW;
-            SetWindowPos(hDlg, nullptr, 0, 0, newWndW, rcDlg.bottom - rcDlg.top, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-
-        GetClientRect(hDlg, &rcCl);
-        SendMessageA(hDlg, WM_SIZE, SIZE_RESTORED, MAKELPARAM(rcCl.right - rcCl.left, rcCl.bottom - rcCl.top));
+        RelayoutMainDialog(hDlg, scale, rcCl.right - rcCl.left, rcCl.bottom - rcCl.top);
+        UpdateListViewColumnsDpi(hDlg, scale);
 
         return TRUE;
     }
@@ -2562,6 +2657,36 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         float scale = GetDpiScaleForWindow(hDlg);
         lpMMI->ptMinTrackSize.x = static_cast<LONG>(514 * scale);
         lpMMI->ptMinTrackSize.y = static_cast<LONG>(180 * scale);
+        return 0;
+    }
+
+    case WM_DPICHANGED: {
+        RECT* prcNew = reinterpret_cast<RECT*>(lParam);
+        if (prcNew) {
+            SetWindowPos(hDlg, nullptr, prcNew->left, prcNew->top,
+                         prcNew->right - prcNew->left, prcNew->bottom - prcNew->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        float newScale = GetDpiScaleForWindow(hDlg);
+        UpdateDialogFonts(hDlg, newScale);
+        AdjustWindowSizeToContent(hDlg, newScale);
+        RECT rcCl;
+        GetClientRect(hDlg, &rcCl);
+        RelayoutMainDialog(hDlg, newScale, rcCl.right - rcCl.left, rcCl.bottom - rcCl.top);
+        UpdateListViewColumnsDpi(hDlg, newScale);
+        InvalidateRect(hDlg, nullptr, TRUE);
+        return 0;
+    }
+
+    case WM_DISPLAYCHANGE: {
+        float newScale = GetDpiScaleForWindow(hDlg);
+        UpdateDialogFonts(hDlg, newScale);
+        AdjustWindowSizeToContent(hDlg, newScale);
+        RECT rcCl;
+        GetClientRect(hDlg, &rcCl);
+        RelayoutMainDialog(hDlg, newScale, rcCl.right - rcCl.left, rcCl.bottom - rcCl.top);
+        UpdateListViewColumnsDpi(hDlg, newScale);
+        InvalidateRect(hDlg, nullptr, TRUE);
         return 0;
     }
 
@@ -2576,68 +2701,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         if (cx <= 0 || cy <= 0) return TRUE;
 
         float scale = GetDpiScaleForWindow(hDlg);
-        int margin = static_cast<int>(10 * scale);
-        int rightColW = static_cast<int>(105 * scale);
-        int bottomLegendH = static_cast<int>(38 * scale);
-
-        HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-        if (hList) {
-            RECT rcList;
-            GetWindowRect(hList, &rcList);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
-            int listW = cx - margin - rcList.left - rightColW;
-            int listH = cy - margin - rcList.top - bottomLegendH;
-            if (listW < 100) listW = 100;
-            if (listH < 100) listH = 100;
-            SetWindowPos(hList, nullptr, rcList.left, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
-            InvalidateRect(hList, nullptr, TRUE);
-        }
-
-        auto MoveRight = [&](int ctrlId) {
-            HWND hCtrl = GetDlgItem(hDlg, ctrlId);
-            if (hCtrl) {
-                RECT rc;
-                GetWindowRect(hCtrl, &rc);
-                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rc), 2);
-                int w = rc.right - rc.left;
-                int h = rc.bottom - rc.top;
-                int newX = cx - margin - w;
-                SetWindowPos(hCtrl, nullptr, newX, rc.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-            }
-        };
-
-        MoveRight(IDC_CHK_ALWAYS_ON_TOP);
-
-        MoveRight(IDC_BTN_HIDE);
-        MoveRight(IDC_BTN_SETTINGS);
-        MoveRight(IDC_BTN_ADD);
-        MoveRight(IDC_BTN_EDIT);
-        MoveRight(IDC_BTN_REMOVE);
-
-        HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
-        HWND hBtnRemove = GetDlgItem(hDlg, IDC_BTN_REMOVE);
-        if (hBtnExit) {
-            RECT rc;
-            GetWindowRect(hBtnExit, &rc);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rc), 2);
-            int w = rc.right - rc.left;
-            int h = rc.bottom - rc.top;
-            int newX = cx - margin - w;
-            int newY = cy - margin - h;
-
-            // Remove ボタンの下端より上に行かないよう重なり防止ガード
-            if (hBtnRemove) {
-                RECT rcRem;
-                GetWindowRect(hBtnRemove, &rcRem);
-                MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcRem), 2);
-                int minExitY = rcRem.bottom + static_cast<int>(6 * scale);
-                if (newY < minExitY) newY = minExitY;
-            }
-            SetWindowPos(hBtnExit, nullptr, newX, newY, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        RelayoutMainDialog(hDlg, scale, cx, cy);
+        UpdateListViewColumnsDpi(hDlg, scale);
 
         // ウィンドウリサイズ時、親ダイアログの余白・凡例領域を背景消去付きで無効化（旧位置の残像を防止）
-        // ※子コントロールは WS_CLIPCHILDREN により保護されチラつかない
         InvalidateRect(hDlg, nullptr, TRUE);
         return TRUE;
     }
@@ -3400,6 +3467,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         RemoveTrayIcon();
         g_isolator.ResumeAllSuspendedThreads();
         SaveConfig(g_isolator.GetConfig(), g_iniPath);
+        if (s_hMainFont) {
+            DeleteObject(s_hMainFont);
+            s_hMainFont = nullptr;
+        }
         PostQuitMessage(0);
         return TRUE;
     }

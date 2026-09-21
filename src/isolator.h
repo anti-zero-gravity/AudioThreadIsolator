@@ -137,6 +137,16 @@ private:
     GlobalConfig m_config;
     std::string m_heuristicsStatusText;
     bool m_initialNeedSave = false;
+
+    // ── リファクタリング: 共通ヘルパーメソッド ──
+    // Chromium 系 PID 追跡状態の一括クリア
+    void ClearChromiumTrackingState(DWORD pid);
+    // Suspend 中オーディオスレッドの安全な Resume
+    static void ResumeAudioThreadIfSuspended(ProcessRule& rule);
+    // 表示用スレッドカウントの算出・更新 (戻り値: stateChanged)
+    static bool UpdateDisplayThreadCount(ProcessRule& rule, int totalThreadCount);
+    // ルール状態変更ログ出力
+    static void LogRuleStateChange(const ProcessRule& rule);
     
     // キー: TID, 値: 適用済みマスク
     std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;

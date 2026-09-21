@@ -37,28 +37,6 @@ typedef NTSTATUS(NTAPI *pfnNtQueryInformationThread)(
     ULONG ThreadInformationLength, PULONG ReturnLength);
 static pfnNtQueryInformationThread s_pfnNtQueryInformationThread = nullptr;
 
-static void *QueryThreadStartAddress(HANDLE hThread) {
-  if (!s_pfnNtQueryInformationThread) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (hNtdll) {
-      s_pfnNtQueryInformationThread =
-          reinterpret_cast<pfnNtQueryInformationThread>(
-              GetProcAddress(hNtdll, "NtQueryInformationThread"));
-    }
-  }
-  if (!s_pfnNtQueryInformationThread)
-    return nullptr;
-
-  void *startAddr = nullptr;
-  ULONG retLen = 0;
-  NTSTATUS status = s_pfnNtQueryInformationThread(
-      hThread, 9 /* ThreadQuerySetWin32StartAddress */, &startAddr,
-      sizeof(startAddr), &retLen);
-  if (status == 0)
-    return startAddr;
-  return nullptr;
-}
-
 typedef NTSTATUS(NTAPI *pfnNtGetNextThread)(
     HANDLE ProcessHandle,
     HANDLE ThreadHandle,
@@ -83,6 +61,21 @@ static void EnsureNtLoaded() {
   }
 }
 
+static void *QueryThreadStartAddress(HANDLE hThread) {
+  EnsureNtLoaded();
+  if (!s_pfnNtQueryInformationThread)
+    return nullptr;
+
+  void *startAddr = nullptr;
+  ULONG retLen = 0;
+  NTSTATUS status = s_pfnNtQueryInformationThread(
+      hThread, 9 /* ThreadQuerySetWin32StartAddress */, &startAddr,
+      sizeof(startAddr), &retLen);
+  if (status == 0)
+    return startAddr;
+  return nullptr;
+}
+
 struct THREAD_BASIC_INFO_RAW {
   NTSTATUS ExitStatus;
   PVOID TebBaseAddress;
@@ -94,14 +87,7 @@ struct THREAD_BASIC_INFO_RAW {
 };
 
 static DWORD_PTR QueryThreadAffinityMask(HANDLE hThread) {
-  if (!s_pfnNtQueryInformationThread) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (hNtdll) {
-      s_pfnNtQueryInformationThread =
-          reinterpret_cast<pfnNtQueryInformationThread>(
-              GetProcAddress(hNtdll, "NtQueryInformationThread"));
-    }
-  }
+  EnsureNtLoaded();
   if (!s_pfnNtQueryInformationThread)
     return 0;
 
@@ -116,14 +102,7 @@ static DWORD_PTR QueryThreadAffinityMask(HANDLE hThread) {
 }
 
 static std::string QueryFmodOrUnityThreadName(HANDLE hProcess, HANDLE hThread) {
-  if (!s_pfnNtQueryInformationThread) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (hNtdll) {
-      s_pfnNtQueryInformationThread =
-          reinterpret_cast<pfnNtQueryInformationThread>(
-              GetProcAddress(hNtdll, "NtQueryInformationThread"));
-    }
-  }
+  EnsureNtLoaded();
   if (!s_pfnNtQueryInformationThread)
     return "";
 
@@ -288,14 +267,7 @@ static bool IsRegisteredAsioDll(const std::string &modPath) {
 // DirectSound / Godot 等)
 static std::string QueryCallstackAudioSignature(HANDLE hProcess,
                                                 HANDLE hThread) {
-  if (!s_pfnNtQueryInformationThread) {
-    HMODULE hNtdll = GetModuleHandleA("ntdll.dll");
-    if (hNtdll) {
-      s_pfnNtQueryInformationThread =
-          reinterpret_cast<pfnNtQueryInformationThread>(
-              GetProcAddress(hNtdll, "NtQueryInformationThread"));
-    }
-  }
+  EnsureNtLoaded();
   if (!s_pfnNtQueryInformationThread)
     return "";
 
@@ -387,6 +359,8 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
   // モジュール名解決キャッシュ (同一 AllocationBase に対する API
   // 呼び出しの重複を防ぐ)
   std::unordered_map<DWORD_PTR, std::string> modNameCache;
+  bool hasDiscordVoice = false;
+  bool hasAvrt = false;
 
   for (size_t i = 0; i < ptrs.size(); ++i) {
     DWORD_PTR p = ptrs[i];
@@ -437,6 +411,19 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess,
             // (6) pxtone (洞窟物語・オルガーニャ等の音源エンジン)
             if (modName.find("pxtone") != std::string::npos) {
               return "pxtone (Organya)";
+            }
+            // (7) Discord Voice (discord_voice.node + avrt.dll MMCSS)
+            if (modName.find("discord_voice") != std::string::npos) {
+              hasDiscordVoice = true;
+              if (hasAvrt) {
+                return "Discord Voice";
+              }
+            }
+            if (modName.find("avrt") != std::string::npos) {
+              hasAvrt = true;
+              if (hasDiscordVoice) {
+                return "Discord Voice";
+              }
             }
           }
         }
@@ -668,14 +655,7 @@ void ThreadIsolator::RemoveRule(size_t index) {
   std::lock_guard<std::mutex> lock(m_mutex);
   if (index < m_config.rules.size()) {
     auto &rule = m_config.rules[index];
-    if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
-      HANDLE hThread =
-          OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-      if (hThread) {
-        ResumeThread(hThread);
-        CloseHandle(hThread);
-      }
-    }
+    ResumeAudioThreadIfSuspended(rule);
     m_config.rules.erase(m_config.rules.begin() + index);
   }
 }
@@ -713,11 +693,7 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
     auto &rule = m_config.rules[index];
     rule.isBypassed = !rule.isBypassed;
     if (rule.audioServicePid != 0) {
-      m_chromiumMaskedPids.erase(rule.audioServicePid);
-      m_chromiumEvictedPids.erase(rule.audioServicePid);
-      m_chromiumThreadTracks.erase(rule.audioServicePid);
-      m_chromiumAudioStates.erase(rule.audioServicePid);
-      m_chromiumScannedPids.erase(rule.audioServicePid);
+      ClearChromiumTrackingState(rule.audioServicePid);
       rule.audioServicePid = 0;
     }
     if (rule.activePid != 0) {
@@ -727,15 +703,7 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
     rule.chromiumScanAttempted = false;
     rule.wasHalfAutoPromoted = false;
     if (rule.isBypassed) {
-      if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
-        HANDLE hThread =
-            OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-        if (hThread) {
-          ResumeThread(hThread);
-          CloseHandle(hThread);
-        }
-        rule.isAudioThreadSuspended = false;
-      }
+      ResumeAudioThreadIfSuspended(rule);
       rule.isAudioIsolated = false;
       rule.hasIntruderThreads = false;
       rule.detectedThreadName = "Bypassed";
@@ -845,15 +813,7 @@ bool ThreadIsolator::ToggleSuspendAudioThread(size_t index) {
 void ThreadIsolator::ResumeAllSuspendedThreads() {
   std::lock_guard<std::mutex> lock(m_mutex);
   for (auto &rule : m_config.rules) {
-    if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
-      HANDLE hThread =
-          OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-      if (hThread) {
-        ResumeThread(hThread);
-        CloseHandle(hThread);
-      }
-      rule.isAudioThreadSuspended = false;
-    }
+    ResumeAudioThreadIfSuspended(rule);
   }
 }
 
@@ -1026,6 +986,57 @@ DWORD_PTR ThreadIsolator::MakeDefaultNormalMask(int coreCount,
   return normal ? normal : full;
 }
 
+
+// ── リファクタリング: 共通ヘルパーメソッド実装 ──
+
+// 候補 2: Chromium 系 PID 追跡状態の一括クリア
+void ThreadIsolator::ClearChromiumTrackingState(DWORD pid) {
+  m_chromiumMaskedPids.erase(pid);
+  m_chromiumEvictedPids.erase(pid);
+  m_chromiumThreadTracks.erase(pid);
+  m_chromiumAudioStates.erase(pid);
+  m_chromiumScannedPids.erase(pid);
+}
+
+// 候補 3: Suspend 中オーディオスレッドの安全な Resume
+void ThreadIsolator::ResumeAudioThreadIfSuspended(ProcessRule& rule) {
+  if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
+    HANDLE hThread =
+        OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
+    if (hThread) {
+      ResumeThread(hThread);
+      CloseHandle(hThread);
+    }
+    rule.isAudioThreadSuspended = false;
+  }
+}
+
+// 候補 4: 表示用スレッドカウントの算出・更新
+bool ThreadIsolator::UpdateDisplayThreadCount(ProcessRule& rule, int totalThreadCount) {
+  int displayThreadCount = 0;
+  if (rule.isAudioIsolated) {
+    displayThreadCount = 1;
+  } else if (rule.detectedThreadName == "sleeping..." || rule.searchPhase == 4) {
+    displayThreadCount = 0;
+  } else {
+    displayThreadCount = totalThreadCount;
+  }
+  if (rule.currentThreadCount != displayThreadCount) {
+    rule.currentThreadCount = displayThreadCount;
+    return true;
+  }
+  return false;
+}
+
+// 候補 5: ルール状態変更ログ出力
+void ThreadIsolator::LogRuleStateChange(const ProcessRule& rule) {
+  char rLog[256];
+  snprintf(rLog, sizeof(rLog),
+      "Rule State Changed: Proc=%s, PID=%lu, AudioThread='%s', Threads=%d",
+      rule.processName.c_str(), rule.activePid,
+      rule.detectedThreadName.c_str(), rule.currentThreadCount);
+  LogDebug(rLog);
+}
 
 bool ThreadIsolator::ScanAndIsolate() {
   std::lock_guard<std::mutex> lock(m_mutex);
@@ -1290,15 +1301,7 @@ bool ThreadIsolator::ScanAndIsolate() {
 
     if (it == runningProcesses.end() || it->second.empty()) {
       if (rule.isRunning) {
-        if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
-          HANDLE hThread =
-              OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-          if (hThread) {
-            ResumeThread(hThread);
-            CloseHandle(hThread);
-          }
-          rule.isAudioThreadSuspended = false;
-        }
+        ResumeAudioThreadIfSuspended(rule);
         if (rule.activePid != 0) {
           m_samplingStates.erase(rule.activePid);
         }
@@ -1312,11 +1315,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.searchPhase = 0;
         rule.searchTurns = 0;
         if (rule.audioServicePid != 0) {
-          m_chromiumMaskedPids.erase(rule.audioServicePid);
-          m_chromiumEvictedPids.erase(rule.audioServicePid);
-          m_chromiumThreadTracks.erase(rule.audioServicePid);
-          m_chromiumAudioStates.erase(rule.audioServicePid);
-          m_chromiumScannedPids.erase(rule.audioServicePid);
+          ClearChromiumTrackingState(rule.audioServicePid);
           rule.audioServicePid = 0;
         }
         stateChanged = true;
@@ -1340,11 +1339,7 @@ bool ThreadIsolator::ScanAndIsolate() {
       rule.searchPhase = 0;
       rule.searchTurns = 0;
       if (rule.audioServicePid != 0) {
-        m_chromiumMaskedPids.erase(rule.audioServicePid);
-        m_chromiumEvictedPids.erase(rule.audioServicePid);
-        m_chromiumThreadTracks.erase(rule.audioServicePid);
-        m_chromiumAudioStates.erase(rule.audioServicePid);
-        m_chromiumScannedPids.erase(rule.audioServicePid);
+        ClearChromiumTrackingState(rule.audioServicePid);
         rule.audioServicePid = 0;
       }
       for (DWORD pid : it->second) {
@@ -1430,11 +1425,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           }
         }
         if (!alive) {
-          m_chromiumMaskedPids.erase(audioServicePid);
-          m_chromiumEvictedPids.erase(audioServicePid);
-          m_chromiumThreadTracks.erase(audioServicePid);
-          m_chromiumAudioStates.erase(audioServicePid);
-          m_chromiumScannedPids.erase(audioServicePid);
+          ClearChromiumTrackingState(audioServicePid);
           audioServicePid = 0;
           rule.audioServicePid = 0;
           rule.detectedThreadName = "sleeping...";
@@ -1516,6 +1507,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.searchTurns = 0;
         rule.isAudioIsolated = false;
         rule.activeAudioTid = 0;
+        if (rule.currentThreadCount != 0) {
+          rule.currentThreadCount = 0;
+          stateChanged = true;
+        }
         continue;
       }
 
@@ -1528,6 +1523,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
         rule.isAudioIsolated = false;
         rule.activeAudioTid = 0;
+        if (rule.currentThreadCount != 0) {
+          rule.currentThreadCount = 0;
+          stateChanged = true;
+        }
         continue;
       }
 
@@ -1866,19 +1865,8 @@ bool ThreadIsolator::ScanAndIsolate() {
 
       CloseHandle(hAsProc);
 
-      if (rule.currentThreadCount != totalThreadCount) {
-        rule.currentThreadCount = totalThreadCount;
-        stateChanged = true;
-      }
-      if (stateChanged) {
-        char rLog[256];
-        snprintf(
-            rLog, sizeof(rLog),
-            "Rule State Changed: Proc=%s, PID=%lu, AudioThread='%s', Threads=%d",
-            rule.processName.c_str(), rule.activePid,
-            rule.detectedThreadName.c_str(), rule.currentThreadCount);
-        LogDebug(rLog);
-      }
+      if (UpdateDisplayThreadCount(rule, totalThreadCount)) stateChanged = true;
+      if (stateChanged) LogRuleStateChange(rule);
       continue;
     }
 
@@ -2446,15 +2434,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         stateChanged = true;
       }
       if (rule.activeAudioTid != primaryAudioTid) {
-        if (rule.isAudioThreadSuspended && rule.activeAudioTid != 0) {
-          HANDLE hOld =
-              OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-          if (hOld) {
-            ResumeThread(hOld);
-            CloseHandle(hOld);
-          }
-          rule.isAudioThreadSuspended = false;
-        }
+        ResumeAudioThreadIfSuspended(rule);
         rule.activeAudioTid = primaryAudioTid;
         rule.wasHalfAutoPromoted = false;
         stateChanged = true;
@@ -2469,15 +2449,7 @@ bool ThreadIsolator::ScanAndIsolate() {
         stateChanged = true;
       }
       if (rule.activeAudioTid != 0) {
-        if (rule.isAudioThreadSuspended) {
-          HANDLE hOld =
-              OpenThread(THREAD_SUSPEND_RESUME, FALSE, rule.activeAudioTid);
-          if (hOld) {
-            ResumeThread(hOld);
-            CloseHandle(hOld);
-          }
-          rule.isAudioThreadSuspended = false;
-        }
+        ResumeAudioThreadIfSuspended(rule);
         rule.activeAudioTid = 0;
         rule.wasHalfAutoPromoted = false;
         stateChanged = true;
@@ -2491,26 +2463,24 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.searchTurns--;
         if (rule.searchTurns <= 0) {
           rule.searchPhase = 2;
-          rule.searchTurns = 8 * turnsPerSec;
+          rule.searchTurns = 10 * turnsPerSec;
           rule.detectedThreadName = "Standby 10";
           stateChanged = true;
         }
       } else if (rule.searchPhase == 2) {
-        int sec = 3 + (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
+        int sec = (rule.searchTurns + 1) / 2;
+        if (sec < 1) sec = 1;
         std::string sName = "Standby " + std::to_string(sec);
         if (rule.detectedThreadName != sName) {
           rule.detectedThreadName = sName;
           stateChanged = true;
         }
         rule.searchTurns--;
-        if (rule.searchTurns <= 0) {
+        if (rule.searchTurns <= 2 * turnsPerSec) {
           rule.searchPhase = 3;
-          rule.searchTurns = 2 * turnsPerSec;
-          rule.detectedThreadName = "Standby 2";
-          stateChanged = true;
         }
       } else if (rule.searchPhase == 3) {
-        int sec = (rule.searchTurns + turnsPerSec - 1) / turnsPerSec;
+        int sec = (rule.searchTurns + 1) / 2;
         if (sec < 1) sec = 1;
         std::string sName = "Standby " + std::to_string(sec);
         if (rule.detectedThreadName != sName) {
@@ -2538,20 +2508,8 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
     }
 
-    if (rule.currentThreadCount != totalThreadCount) {
-      rule.currentThreadCount = totalThreadCount;
-      stateChanged = true;
-    }
-
-    if (stateChanged) {
-      char rLog[256];
-      snprintf(
-          rLog, sizeof(rLog),
-          "Rule State Changed: Proc=%s, PID=%lu, AudioThread='%s', Threads=%d",
-          rule.processName.c_str(), rule.activePid,
-          rule.detectedThreadName.c_str(), rule.currentThreadCount);
-      LogDebug(rLog);
-    }
+    if (UpdateDisplayThreadCount(rule, totalThreadCount)) stateChanged = true;
+    if (stateChanged) LogRuleStateChange(rule);
   }
 
   m_heuristicsStatusText = heuristicsStatus;
