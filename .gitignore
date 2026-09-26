@@ -53,7 +53,6 @@ plan.md
 arc.md
 
 # Build and measurement scripts
-build.ps1
 measure.ps1
 
 # Trash folder

@@ -1,0 +1,803 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ATI Priority Selector — 3D Three.js Engine</title>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <!-- Three.js & OrbitControls -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: #090b10;
+      font-family: 'Inter', sans-serif;
+      color: #d8dee9;
+      display: flex; flex-direction: column; align-items: center;
+      min-height: 100vh; padding: 18px;
+      user-select: none;
+      overflow-x: hidden;
+    }
+    header {
+      margin-bottom: 14px;
+      text-align: center;
+    }
+    header h1 {
+      font-size: 18px;
+      font-weight: 800;
+      letter-spacing: 0.8px;
+      color: #eceff4;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      justify-content: center;
+    }
+    header .sub {
+      font-size: 11px;
+      color: #606d80;
+      font-family: 'JetBrains Mono', monospace;
+      margin-top: 3px;
+    }
+    .main {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      justify-content: flex-start;
+      max-width: 1240px;
+      width: 100%;
+    }
+    .viewer-wrap {
+      background: rgba(15, 19, 28, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      border-radius: 14px;
+      padding: 14px;
+      box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      position: relative;
+    }
+    #viewport3d {
+      width: 620px;
+      height: 500px;
+      border-radius: 10px;
+      overflow: hidden;
+      cursor: grab;
+      position: relative;
+      background: #0d1017;
+      box-shadow: inset 0 0 20px rgba(0,0,0,0.8);
+    }
+    #viewport3d:active { cursor: grabbing; }
+    
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      margin-top: 10px;
+      width: 100%;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .tool-group {
+      display: flex;
+      gap: 6px;
+    }
+    .btn {
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.12);
+      color: #c0caf5;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 6px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-family: 'JetBrains Mono', monospace;
+      transition: all 0.15s ease;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .btn:hover {
+      background: rgba(255, 255, 255, 0.14);
+      color: #ffffff;
+      border-color: rgba(255, 255, 255, 0.25);
+    }
+    .btn.active {
+      background: #2563eb;
+      color: #ffffff;
+      border-color: #3b82f6;
+    }
+    .camera-info-badge {
+      font-size: 11px;
+      color: #94a3b8;
+      font-family: 'JetBrains Mono', monospace;
+      background: rgba(15, 23, 42, 0.85);
+      border: 1px solid rgba(122, 162, 247, 0.25);
+      padding: 5px 10px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .camera-info-badge b {
+      color: #60a5fa;
+      font-weight: 700;
+    }
+    .camera-info-badge .val-accent {
+      color: #38bdf8;
+      font-weight: 700;
+    }
+    .info-sep {
+      color: rgba(255, 255, 255, 0.15);
+    }
+    
+    .hud {
+      min-width: 320px;
+      max-width: 380px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .card {
+      background: rgba(15, 19, 28, 0.95);
+      border: 1px solid rgba(255, 255, 255, 0.09);
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.4);
+    }
+    .card-label {
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 1.2px;
+      color: #717d91;
+      font-weight: 700;
+      margin-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+    }
+    .hero-val-row {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+    .hero-val {
+      font-size: 52px;
+      font-weight: 800;
+      font-family: 'JetBrains Mono', monospace;
+      color: #ffffff;
+      line-height: 1;
+      text-shadow: 0 0 20px rgba(59, 130, 246, 0.4);
+    }
+    .hero-rank {
+      font-size: 13px;
+      font-weight: 700;
+      color: #60a5fa;
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .detail {
+      font-size: 12px;
+      margin-bottom: 6px;
+      display: flex;
+      justify-content: space-between;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+      padding-bottom: 4px;
+    }
+    .detail .lbl { color: #8892b0; }
+    .detail .v { font-family: 'JetBrains Mono', monospace; font-weight: 600; color: #e2e8f0; }
+    .detail.formula .v { color: #38bdf8; font-weight: 700; }
+    
+    #rankList {
+      max-height: 250px;
+      overflow-y: auto;
+      font-size: 11px;
+      font-family: 'JetBrains Mono', monospace;
+      line-height: 1.8;
+      color: #64748b;
+      padding-right: 4px;
+    }
+    #rankList::-webkit-scrollbar { width: 5px; }
+    #rankList::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+    
+    #rankList div {
+      padding: 2px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      transition: background 0.1s;
+    }
+    #rankList div:hover {
+      background: rgba(255, 255, 255, 0.05);
+      color: #cbd5e1;
+    }
+    #rankList div.sel {
+      color: #ffffff;
+      font-weight: 700;
+      background: rgba(59, 130, 246, 0.25);
+      border-left: 3px solid #3b82f6;
+    }
+    
+    .guide-box {
+      font-size: 11px;
+      color: #8b9bb4;
+      line-height: 1.5;
+    }
+    .guide-box b { color: #e2e8f0; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1><span>📊</span> Windows Priority 3D Matrix (7 × 7)</h1>
+  <div class="sub">3D WebGL (Three.js) Engine — Depth Buffer & 3-Point Perspective</div>
+</header>
+
+<div class="main">
+  <div class="viewer-wrap">
+    <div id="viewport3d"></div>
+    <div class="toolbar">
+      <div class="tool-group">
+        <button class="btn active" id="btnOrigView" title="手前27.9° / 左奥116.1° / 仰角47.0°の基準視点">📷 基準アングル (28° / 116°)</button>
+        <button class="btn" id="btnTopView">⬇ 上面俯瞰</button>
+        <button class="btn" id="btnReset">🔄 リセット</button>
+      </div>
+      <div class="camera-info-badge">
+        <span>🔍 ズーム: <b id="hudZoom">0.56x</b></span>
+        <span class="info-sep">｜</span>
+        <span id="hudAngles">手前: <b class="val-accent">+27.9°</b> ｜ 左奥: <b class="val-accent">+116.1°</b> <small>(仰角 47.0°)</small></span>
+      </div>
+    </div>
+  </div>
+
+  <div class="hud">
+    <div class="card">
+      <div class="card-label">
+        <span>CURRENT SELECTION</span>
+        <span id="hudCellPos">[Row:0, Col:0]</span>
+      </div>
+      <div class="hero-val-row">
+        <div class="hero-val" id="hudBase">1</div>
+        <div class="hero-rank" id="hudRank">Rank #1 / 49</div>
+      </div>
+      <div class="detail"><span class="lbl">Process Class</span><span class="v" id="hudProc">Idle</span></div>
+      <div class="detail"><span class="lbl">Thread Priority</span><span class="v" id="hudThread">Idle(-15)</span></div>
+      <div class="detail formula"><span class="lbl">計算式</span><span class="v" id="hudFormula">4 + (-15) = 1</span></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">RANK ORDER (ASCENDING)</div>
+      <div id="rankList"></div>
+    </div>
+
+    <div class="card guide-box">
+      <b>操作方法:</b><br>
+      • <b>左ドラッグ</b>: 3D回転 (全方位)<br>
+      • <b>右ドラッグ / Shift+ドラッグ</b>: パン移動<br>
+      • <b>ホイール</b>: ズームイン / アウト<br>
+      • <b>クリック</b>: 柱を直接選択<br>
+      • <b>↑ / ↓ キー</b>: ランクを順繰り選択
+    </div>
+  </div>
+</div>
+
+<script>
+// ════════════════════════════════════════════════
+// 1. Data Model
+// ════════════════════════════════════════════════
+const PM = [
+  [ 1,  2,  3,  4,  5,  6, 15],
+  [ 1,  4,  5,  6,  7,  8, 15],
+  [ 1,  5,  6,  7,  8,  9, 15],
+  [ 1,  7,  8,  9, 10, 11, 15],
+  [ 1,  8,  9, 10, 11, 12, 15],
+  [ 1, 11, 12, 13, 14, 15, 15],
+  [16, 22, 23, 24, 25, 26, 31],
+];
+const PS = ['IDLE_PRIORITY_CLASS','BELOW_NORMAL_PRIORITY_CLASS','NORMAL_PRIORITY_CLASS (BG)','NORMAL_PRIORITY_CLASS (FG)','ABOVE_NORMAL_PRIORITY_CLASS','HIGH_PRIORITY_CLASS','REALTIME_PRIORITY_CLASS'];
+const TS = ['THREAD_PRIORITY_IDLE','THREAD_PRIORITY_LOWEST','THREAD_PRIORITY_BELOW_NORMAL','THREAD_PRIORITY_NORMAL','THREAD_PRIORITY_ABOVE_NORMAL','THREAD_PRIORITY_HIGHEST','THREAD_PRIORITY_TIME_CRITICAL'];
+const TR = [-15, -2, -1, 0, 1, 2, 15];
+const PB = [4, 6, 8, 8, 10, 13, 24];
+
+// Color definitions: Subdued, elegant matte palette (strictly matching original image)
+const ROW_COLORS = [
+  0x4a90b8, // Row 0: Idle (Soft Slate Blue / Cyan)
+  0xb85d43, // Row 1: Below Normal (Muted Terracotta / Coral)
+  0x7e3d5d, // Row 2: Normal BG (Dusty Wine / Mulberry)
+  0x78a49a, // Row 3: Normal FG (Pale Celadon / Sage Mint)
+  0xc59e45, // Row 4: Above Normal (Warm Mustard / Sand Amber)
+  0x5a2d48, // Row 5: High (Deep Plum / Bordeaux)
+  0x9da3c2, // Row 6: Realtime (Soft Lilac / Lavender Gray)
+];
+
+const entries = [];
+for (let r = 0; r < 7; r++) {
+  for (let c = 0; c < 7; c++) {
+    entries.push({ row: r, col: c, bp: PM[r][c], pb: PB[r], tr: TR[c] });
+  }
+}
+// Sort by BasePriority ASC, then Row, then Col
+entries.sort((a, b) => a.bp !== b.bp ? a.bp - b.bp : a.row !== b.row ? a.row - b.row : a.col - b.col);
+entries.forEach((e, i) => e.rank = i + 1);
+
+const byRC = {};
+entries.forEach(e => { byRC[`${e.row}_${e.col}`] = e; });
+
+let curRank = 1;
+function sel() {
+  if (curRank === 0) return null;
+  return entries[curRank - 1];
+}
+
+// ════════════════════════════════════════════════
+// 2. Three.js Scene Setup
+// ════════════════════════════════════════════════
+const container = document.getElementById('viewport3d');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0d14);
+
+const width = container.clientWidth;
+const height = container.clientHeight;
+
+// Perspective Camera with 3-Point Perspective
+const camera = new THREE.PerspectiveCamera(32, width / height, 0.1, 100);
+
+// Camera Position calibrated to user reference:
+// - Zoom: 0.56x, Elevation: 47.0 deg
+// - Front edge: +27.9 deg, Left-back edge: +116.1 deg
+const ORIG_CAM_POS = new THREE.Vector3(-10.22, 25.01, 19.40);
+const ORIG_TARGET = new THREE.Vector3(0, 1.5, 0);
+
+camera.position.copy(ORIG_CAM_POS);
+camera.lookAt(ORIG_TARGET);
+
+const renderer = new THREE.WebGLRenderer({
+  antialias: true,
+  alpha: true,
+  preserveDrawingBuffer: true,
+  powerPreference: 'high-performance'
+});
+renderer.setSize(width, height);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+container.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.target.copy(ORIG_TARGET);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.maxPolarAngle = Math.PI / 2 - 0.05; // Do not go below floor
+
+// ════════════════════════════════════════════════
+// 3. Lighting Setup (Soft, matte natural lighting)
+// ════════════════════════════════════════════════
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.72);
+scene.add(ambientLight);
+
+const mainLight = new THREE.DirectionalLight(0xfff8f0, 0.65);
+mainLight.position.set(10, 20, 12);
+mainLight.castShadow = true;
+mainLight.shadow.mapSize.width = 1024;
+mainLight.shadow.mapSize.height = 1024;
+scene.add(mainLight);
+
+const fillLight = new THREE.DirectionalLight(0x94a3b8, 0.28);
+fillLight.position.set(-15, 12, -10);
+scene.add(fillLight);
+
+
+
+// ════════════════════════════════════════════════
+// 4. Texture Generator for Pillar Tops (Numbers)
+// ════════════════════════════════════════════════
+function createTopNumberTexture(num, hexColor) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 256;
+  canvas.height = 256;
+  const ctx = canvas.getContext('2d');
+
+  // Background
+  ctx.fillStyle = hexColor;
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Soft inner gradient
+  const grad = ctx.createLinearGradient(0, 0, 256, 256);
+  grad.addColorStop(0, 'rgba(255,255,255,0.25)');
+  grad.addColorStop(1, 'rgba(0,0,0,0.15)');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Text enlarged by 150% (78px equivalent on 128px -> 122px on 256px canvas)
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 122px "JetBrains Mono", monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.shadowColor = 'rgba(0,0,0,0.65)';
+  ctx.shadowBlur = 10;
+  ctx.shadowOffsetY = 4;
+  ctx.fillText(num, 128, 128);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.generateMipmaps = true;
+  texture.anisotropy = 4;
+  return texture;
+}
+
+// ════════════════════════════════════════════════
+// 5. Pillar Creation (7x7 tight-fit solid blocks)
+// ════════════════════════════════════════════════
+const pillars = [];
+const pillarMap = new Map();
+const HEIGHT_SCALE = 0.22; // Height multiplier per basePriority
+
+// Material cache for top faces
+const topTextures = new Map();
+
+for (let r = 0; r < 7; r++) {
+  for (let c = 0; c < 7; c++) {
+    const bp = PM[r][c];
+    const h = bp * HEIGHT_SCALE;
+
+    // Grid coordinates:
+    // c=0..6 mapped to x = -3.0 .. +3.0
+    // r=0..6 mapped to z = +3.0 .. -3.0 (r=0 is FRONT, r=6 is BACK)
+    const x = c - 3.0;
+    const z = 3.0 - r;
+
+    // Pillar Geometry (width=1, depth=1 -> perfectly touching neighbours)
+    const geo = new THREE.BoxGeometry(1.0, h, 1.0);
+    
+    // Base Color for this row (all threads in the same process class share the identical process color)
+    const baseHex = ROW_COLORS[r];
+
+    const colorObj = new THREE.Color(baseHex);
+    const hexStr = `#${colorObj.getHexString()}`;
+
+    // Top texture key
+    const texKey = `${bp}_${hexStr}`;
+    let topTex = topTextures.get(texKey);
+    if (!topTex) {
+      topTex = createTopNumberTexture(bp, hexStr);
+      topTextures.set(texKey, topTex);
+    }
+
+    // Matte materials for 6 faces: [right, left, top, bottom, front, back]
+    const sideMat = new THREE.MeshStandardMaterial({
+      color: baseHex,
+      roughness: 0.52,
+      metalness: 0.04,
+    });
+    const topMat = new THREE.MeshStandardMaterial({
+      map: topTex,
+      roughness: 0.45,
+      metalness: 0.04,
+    });
+
+    const materials = [
+      sideMat,           // +X
+      sideMat.clone(),   // -X
+      topMat,            // +Y (Top face with number)
+      sideMat.clone(),   // -Y
+      sideMat.clone(),   // +Z (Front face)
+      sideMat.clone(),   // -Z (Back face)
+    ];
+
+    const mesh = new THREE.Mesh(geo, materials);
+    mesh.position.set(x, h / 2, z);
+    mesh.castShadow = true;
+    mesh.receiveShadow = true;
+
+    mesh.userData = { row: r, col: c, bp: bp, baseColor: baseHex };
+
+    scene.add(mesh);
+    pillars.push(mesh);
+    pillarMap.set(`${r}_${c}`, mesh);
+  }
+}
+
+// ════════════════════════════════════════════════
+// 6. Raycasting & Interactive Selection
+// ════════════════════════════════════════════════
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let hoveredPillar = null;
+
+function updateSelectionVisual() {
+  // Rank 0: All pillars full highlight (unless hovered)
+  if (curRank === 0 && !hoveredPillar) {
+    pillars.forEach(p => {
+      const mats = p.material;
+      const baseColor = new THREE.Color(p.userData.baseColor);
+      mats.forEach((m, idx) => {
+        if (idx === 2) {
+          m.color.setRGB(1.0, 1.0, 1.0);
+        } else {
+          m.color.copy(baseColor);
+        }
+        m.emissive = baseColor;
+        m.emissiveIntensity = idx === 2 ? 0.35 : 0.22;
+      });
+    });
+    return;
+  }
+
+  const s = sel();
+  const currentMesh = s ? pillarMap.get(`${s.row}_${s.col}`) : null;
+  const focusMesh = hoveredPillar || currentMesh;
+  if (!focusMesh) return;
+  const targetBp = focusMesh.userData.bp;
+
+  // 1) Unselected base dimming: 60% suppression (40% brightness)
+  // 2) Hover / Selected pillar: 100% top number brightness (1.0)
+  // 3) All pillars with identical BasePriority (same number): 80% top number brightness (0.80)
+  pillars.forEach(p => {
+    const isFocus = (p === focusMesh);
+    const isCur = (p === currentMesh);
+    const isSameBp = (!isFocus && p.userData.bp === targetBp);
+    const mats = p.material;
+    const baseColor = new THREE.Color(p.userData.baseColor);
+
+    mats.forEach((m, idx) => {
+      if (isFocus) {
+        // Active focus pillar: 100% top number brightness
+        if (idx === 2) {
+          m.color.setRGB(1.0, 1.0, 1.0);
+        } else {
+          m.color.copy(baseColor);
+        }
+        m.emissive = baseColor;
+        m.emissiveIntensity = idx === 2 ? 0.35 : 0.22;
+      } else if (isSameBp) {
+        // All pillars sharing the exact same base priority (same number): 10% reduced glow/brightness (70% top number)
+        if (idx === 2) {
+          m.color.setRGB(0.70, 0.70, 0.70);
+        } else {
+          m.color.copy(baseColor).multiplyScalar(0.60);
+        }
+        m.emissive = baseColor;
+        m.emissiveIntensity = idx === 2 ? 0.08 : 0.04;
+      } else {
+        // Other pillars: 45% brightness (55% suppressed)
+        if (idx === 2) {
+          m.color.setRGB(0.45, 0.45, 0.45);
+        } else {
+          m.color.copy(baseColor).multiplyScalar(0.45);
+        }
+        m.emissive = baseColor;
+        m.emissiveIntensity = idx === 2 ? 0.05 : 0.02;
+      }
+    });
+  });
+}
+
+// ════════════════════════════════════════════════
+// Real-time Camera HUD (Zoom & Perspective Angles)
+// ════════════════════════════════════════════════
+const ptOrigin = new THREE.Vector3(-3.0, 0, 3.0);  // Idle, Idle (front-left corner)
+const ptFront  = new THREE.Vector3( 3.0, 0, 3.0);  // Idle, TimeCrit (front edge end)
+const ptLeft   = new THREE.Vector3(-3.0, 0, -3.0); // Realtime, Idle (left edge end)
+
+function updateCameraHUD() {
+  // NDC screen projection
+  const v0 = ptOrigin.clone().project(camera);
+  const vc = ptFront.clone().project(camera);
+  const vl = ptLeft.clone().project(camera);
+
+  // Screen angle of front axis (Thread Priority)
+  const dcx = vc.x - v0.x;
+  const dcy = vc.y - v0.y; // In NDC, +Y is UP
+  const angFront = (Math.atan2(dcy, dcx) * 180 / Math.PI).toFixed(1);
+
+  // Screen angle of left-back axis (Process Class)
+  const dlx = vl.x - v0.x;
+  const dly = vl.y - v0.y;
+  const angLeft = (Math.atan2(dly, dlx) * 180 / Math.PI).toFixed(1);
+
+  // Distance & Zoom level (relative to base distance 18.0)
+  const dist = camera.position.distanceTo(controls.target);
+  const zoom = (18.0 / dist).toFixed(2);
+
+  // Elevation angle from horizontal plane
+  const polar = controls.getPolarAngle();
+  const elev = (90 - (polar * 180 / Math.PI)).toFixed(1);
+
+  const elZoom = document.getElementById('hudZoom');
+  const elAngles = document.getElementById('hudAngles');
+  if (elZoom) elZoom.textContent = `${zoom}x`;
+  if (elAngles) {
+    const fSign = angFront >= 0 ? '+' : '';
+    const lSign = angLeft >= 0 ? '+' : '';
+    elAngles.innerHTML = `手前: <b class="val-accent">${fSign}${angFront}°</b> ｜ 左奥: <b class="val-accent">${lSign}${angLeft}°</b> <small>(仰角 ${elev}°)</small>`;
+  }
+}
+
+function onPointerMove(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(pillars, false);
+
+  if (intersects.length > 0) {
+    const hit = intersects[0].object;
+    if (hoveredPillar !== hit) {
+      hoveredPillar = hit;
+      renderer.domElement.style.cursor = 'pointer';
+      updateSelectionVisual();
+    }
+  } else {
+    if (hoveredPillar !== null) {
+      hoveredPillar = null;
+      renderer.domElement.style.cursor = 'grab';
+      updateSelectionVisual();
+    }
+  }
+}
+
+function onPointerDown(e) {
+  // Only trigger on primary left click
+  if (e.button !== 0) return;
+
+  const rect = renderer.domElement.getBoundingClientRect();
+  mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObjects(pillars, false);
+
+  if (intersects.length > 0) {
+    const hit = intersects[0].object;
+    const r = hit.userData.row;
+    const c = hit.userData.col;
+    const item = byRC[`${r}_${c}`];
+    if (item) {
+      curRank = item.rank;
+      updateHUD();
+      updateSelectionVisual();
+    }
+  } else {
+    // Clicked outside pillars: select all (Rank 0)
+    curRank = 0;
+    updateHUD();
+    updateSelectionVisual();
+  }
+}
+
+renderer.domElement.addEventListener('pointermove', onPointerMove);
+renderer.domElement.addEventListener('pointerdown', onPointerDown);
+
+// ════════════════════════════════════════════════
+// 8. HUD & UI Synchronization
+// ════════════════════════════════════════════════
+function updateHUD() {
+  if (curRank === 0) {
+    document.getElementById('hudRank').textContent = `Rank #0 / 49 (ALL)`;
+    document.getElementById('hudBase').textContent = `ALL`;
+    document.getElementById('hudProc').textContent = `ALL PROCESS CLASSES`;
+    document.getElementById('hudThread').textContent = `ALL THREAD PRIORITIES`;
+    document.getElementById('hudFormula').textContent = `All 49 Pillars Active (Full Highlight)`;
+    document.getElementById('hudCellPos').textContent = `[All 7x7 Pillars]`;
+  } else {
+    const s = sel();
+    document.getElementById('hudRank').textContent = `Rank #${s.rank} / 49`;
+    document.getElementById('hudBase').textContent = s.bp;
+    document.getElementById('hudProc').textContent = PS[s.row];
+    document.getElementById('hudThread').textContent = TS[s.col];
+    document.getElementById('hudFormula').textContent = `${s.pb} + (${s.tr >= 0 ? '+' : ''}${s.tr}) = ${s.bp}`;
+    document.getElementById('hudCellPos').textContent = `[Row:${s.row}, Col:${s.col}]`;
+  }
+
+  const el = document.getElementById('rankList');
+  const isAll = curRank === 0;
+  let h = `<div${isAll ? ' class="sel"' : ''} data-rank="0">
+    <span><b>#00</b> ALL MATRIX</span>
+    <span>全柱選択 (Full Highlight)</span>
+  </div>`;
+  for (const e of entries) {
+    const isSel = e.rank === curRank;
+    const cls = isSel ? ' class="sel"' : '';
+    h += `<div${cls} data-rank="${e.rank}">
+      <span><b>#${String(e.rank).padStart(2,'0')}</b> Base ${String(e.bp).padStart(2,' ')}</span>
+      <span>${PS[e.row].split('_')[0]} × ${TS[e.col].split('_')[2] || TS[e.col]}</span>
+    </div>`;
+  }
+  el.innerHTML = h;
+
+  const activeDiv = el.querySelector('.sel');
+  if (activeDiv) {
+    activeDiv.scrollIntoView({ block: 'nearest' });
+  }
+
+  updateSelectionVisual();
+}
+
+// Rank list click handler
+document.getElementById('rankList').addEventListener('click', (e) => {
+  const row = e.target.closest('div[data-rank]');
+  if (row) {
+    curRank = parseInt(row.getAttribute('data-rank'), 10);
+    updateHUD();
+  }
+});
+
+// Keyboard navigation
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowUp' || e.key === 'ArrowLeft') {
+    curRank = Math.max(0, curRank - 1);
+    updateHUD();
+    e.preventDefault();
+  } else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') {
+    curRank = Math.min(49, curRank + 1);
+    updateHUD();
+    e.preventDefault();
+  }
+});
+
+// Camera Buttons
+document.getElementById('btnOrigView').addEventListener('click', () => {
+  animateCameraTo(ORIG_CAM_POS, ORIG_TARGET);
+});
+
+document.getElementById('btnTopView').addEventListener('click', () => {
+  animateCameraTo(new THREE.Vector3(0, 18, 0.01), ORIG_TARGET);
+});
+
+document.getElementById('btnReset').addEventListener('click', () => {
+  animateCameraTo(ORIG_CAM_POS, ORIG_TARGET);
+});
+
+// Controls change event for real-time HUD
+controls.addEventListener('change', updateCameraHUD);
+
+function animateCameraTo(targetPos, lookTarget) {
+  const startPos = camera.position.clone();
+  const startTarget = controls.target.clone();
+  const duration = 600;
+  const startTime = performance.now();
+
+  function step(now) {
+    const t = Math.min((now - startTime) / duration, 1.0);
+    // Ease out cubic
+    const ease = 1 - Math.pow(1 - t, 3);
+
+    camera.position.lerpVectors(startPos, targetPos, ease);
+    controls.target.lerpVectors(startTarget, lookTarget, ease);
+    controls.update();
+    updateCameraHUD();
+
+    if (t < 1.0) {
+      requestAnimationFrame(step);
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+// ════════════════════════════════════════════════
+// 9. Animation Loop
+// ════════════════════════════════════════════════
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// Initialize
+updateHUD();
+updateCameraHUD();
+animate();
+
+// Resize observer
+window.addEventListener('resize', () => {
+  const w = container.clientWidth;
+  const h = container.clientHeight;
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+  renderer.setSize(w, h);
+  updateCameraHUD();
+});
+</script>
+</body>
+</html>

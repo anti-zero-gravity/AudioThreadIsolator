@@ -5,6 +5,7 @@
 #include <windows.h>
 #include "process_picker.h"
 #include "resource.h"
+#include "dpi_utils.h"
 #include <commctrl.h>
 #include <tlhelp32.h>
 #include <algorithm>
@@ -13,23 +14,6 @@
 namespace ati {
 
 static std::vector<PickedProcess>* s_pSelectedOut = nullptr;
-
-static float GetDpiScaleForWindow(HWND hWnd) {
-    typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
-    HMODULE hUser32 = GetModuleHandleA("user32.dll");
-    if (hUser32) {
-        PFN_GetDpiForWindow pfn = (PFN_GetDpiForWindow)GetProcAddress(hUser32, "GetDpiForWindow");
-        if (pfn) {
-            UINT dpi = pfn(hWnd);
-            if (dpi > 0) return dpi / 96.0f;
-        }
-    }
-    HDC hdc = GetDC(hWnd);
-    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
-    ReleaseDC(hWnd, hdc);
-    if (dpi <= 0) dpi = 96;
-    return dpi / 96.0f;
-}
 
 static std::string PriorityToString(DWORD prio) {
     switch (prio) {
@@ -131,17 +115,17 @@ static INT_PTR CALLBACK ProcessPickerDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
 
         lvc.iSubItem = 0;
-        lvc.cx = static_cast<int>(120 * scale);
+        lvc.cx = ScaleI(120, scale);
         lvc.pszText = const_cast<LPSTR>("Process Name");
         ListView_InsertColumn(hList, 0, &lvc);
 
         lvc.iSubItem = 1;
-        lvc.cx = static_cast<int>(120 * scale);
+        lvc.cx = ScaleI(120, scale);
         lvc.pszText = const_cast<LPSTR>("File Name");
         ListView_InsertColumn(hList, 1, &lvc);
 
         lvc.iSubItem = 2;
-        lvc.cx = static_cast<int>(75 * scale);
+        lvc.cx = ScaleI(75, scale);
         lvc.pszText = const_cast<LPSTR>("Priority");
         ListView_InsertColumn(hList, 2, &lvc);
 
@@ -152,7 +136,7 @@ static INT_PTR CALLBACK ProcessPickerDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
             if (autoW < initialW) {
                 ListView_SetColumnWidth(hList, i, initialW);
             } else {
-                ListView_SetColumnWidth(hList, i, autoW + static_cast<int>(6 * scale));
+                ListView_SetColumnWidth(hList, i, autoW + ScaleI(6, scale));
             }
         }
 

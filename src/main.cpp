@@ -19,9 +19,17 @@
 #include "resource.h"
 #include "isolator.h"
 #include "process_picker.h"
+#include "priority_matrix_picker.h"
+#include "priority_matrix_data.h"
+#include "dpi_utils.h"
 
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shlwapi.lib")
+
+using ati::GetDpiScaleForWindow;
+using ati::ScaleI;
+using ati::GetEffectiveFont;
+namespace Layout = ati::Layout;
 
 #define WM_TRAYICON_MSG (WM_APP + 1)
 #define TIMER_POLLING_ID 1001
@@ -34,16 +42,15 @@ static std::string g_iniPath;
 static bool g_startInTray = false;
 static bool g_alwaysOnTop = false;
 static bool s_pulseTick = false;
-static HWND s_hInPlaceCombo = nullptr;
-static int s_inPlaceItemIndex = -1;
-static bool s_inPlaceCancelled = false;
 static HANDLE g_hSingleInstanceMutex = nullptr;
 
 // ListView 列幅定義 (DPI 基準値: scale=1.0 時のピクセル幅)
-// Col: 0:!  1:ProcessName  2:Audio  3:Excluded  4:PID/TID  5:||  6:Priority  7:TIDs  8:Changes
-static const int kColBaseWidths[] = { 24, 116, 68, 75, 135, 24, 130, 55, 76 };
-static const int kColCount = sizeof(kColBaseWidths) / sizeof(kColBaseWidths[0]);
-static inline int ScaleI(int base, float s) { return static_cast<int>(base * s); }
+// Col: 0:!  1:ProcessName  2:Thread Priority  3:Process Priority  4:||  5:PID/TID  6:TIDs  7:Chgs  8:Audio  9:Excluded
+// 10列最適化値 (16, 137, 135, 110, 20, 139, 35, 67, 44, 59) ➔ 合計 762px (scale=1.0 基準値)
+static const int kColDefaultWidths[] = { 16, 137, 135, 110, 20, 139, 35, 67, 44, 59 };
+static const int kColCount = sizeof(kColDefaultWidths) / sizeof(kColDefaultWidths[0]);
+static std::vector<int> g_colWidths = { 16, 137, 135, 110, 20, 139, 35, 67, 44, 59 };
+static int g_windowHeight = 0;
 
 #ifdef _DEBUG
 void LogDebug(const char* msg) {
@@ -102,23 +109,6 @@ static void InitializeHighDpi() {
             pfnSetAware();
         }
     }
-}
-
-static float GetDpiScaleForWindow(HWND hWnd) {
-    typedef UINT (WINAPI *PFN_GetDpiForWindow)(HWND);
-    HMODULE hUser32 = GetModuleHandleA("user32.dll");
-    if (hUser32) {
-        PFN_GetDpiForWindow pfn = (PFN_GetDpiForWindow)GetProcAddress(hUser32, "GetDpiForWindow");
-        if (pfn) {
-            UINT dpi = pfn(hWnd);
-            if (dpi > 0) return dpi / 96.0f;
-        }
-    }
-    HDC hdc = GetDC(hWnd);
-    int dpi = GetDeviceCaps(hdc, LOGPIXELSX);
-    ReleaseDC(hWnd, hdc);
-    if (dpi <= 0) dpi = 96;
-    return dpi / 96.0f;
 }
 
 // --- スタートアップ (Runキー) 管理 ---
@@ -188,6 +178,18 @@ static std::string GetPriorityString(int prio) {
         if (PRIO_OPTIONS[i].value == prio) return PRIO_OPTIONS[i].label;
     }
     return std::to_string(prio);
+}
+
+static std::string GetProcessPriorityString(DWORD pClass) {
+    switch (pClass) {
+    case REALTIME_PRIORITY_CLASS: return "Realtime";
+    case HIGH_PRIORITY_CLASS: return "High";
+    case ABOVE_NORMAL_PRIORITY_CLASS: return "Above Normal";
+    case NORMAL_PRIORITY_CLASS: return "Normal";
+    case BELOW_NORMAL_PRIORITY_CLASS: return "Below Normal";
+    case IDLE_PRIORITY_CLASS: return "Idle";
+    case 0: default: return "(Default)";
+    }
 }
 
 // --- コア番号・マスク変換ヘルパー (ANSI) ---
@@ -385,6 +387,44 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
     g_alwaysOnTop = (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
     config.enableHeuristics = true;
 
+    // ColumnWidths (または ColumnWidth) の読み込み
+    char colBuf[256] = { 0 };
+    GetPrivateProfileStringA("Global", "ColumnWidths", "", colBuf, sizeof(colBuf), iniPath.c_str());
+    if (colBuf[0] == '\0') {
+        GetPrivateProfileStringA("Global", "ColumnWidth", "", colBuf, sizeof(colBuf), iniPath.c_str());
+    }
+    config.columnWidths.clear();
+    if (colBuf[0] != '\0') {
+        std::string s(colBuf);
+        // 全角カンマ '，' を半角カンマ ',' に変換
+        for (size_t i = 0; i + 1 < s.size(); ) {
+            if (static_cast<unsigned char>(s[i]) == 0x81 && static_cast<unsigned char>(s[i+1]) == 0x43) { // Shift-JIS 全角カンマ
+                s.replace(i, 2, ",");
+            } else if (i + 2 < s.size() && static_cast<unsigned char>(s[i]) == 0xEF && static_cast<unsigned char>(s[i+1]) == 0xBC && static_cast<unsigned char>(s[i+2]) == 0x8C) { // UTF-8 全角カンマ
+                s.replace(i, 3, ",");
+            } else {
+                ++i;
+            }
+        }
+        std::stringstream ss(s);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            while (!item.empty() && isspace(static_cast<unsigned char>(item.front()))) item.erase(item.begin());
+            while (!item.empty() && isspace(static_cast<unsigned char>(item.back()))) item.pop_back();
+            if (!item.empty()) {
+                config.columnWidths.push_back(atoi(item.c_str()));
+            }
+        }
+    }
+    if (config.columnWidths.size() != kColCount) {
+        config.columnWidths.assign(kColDefaultWidths, kColDefaultWidths + kColCount);
+    }
+    g_colWidths = config.columnWidths;
+
+    // WindowHeight の読み込み
+    config.windowHeight = GetPrivateProfileIntA("Global", "WindowHeight", 0, iniPath.c_str());
+    g_windowHeight = config.windowHeight;
+
     config.rules.clear();
 
     char sectionBuf[4096] = { 0 };
@@ -417,30 +457,87 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                 rule.isRunning = false;
 
                 std::stringstream ss(valStr);
-                std::string token;
-                while (std::getline(ss, token, ',')) {
-                    size_t colon = token.find(':');
+                std::string rawToken;
+                std::vector<std::pair<std::string, std::string>> kvPairs;
+                while (std::getline(ss, rawToken, ',')) {
+                    while (!rawToken.empty() && isspace(static_cast<unsigned char>(rawToken.front()))) rawToken.erase(rawToken.begin());
+                    while (!rawToken.empty() && isspace(static_cast<unsigned char>(rawToken.back()))) rawToken.pop_back();
+                    if (rawToken.empty()) continue;
+
+                    size_t colon = rawToken.find(':');
                     if (colon != std::string::npos) {
-                        std::string k = token.substr(0, colon);
-                        std::string v = token.substr(colon + 1);
+                        std::string k = rawToken.substr(0, colon);
+                        std::string v = rawToken.substr(colon + 1);
                         while (!k.empty() && isspace(static_cast<unsigned char>(k.front()))) k.erase(k.begin());
                         while (!k.empty() && isspace(static_cast<unsigned char>(k.back()))) k.pop_back();
                         while (!v.empty() && isspace(static_cast<unsigned char>(v.front()))) v.erase(v.begin());
                         while (!v.empty() && isspace(static_cast<unsigned char>(v.back()))) v.pop_back();
-
-                        if (k == "AudioCore" || k == "AudioCores" || k == "AudioCoreMask") {
-                            int fc = 0;
-                            DWORD_PTR m = ParseCoreListToMask(v, fc);
-                            if (m != 0) {
-                                rule.audioAffinityMask = m;
-                                rule.audioCore = fc;
-                            } else {
-                                rule.audioCore = atoi(v.c_str());
-                                rule.audioAffinityMask = ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
+                        kvPairs.push_back({k, v});
+                    } else {
+                        // コロンを含まないトークンは直前のキーの値の続き (例: AudioCore:10, 11 や AudioTid:22220, 24500)
+                        if (!kvPairs.empty()) {
+                            if (!kvPairs.back().second.empty()) {
+                                kvPairs.back().second += ", ";
                             }
-                        } else if (k == "AudioPriority" || k == "Priority") {
+                            kvPairs.back().second += rawToken;
+                        } else {
+                            kvPairs.push_back({rawToken, ""});
+                        }
+                    }
+                }
+
+                for (const auto& kv : kvPairs) {
+                    const std::string& k = kv.first;
+                    const std::string& v = kv.second;
+
+                    if (k == "IgnoreSig" || k == "IgnoreSigRank") {
+                        rule.ignoreSig = true;
+                        if (!v.empty()) {
+                            int cnt = atoi(v.c_str());
+                            rule.ignoreSigCount = (cnt > 0) ? cnt : 1;
+                        } else {
+                            rule.ignoreSigCount = 1;
+                        }
+                    } else if (k == "AudioCore" || k == "AudioCores" || k == "AudioCoreMask") {
+                        int fc = 0;
+                        DWORD_PTR m = ParseCoreListToMask(v, fc);
+                        rule.audioCores.clear();
+                        std::stringstream ss(v);
+                        std::string ctok;
+                        while (std::getline(ss, ctok, ',')) {
+                            while (!ctok.empty() && isspace(static_cast<unsigned char>(ctok.front()))) ctok.erase(ctok.begin());
+                            while (!ctok.empty() && isspace(static_cast<unsigned char>(ctok.back()))) ctok.pop_back();
+                            if (!ctok.empty()) {
+                                int cVal = atoi(ctok.c_str());
+                                if (cVal >= 0 && cVal < 64) rule.audioCores.push_back(cVal);
+                            }
+                        }
+                        if (m != 0) {
+                            rule.audioAffinityMask = m;
+                            rule.audioCore = fc;
+                        } else {
+                            rule.audioCore = atoi(v.c_str());
+                            rule.audioAffinityMask = ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
+                            rule.audioCores.push_back(rule.audioCore);
+                        }
+                    } else if (k == "AudioPriority" || k == "Priority") {
+                        rule.audioPriorities.clear();
+                        std::stringstream ss(v);
+                        std::string ptok;
+                        while (std::getline(ss, ptok, ',')) {
+                            while (!ptok.empty() && isspace(static_cast<unsigned char>(ptok.front()))) ptok.erase(ptok.begin());
+                            while (!ptok.empty() && isspace(static_cast<unsigned char>(ptok.back()))) ptok.pop_back();
+                            if (!ptok.empty()) {
+                                rule.audioPriorities.push_back(atoi(ptok.c_str()));
+                            }
+                        }
+                        if (!rule.audioPriorities.empty()) {
+                            rule.audioPriority = rule.audioPriorities[0];
+                        } else {
                             rule.audioPriority = atoi(v.c_str());
-                        } else if (k == "NormalCores" || k == "OtherThanAudio" || k == "NormalMask") {
+                            rule.audioPriorities.push_back(rule.audioPriority);
+                        }
+                    } else if (k == "NormalCores" || k == "OtherThanAudio" || k == "NormalMask") {
                             if (v.length() > 2 && (v.substr(0, 2) == "0x" || v.substr(0, 2) == "0X")) {
                                 rule.normalAffinityMask = _strtoui64(v.c_str(), nullptr, 16);
                             } else {
@@ -457,17 +554,43 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             double dVal = atof(v.c_str());
                             dVal = std::ceil(dVal * 10.0) / 10.0;
                             rule.cyclesDelta = (dVal > 0.0) ? dVal : 0.0;
-                        } else if (k == "IgnoreSig" || k == "IgnoreSigRank") {
-                            rule.ignoreSigRank = atoi(v.c_str());
                         } else if (k == "AudioPid") {
                             rule.lastAudioPid = static_cast<DWORD>(atoi(v.c_str()));
-                        } else if (k == "AudioTid") {
-                            rule.lastAudioTid = static_cast<DWORD>(atoi(v.c_str()));
+                        } else if (k == "AudioTid" || k == "AudioTids") {
+                            rule.lastAudioTids.clear();
+                            std::stringstream ss(v);
+                            std::string ttok;
+                            while (std::getline(ss, ttok, ',')) {
+                                while (!ttok.empty() && isspace(static_cast<unsigned char>(ttok.front()))) ttok.erase(ttok.begin());
+                                while (!ttok.empty() && isspace(static_cast<unsigned char>(ttok.back()))) ttok.pop_back();
+                                if (!ttok.empty()) {
+                                    DWORD tVal = static_cast<DWORD>(atoi(ttok.c_str()));
+                                    if (tVal > 0) rule.lastAudioTids.push_back(tVal);
+                                }
+                            }
+                            rule.lastAudioTid = rule.lastAudioTids.empty() ? 0 : rule.lastAudioTids[0];
                         } else if (k == "Decline") {
                             rule.isDeclineBoost = (atoi(v.c_str()) != 0);
+                        } else if (k == "ProcessPriority" || k == "ProcessPriorityClass") {
+                            if (v.length() > 2 && (v.substr(0, 2) == "0x" || v.substr(0, 2) == "0X")) {
+                                rule.processPriorityClass = static_cast<DWORD>(_strtoui64(v.c_str(), nullptr, 16));
+                            } else if (v == "Realtime") {
+                                rule.processPriorityClass = REALTIME_PRIORITY_CLASS;
+                            } else if (v == "High") {
+                                rule.processPriorityClass = HIGH_PRIORITY_CLASS;
+                            } else if (v == "Above Normal" || v == "AboveNormal") {
+                                rule.processPriorityClass = ABOVE_NORMAL_PRIORITY_CLASS;
+                            } else if (v == "Normal") {
+                                rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
+                            } else if (v == "Below Normal" || v == "BelowNormal") {
+                                rule.processPriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+                            } else if (v == "Idle") {
+                                rule.processPriorityClass = IDLE_PRIORITY_CLASS;
+                            } else {
+                                rule.processPriorityClass = static_cast<DWORD>(atoi(v.c_str()));
+                            }
                         }
                     }
-                }
 
                 if (rule.isBypassed) {
                     rule.detectedThreadName = "Bypassed";
@@ -520,6 +643,19 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         g_alwaysOnTop ? "1" : "0", iniPath.c_str()
     );
 
+    std::string colStr;
+    const std::vector<int>& widths = !config.columnWidths.empty() ? config.columnWidths : g_colWidths;
+    for (size_t i = 0; i < widths.size(); ++i) {
+        if (i > 0) colStr += ", ";
+        colStr += std::to_string(widths[i]);
+    }
+    WritePrivateProfileStringA("Global", "ColumnWidths", colStr.c_str(), iniPath.c_str());
+
+    int wH = config.windowHeight > 0 ? config.windowHeight : g_windowHeight;
+    if (wH > 0) {
+        WritePrivateProfileStringA("Global", "WindowHeight", std::to_string(wH).c_str(), iniPath.c_str());
+    }
+
     WritePrivateProfileSectionA("Processes", "\0", iniPath.c_str());
     for (const auto& rule : config.rules) {
         DWORD_PTR rMask = rule.audioAffinityMask 
@@ -543,13 +679,38 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
             if (!val.empty()) val += ", ";
             val += "Decline:1";
         }
-        if (rule.ignoreSigRank > 0) {
+        if (rule.ignoreSig) {
             if (!val.empty()) val += ", ";
-            val += "IgnoreSig:" + std::to_string(rule.ignoreSigRank);
+            if (rule.ignoreSigCount > 1) {
+                val += "IgnoreSig:" + std::to_string(rule.ignoreSigCount);
+            } else {
+                val += "IgnoreSig";
+            }
         }
         if (!val.empty()) val += ", ";
-        val += "AudioCore:" + FormatMaskToCoreList(rMask);
-        val += ", AudioPriority:" + std::to_string(rule.audioPriority);
+        if (rule.audioCores.size() > 1) {
+            std::string coreListStr;
+            for (size_t ci = 0; ci < rule.audioCores.size(); ++ci) {
+                if (ci > 0) coreListStr += ", ";
+                coreListStr += std::to_string(rule.audioCores[ci]);
+            }
+            val += "AudioCore:" + coreListStr;
+        } else {
+            val += "AudioCore:" + FormatMaskToCoreList(rMask);
+        }
+        if (rule.audioPriorities.size() > 1) {
+            std::string prioListStr;
+            for (size_t pi = 0; pi < rule.audioPriorities.size(); ++pi) {
+                if (pi > 0) prioListStr += ", ";
+                prioListStr += std::to_string(rule.audioPriorities[pi]);
+            }
+            val += ", AudioPriority:" + prioListStr;
+        } else {
+            val += ", AudioPriority:" + std::to_string(rule.audioPriority);
+        }
+        if (rule.processPriorityClass != 0) {
+            val += ", ProcessPriority:" + GetProcessPriorityString(rule.processPriorityClass);
+        }
         if (rule.normalAffinityMask != 0) {
             char nHex[32] = { 0 };
             snprintf(nHex, sizeof(nHex), "0x%llX", static_cast<unsigned long long>(rule.normalAffinityMask));
@@ -559,9 +720,17 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
             val += ", TargetPriority:" + std::to_string(rule.targetPriority);
         }
         // 正常隔離中かつ稼働中のプロセスのみ、次回照合用として AudioPid / AudioTid を記録 (未起動やBypass時は消去)
-        if (rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && rule.activeAudioTid != 0) {
+        if (rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && (!rule.activeAudioTids.empty() || rule.activeAudioTid != 0)) {
             val += ", AudioPid:" + std::to_string(rule.activePid);
-            val += ", AudioTid:" + std::to_string(rule.activeAudioTid);
+            val += ", AudioTid:";
+            if (!rule.activeAudioTids.empty()) {
+                for (size_t i = 0; i < rule.activeAudioTids.size(); ++i) {
+                    if (i > 0) val += ", ";
+                    val += std::to_string(rule.activeAudioTids[i]);
+                }
+            } else {
+                val += std::to_string(rule.activeAudioTid);
+            }
         }
         if (rule.isBypassed) {
             val += ", Bypass:1";
@@ -572,7 +741,17 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
     }
 }
 
-// --- ListView ヘルパー (メイン監視画面: 固定8列) ---
+// --- ListView ヘルパー (メイン監視画面: 固定9列) ---
+static std::string StripExeExtension(const std::string& name) {
+    if (name.length() >= 4) {
+        std::string ext = name.substr(name.length() - 4);
+        if (_stricmp(ext.c_str(), ".exe") == 0) {
+            return name.substr(0, name.length() - 4);
+        }
+    }
+    return name;
+}
+
 static std::string GetCoreLabel(int coreIdx, const std::vector<ati::CoreInfo>& cores) {
     for (const auto& c : cores) {
         if (c.logicalIndex == coreIdx) return c.label;
@@ -580,60 +759,135 @@ static std::string GetCoreLabel(int coreIdx, const std::vector<ati::CoreInfo>& c
     return "#" + std::to_string(coreIdx);
 }
 
+struct DisplayRow {
+    size_t ruleIndex = 0;
+    size_t subIndex = 0;
+    DWORD tid = 0;
+};
+static std::vector<DisplayRow> g_displayRows;
+
 static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rules) {
+    g_displayRows.clear();
     ListView_DeleteAllItems(hList);
 
     auto cores = ati::CpuTopology::GetCpuCores();
 
     for (size_t i = 0; i < rules.size(); ++i) {
         const auto& r = rules[i];
+        size_t rowCount = (r.ignoreSig && r.ignoreSigCount > 1) ? static_cast<size_t>(r.ignoreSigCount) : 1;
 
-        LVITEMA lvi = { 0 };
-        lvi.mask = LVIF_TEXT;
-        lvi.iItem = static_cast<int>(i);
-        lvi.iSubItem = 0;
-        lvi.pszText = const_cast<LPSTR>("");
-        ListView_InsertItem(hList, &lvi);
+        for (size_t s = 0; s < rowCount; ++s) {
+            DWORD tid = 0;
+            if (s < r.activeAudioTids.size()) {
+                tid = r.activeAudioTids[s];
+            } else if (s == 0) {
+                tid = r.activeAudioTid;
+            }
 
-        // 1: Process Name
-        ListView_SetItemText(hList, static_cast<int>(i), 1, const_cast<LPSTR>(r.processName.c_str()));
+            DisplayRow dr;
+            dr.ruleIndex = i;
+            dr.subIndex = s;
+            dr.tid = tid;
+            int itemIdx = static_cast<int>(g_displayRows.size());
+            g_displayRows.push_back(dr);
 
-        // 2: For Audio (稼働時は #5 / #1,2 形式または多コア時は HEX 形式、停止時は -)
-        DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
-        std::string forAudioStr = r.isRunning ? FormatAudioMaskDisplay(mask, cores) : "-";
-        ListView_SetItemText(hList, static_cast<int>(i), 2, const_cast<LPSTR>(forAudioStr.c_str()));
+            LVITEMA lvi = { 0 };
+            lvi.mask = LVIF_TEXT;
+            lvi.iItem = itemIdx;
+            lvi.iSubItem = 0;
+            lvi.pszText = const_cast<LPSTR>("");
+            ListView_InsertItem(hList, &lvi);
 
-        // 3: Other than
-        int coreCount = ati::CpuTopology::GetSystemCoreCount();
-        DWORD_PTR normalMask = (r.normalAffinityMask != 0) ? r.normalAffinityMask : g_isolator.GetConfig().normalAffinityMask;
-        std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
-        ListView_SetItemText(hList, static_cast<int>(i), 3, const_cast<LPSTR>(otherThanStr.c_str()));
+            // 1: Process Name (.exe を除いて表示)
+            std::string displayName = StripExeExtension(r.processName);
+            ListView_SetItemText(hList, itemIdx, 1, const_cast<LPSTR>(displayName.c_str()));
 
-        // 4: Audio Core PID/TID
-        std::string thName;
-        if (r.isBypassed) {
-            thName = "Bypassed";
-        } else if (r.detectedThreadName.empty()) {
-            thName = r.isRunning ? "Scanning..." : "Not running";
-        } else {
-            thName = r.detectedThreadName;
+            // 2: Thread Priority
+            int rowPrio = (s < r.audioPriorities.size()) ? r.audioPriorities[s] : r.audioPriority;
+            std::string prioStr = GetPriorityString(rowPrio);
+            ListView_SetItemText(hList, itemIdx, 2, const_cast<LPSTR>(prioStr.c_str()));
+
+            // 3: Process Priority
+            std::string procPrioStr = GetProcessPriorityString(r.processPriorityClass);
+            ListView_SetItemText(hList, itemIdx, 3, const_cast<LPSTR>(procPrioStr.c_str()));
+
+            // 4: Pause / Verify (カスタムドロー描画、テキストは空)
+            ListView_SetItemText(hList, itemIdx, 4, const_cast<LPSTR>(""));
+
+            // 5: Audio Core PID/TID
+            std::string thName;
+            if (r.isBypassed) {
+                thName = "Bypassed";
+            } else if (!r.isRunning) {
+                thName = "Not running";
+            } else if (r.ignoreSig && r.ignoreSigCount > 1) {
+                size_t confirmedCount = r.activeAudioTids.size();
+                if (s < confirmedCount && tid != 0) {
+                    thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(tid);
+                } else if (r.multiSearchSleeping) {
+                    thName = "sleeping...";
+                } else {
+                    int intervalMs = (g_isolator.GetConfig().pollingIntervalMs > 0) ? g_isolator.GetConfig().pollingIntervalMs : 1000;
+                    int turnsPerSec = 1000 / intervalMs;
+                    if (turnsPerSec < 1) turnsPerSec = 1;
+                    int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
+                    if (sec < 1) sec = 1;
+                    if (sec > 10) sec = 10;
+                    if (s == confirmedCount) {
+                        thName = "Standby " + std::to_string(sec);
+                    } else {
+                        thName = "Standby 10";
+                    }
+                }
+            } else if (r.isAudioIsolated && tid != 0) {
+                thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(tid);
+            } else if (r.detectedThreadName.empty()) {
+                thName = r.isRunning ? "Scanning..." : "Not running";
+            } else {
+                thName = r.detectedThreadName;
+            }
+            ListView_SetItemText(hList, itemIdx, 5, const_cast<LPSTR>(thName.c_str()));
+
+            // 6: TIDs
+            std::string threadsStr = r.isRunning ? std::to_string(r.currentThreadCount) : "-";
+            ListView_SetItemText(hList, itemIdx, 6, const_cast<LPSTR>(threadsStr.c_str()));
+
+            // 7: Chgs
+            std::string countStr = std::to_string(r.applyCount);
+            ListView_SetItemText(hList, itemIdx, 7, const_cast<LPSTR>(countStr.c_str()));
+
+            // 8: Audio
+            int assignedCore = r.audioCore;
+            if (s < r.audioCores.size()) {
+                assignedCore = r.audioCores[s];
+            } else if (r.audioAffinityMask != 0) {
+                int bitIdx = -1;
+                int foundCount = 0;
+                for (int c = 0; c < 64; ++c) {
+                    if ((r.audioAffinityMask & (1ULL << c)) != 0) {
+                        if (foundCount == static_cast<int>(s)) {
+                            bitIdx = c;
+                            break;
+                        }
+                        foundCount++;
+                    }
+                }
+                if (bitIdx >= 0) assignedCore = bitIdx;
+            }
+            std::string forAudioStr = r.isRunning ? GetCoreLabel(assignedCore, cores) : "-";
+            ListView_SetItemText(hList, itemIdx, 8, const_cast<LPSTR>(forAudioStr.c_str()));
+
+            // 9: Excluded (最小TID以外は "same")
+            if (s > 0) {
+                ListView_SetItemText(hList, itemIdx, 9, const_cast<LPSTR>("same"));
+            } else {
+                int coreCount = ati::CpuTopology::GetSystemCoreCount();
+                DWORD_PTR normalMask = (r.normalAffinityMask != 0) ? r.normalAffinityMask : g_isolator.GetConfig().normalAffinityMask;
+                DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
+                std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
+                ListView_SetItemText(hList, itemIdx, 9, const_cast<LPSTR>(otherThanStr.c_str()));
+            }
         }
-        ListView_SetItemText(hList, static_cast<int>(i), 4, const_cast<LPSTR>(thName.c_str()));
-
-        // 5: Pause / Verify (カスタムドロー描画、テキストは空)
-        ListView_SetItemText(hList, static_cast<int>(i), 5, const_cast<LPSTR>(""));
-
-        // 6: Priority
-        std::string prioStr = GetPriorityString(r.audioPriority);
-        ListView_SetItemText(hList, static_cast<int>(i), 6, const_cast<LPSTR>(prioStr.c_str()));
-
-        // 7: TIDs
-        std::string threadsStr = r.isRunning ? std::to_string(r.currentThreadCount) : "-";
-        ListView_SetItemText(hList, static_cast<int>(i), 7, const_cast<LPSTR>(threadsStr.c_str()));
-
-        // 8: Changes
-        std::string countStr = std::to_string(r.applyCount);
-        ListView_SetItemText(hList, static_cast<int>(i), 8, const_cast<LPSTR>(countStr.c_str()));
     }
 }
 
@@ -647,58 +901,124 @@ static void SetSubItemTextIfChanged(HWND hList, int item, int subItem, const std
 
 static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule>& rules) {
     int count = ListView_GetItemCount(hList);
-    if (count != static_cast<int>(rules.size())) {
+    size_t expectedRows = 0;
+    for (const auto& r : rules) {
+        expectedRows += (r.ignoreSig && r.ignoreSigCount > 1) ? static_cast<size_t>(r.ignoreSigCount) : 1;
+    }
+    if (count != static_cast<int>(expectedRows) || g_displayRows.size() != expectedRows) {
         RefreshListView(hList, rules);
         return;
     }
 
     auto cores = ati::CpuTopology::GetCpuCores();
 
-    for (size_t i = 0; i < rules.size(); ++i) {
-        const auto& r = rules[i];
+    for (size_t rowIdx = 0; rowIdx < g_displayRows.size(); ++rowIdx) {
+        auto& dr = g_displayRows[rowIdx];
+        if (dr.ruleIndex >= rules.size()) continue;
+        const auto& r = rules[dr.ruleIndex];
+
+        // 最新の TID を更新
+        if (dr.subIndex < r.activeAudioTids.size()) {
+            dr.tid = r.activeAudioTids[dr.subIndex];
+        } else if (dr.subIndex == 0) {
+            dr.tid = r.activeAudioTid;
+        } else {
+            dr.tid = 0;
+        }
+
+        int item = static_cast<int>(rowIdx);
 
         // 0: Indicator (カスタムドロー描画、テキストは空)
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 0, "");
+        SetSubItemTextIfChanged(hList, item, 0, "");
 
-        // 1: Process Name
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 1, r.processName);
+        // 1: Process Name (.exe を除いて表示)
+        SetSubItemTextIfChanged(hList, item, 1, StripExeExtension(r.processName));
 
-        // 2: For Audio
-        DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
-        std::string forAudioStr = r.isRunning ? FormatAudioMaskDisplay(mask, cores) : "-";
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 2, forAudioStr);
+        // 2: Thread Priority
+        int rowPrio = (dr.subIndex < r.audioPriorities.size()) ? r.audioPriorities[dr.subIndex] : r.audioPriority;
+        std::string prioStr = GetPriorityString(rowPrio);
+        SetSubItemTextIfChanged(hList, item, 2, prioStr);
 
-        // 3: Other than
-        int coreCount = ati::CpuTopology::GetSystemCoreCount();
-        DWORD_PTR normalMask = (r.normalAffinityMask != 0) ? r.normalAffinityMask : g_isolator.GetConfig().normalAffinityMask;
-        std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 3, otherThanStr);
+        // 3: Process Priority
+        std::string procPrioStr = GetProcessPriorityString(r.processPriorityClass);
+        SetSubItemTextIfChanged(hList, item, 3, procPrioStr);
 
-        // 4: Audio Core PID/TID
+        // 4: Pause / Verify (カスタムドロー描画、テキストは空)
+        SetSubItemTextIfChanged(hList, item, 4, "");
+
+        // 5: Audio Core PID/TID
         std::string thName;
         if (r.isBypassed) {
             thName = "Bypassed";
+        } else if (!r.isRunning) {
+            thName = "Not running";
+        } else if (r.ignoreSig && r.ignoreSigCount > 1) {
+            size_t confirmedCount = r.activeAudioTids.size();
+            if (dr.subIndex < confirmedCount && dr.tid != 0) {
+                thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(dr.tid);
+            } else if (r.multiSearchSleeping) {
+                thName = "sleeping...";
+            } else {
+                int intervalMs = (g_isolator.GetConfig().pollingIntervalMs > 0) ? g_isolator.GetConfig().pollingIntervalMs : 1000;
+                int turnsPerSec = 1000 / intervalMs;
+                if (turnsPerSec < 1) turnsPerSec = 1;
+                int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
+                if (sec < 1) sec = 1;
+                if (sec > 10) sec = 10;
+                if (dr.subIndex == confirmedCount) {
+                    thName = "Standby " + std::to_string(sec);
+                } else {
+                    thName = "Standby 10";
+                }
+            }
+        } else if (r.isAudioIsolated && dr.tid != 0) {
+            thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(dr.tid);
         } else if (r.detectedThreadName.empty()) {
             thName = r.isRunning ? "Scanning..." : "Not running";
         } else {
             thName = r.detectedThreadName;
         }
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 4, thName);
+        SetSubItemTextIfChanged(hList, item, 5, thName);
 
-        // 5: Pause / Verify (カスタムドロー描画、テキストは空)
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 5, "");
-
-        // 6: Priority
-        std::string prioStr = GetPriorityString(r.audioPriority);
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 6, prioStr);
-
-        // 7: TIDs
+        // 6: TIDs
         std::string threadsStr = r.isRunning ? std::to_string(r.currentThreadCount) : "-";
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 7, threadsStr);
+        SetSubItemTextIfChanged(hList, item, 6, threadsStr);
 
-        // 8: Changes
+        // 7: Chgs
         std::string countStr = std::to_string(r.applyCount);
-        SetSubItemTextIfChanged(hList, static_cast<int>(i), 8, countStr);
+        SetSubItemTextIfChanged(hList, item, 7, countStr);
+
+        // 8: Audio
+        int assignedCore = r.audioCore;
+        if (dr.subIndex < r.audioCores.size()) {
+            assignedCore = r.audioCores[dr.subIndex];
+        } else if (r.audioAffinityMask != 0) {
+            int bitIdx = -1;
+            int foundCount = 0;
+            for (int c = 0; c < 64; ++c) {
+                if ((r.audioAffinityMask & (1ULL << c)) != 0) {
+                    if (foundCount == static_cast<int>(dr.subIndex)) {
+                        bitIdx = c;
+                        break;
+                    }
+                    foundCount++;
+                }
+            }
+            if (bitIdx >= 0) assignedCore = bitIdx;
+        }
+        std::string forAudioStr = r.isRunning ? GetCoreLabel(assignedCore, cores) : "-";
+        SetSubItemTextIfChanged(hList, item, 8, forAudioStr);
+
+        // 9: Excluded (最小TID以外は "same")
+        if (dr.subIndex > 0) {
+            SetSubItemTextIfChanged(hList, item, 9, "same");
+        } else {
+            int coreCount = ati::CpuTopology::GetSystemCoreCount();
+            DWORD_PTR normalMask = (r.normalAffinityMask != 0) ? r.normalAffinityMask : g_isolator.GetConfig().normalAffinityMask;
+            DWORD_PTR mask = r.audioAffinityMask ? r.audioAffinityMask : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
+            std::string otherThanStr = FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated, mask, normalMask, coreCount, cores);
+            SetSubItemTextIfChanged(hList, item, 9, otherThanStr);
+        }
     }
 }
 
@@ -756,6 +1076,135 @@ static void SubclassAffinityTable(HWND hList) {
     WNDPROC pfnOld = (WNDPROC)SetWindowLongPtrA(hList, GWLP_WNDPROC, (LONG_PTR)AffinityTableSubclassProc);
     if (pfnOld) {
         SetPropA(hList, "ATI_OrigTableProc", (HANDLE)pfnOld);
+    }
+}
+
+// ── アフィニティテーブル初期化共通ヘルパー (候補 M5) ──
+static void InitAffinityListView(HWND hDlg, int listCtrlId, float scale,
+                                  const std::vector<ati::CoreInfo>& cores,
+                                  const char* row0Label, const char* row1Label) {
+    HWND hList = GetDlgItem(hDlg, listCtrlId);
+    if (!hList) return;
+
+    HFONT hFont = GetEffectiveFont(hDlg);
+    SubclassAffinityTable(hList);
+    SendMessageA(hList, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
+    HWND hHeader = ListView_GetHeader(hList);
+    if (hHeader) SendMessageA(hHeader, WM_SETFONT, reinterpret_cast<WPARAM>(hFont), TRUE);
+    ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+
+    LVCOLUMNA lvc = { 0 };
+    lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
+
+    // 0: Item
+    lvc.fmt = LVCFMT_LEFT;
+    lvc.cx = ScaleI(Layout::kAffinityItemColW, scale);
+    lvc.iSubItem = 0;
+    lvc.pszText = const_cast<LPSTR>("Item");
+    ListView_InsertColumn(hList, 0, &lvc);
+
+    // 1 .. coreCount: コアラベル (#0, #1, P0, E0 等)
+    for (size_t c = 0; c < cores.size(); ++c) {
+        lvc.fmt = LVCFMT_CENTER;
+        lvc.cx = ScaleI(Layout::kAffinityCoreColW, scale);
+        lvc.iSubItem = static_cast<int>(1 + c);
+        lvc.pszText = const_cast<LPSTR>(cores[c].label.c_str());
+        ListView_InsertColumn(hList, static_cast<int>(1 + c), &lvc);
+    }
+
+    // 行 0:
+    LVITEMA lvi = { 0 };
+    lvi.mask = LVIF_TEXT;
+    lvi.iItem = 0;
+    lvi.pszText = const_cast<LPSTR>(row0Label);
+    ListView_InsertItem(hList, &lvi);
+
+    // 行 1:
+    lvi.iItem = 1;
+    lvi.pszText = const_cast<LPSTR>(row1Label);
+    ListView_InsertItem(hList, &lvi);
+}
+
+// ── アフィニティテーブル チェックボックスカスタムドロー共通ハンドラ (候補 M6) ──
+template <typename CheckFn>
+static BOOL HandleAffinityCustomDraw(HWND hDlg, int listCtrlId, LPARAM lParam,
+                                     const std::vector<ati::CoreInfo>& cores,
+                                     CheckFn isCheckedFn) {
+    LPNMLVCUSTOMDRAW plvcd = reinterpret_cast<LPNMLVCUSTOMDRAW>(lParam);
+    switch (plvcd->nmcd.dwDrawStage) {
+    case CDDS_PREPAINT:
+        SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
+        return TRUE;
+    case CDDS_ITEMPREPAINT:
+        SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYSUBITEMDRAW);
+        return TRUE;
+    case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
+        int item = static_cast<int>(plvcd->nmcd.dwItemSpec);
+        int subItem = plvcd->iSubItem;
+        int coreCount = static_cast<int>(cores.size());
+
+        HWND hList = GetDlgItem(hDlg, listCtrlId);
+        bool isSelected = (ListView_GetItemState(hList, item, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+        COLORREF clrBk = isSelected ? RGB(225, 238, 254) : RGB(255, 255, 255);
+        plvcd->clrTextBk = clrBk;
+        plvcd->clrText = RGB(0, 0, 0);
+
+        if (subItem >= 1 && subItem <= coreCount) {
+            HDC hdc = plvcd->nmcd.hdc;
+            RECT rcSub;
+            ListView_GetSubItemRect(hList, item, subItem, LVIR_BOUNDS, &rcSub);
+
+            HBRUSH hBr = CreateSolidBrush(clrBk);
+            FillRect(hdc, &rcSub, hBr);
+            DeleteObject(hBr);
+
+            HPEN hPen = CreatePen(PS_SOLID, 1, RGB(235, 235, 235));
+            HPEN hOldPen = static_cast<HPEN>(SelectObject(hdc, hPen));
+            MoveToEx(hdc, rcSub.right - 1, rcSub.top, nullptr);
+            LineTo(hdc, rcSub.right - 1, rcSub.bottom);
+            MoveToEx(hdc, rcSub.left, rcSub.bottom - 1, nullptr);
+            LineTo(hdc, rcSub.right, rcSub.bottom - 1);
+            SelectObject(hdc, hOldPen);
+            DeleteObject(hPen);
+
+            int logicalIdx = cores[subItem - 1].logicalIndex;
+            bool isChecked = isCheckedFn(item, logicalIdx);
+
+            float scale = GetDpiScaleForWindow(hDlg);
+            int boxSize = ScaleI(Layout::kCheckboxSize, scale);
+            if (boxSize < Layout::kCheckboxSize) boxSize = Layout::kCheckboxSize;
+            RECT rcBox;
+            rcBox.left = rcSub.left + (rcSub.right - rcSub.left - boxSize) / 2;
+            rcBox.top = rcSub.top + (rcSub.bottom - rcSub.top - boxSize) / 2;
+            rcBox.right = rcBox.left + boxSize;
+            rcBox.bottom = rcBox.top + boxSize;
+
+            UINT uState = DFCS_BUTTONCHECK | (isChecked ? DFCS_CHECKED : 0) | DFCS_FLAT;
+            DrawFrameControl(hdc, &rcBox, DFC_BUTTON, uState);
+
+            SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+            return TRUE;
+        }
+
+        SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_DODEFAULT);
+        return TRUE;
+    }
+    default:
+        break;
+    }
+    return FALSE;
+}
+
+// ── 子ダイアログ内全幅コントロールのリサイズ共通ヘルパー (候補 M7) ──
+static inline void ResizeDialogControlWidth(HWND hDlg, int ctrlId, int cx, int margin) {
+    HWND hCtrl = GetDlgItem(hDlg, ctrlId);
+    if (hCtrl) {
+        RECT rc;
+        GetWindowRect(hCtrl, &rc);
+        MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rc), 2);
+        int w = cx - margin * 2;
+        int h = rc.bottom - rc.top;
+        SetWindowPos(hCtrl, nullptr, margin, rc.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
     }
 }
 
@@ -1021,15 +1470,14 @@ static BOOL HandlePriorityComboDrawItem(HWND hDlg, LPARAM lParam, UINT ctlId) {
         SendMessageA(pdis->hwndItem, CB_GETLBTEXT, pdis->itemID, reinterpret_cast<LPARAM>(text));
 
         HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0));
-        if (!hFont) hFont = reinterpret_cast<HFONT>(SendMessageA(hDlg, WM_GETFONT, 0, 0));
-        if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+        if (!hFont) hFont = GetEffectiveFont(hDlg);
         HGDIOBJ oldFont = SelectObject(hdc, hFont);
 
         SetBkMode(hdc, TRANSPARENT);
         SetTextColor(hdc, textCol);
 
         float scale = GetDpiScaleForWindow(hDlg);
-        int extraLeft = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px相当 (6pxから2px右へ戻す)
+        int extraLeft = ScaleI(2, scale); // 200%環境で4px相当 (6pxから2px右へ戻す)
         RECT rcText = rc;
         if (isComboEdit) {
             rcText.right -= 6;
@@ -1086,8 +1534,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             int mainCenterX = (rcMain.left + rcMain.right) / 2;
             int mainCenterY = (rcMain.top + rcMain.bottom) / 2;
 
-            int stepX = static_cast<int>(40 * scale);
-            int stepY = static_cast<int>(40 * scale);
+            int stepX = ScaleI(Layout::kPickerOffset, scale);
+            int stepY = ScaleI(Layout::kPickerOffset, scale);
             int offsetX = (screenCenterX >= mainCenterX) ? stepX : -stepX;
             int offsetY = (screenCenterY >= mainCenterY) ? stepY : -stepY;
 
@@ -1107,48 +1555,10 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             SetWindowPos(hDlg, nullptr, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
 
-        HFONT hFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
-        if (!hFont) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
+        InitAffinityListView(hDlg, IDC_LIST_SETTINGS_CORES, scale, cores,
+                             "Default Audio Core", "Excluded");
         HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
         if (hList) {
-            SubclassAffinityTable(hList);
-            SendMessageA(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
-            HWND hHeader = ListView_GetHeader(hList);
-            if (hHeader) SendMessageA(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
-            ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-
-            LVCOLUMNA lvc = { 0 };
-            lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
-
-            // 0: Item
-            lvc.fmt = LVCFMT_LEFT;
-            lvc.cx = static_cast<int>(130 * scale);
-            lvc.iSubItem = 0;
-            lvc.pszText = const_cast<LPSTR>("Item");
-            ListView_InsertColumn(hList, 0, &lvc);
-
-            // 1 .. coreCount: コアラベル (#0, #1, P0, E0 等)
-            for (int c = 0; c < coreCount; ++c) {
-                lvc.fmt = LVCFMT_CENTER;
-                lvc.cx = static_cast<int>(34 * scale);
-                lvc.iSubItem = 1 + c;
-                lvc.pszText = const_cast<LPSTR>(cores[c].label.c_str());
-                ListView_InsertColumn(hList, 1 + c, &lvc);
-            }
-
-            // 行 0: Default Audio Core
-            LVITEMA lvi = { 0 };
-            lvi.mask = LVIF_TEXT;
-            lvi.iItem = 0;
-            lvi.pszText = const_cast<LPSTR>("Default Audio Core");
-            ListView_InsertItem(hList, &lvi);
-
-            // 行 1: Excluded
-            lvi.iItem = 1;
-            lvi.pszText = const_cast<LPSTR>("Excluded");
-            ListView_InsertItem(hList, &lvi);
-
             ShowScrollBar(hList, SB_VERT, FALSE);
             ListView_Scroll(hList, 0, -9999);
         }
@@ -1219,9 +1629,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             COLORREF textColor = isDisabled ? RGB(160, 160, 160) : RGB(60, 95, 75); // 落ち着いた鈍い緑
             SetTextColor(hdc, textColor);
 
-            HFONT hBaseFont = (HFONT)SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0);
-            if (!hBaseFont) hBaseFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
-            if (!hBaseFont) hBaseFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT hBaseFont = reinterpret_cast<HFONT>(SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0));
+            if (!hBaseFont) hBaseFont = GetEffectiveFont(hDlg);
 
             LOGFONTA lf = { 0 };
             GetObjectA(hBaseFont, sizeof(lf), &lf);
@@ -1243,8 +1652,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
         float scale = GetDpiScaleForWindow(hDlg);
-        lpMMI->ptMinTrackSize.x = static_cast<LONG>(460 * scale);
-        lpMMI->ptMinTrackSize.y = static_cast<LONG>(250 * scale);
+        lpMMI->ptMinTrackSize.x = static_cast<LONG>(ScaleI(Layout::kPickerMinW, scale));
+        lpMMI->ptMinTrackSize.y = static_cast<LONG>(ScaleI(Layout::kPickerMinH, scale));
         return 0;
     }
 
@@ -1255,19 +1664,11 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         if (cx <= 0 || cy <= 0) return TRUE;
 
         float scale = GetDpiScaleForWindow(hDlg);
-        int margin = static_cast<int>(14 * scale);
-        int spacing = static_cast<int>(8 * scale);
+        int margin = ScaleI(Layout::kDialogMargin, scale);
+        int spacing = ScaleI(Layout::kCtrlSpacing, scale);
 
         // コア表リストビューの幅追従
-        HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
-        if (hList) {
-            RECT rcList;
-            GetWindowRect(hList, &rcList);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
-            int listW = cx - margin * 2;
-            int listH = rcList.bottom - rcList.top;
-            SetWindowPos(hList, nullptr, margin, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        ResizeDialogControlWidth(hDlg, IDC_LIST_SETTINGS_CORES, cx, margin);
 
         // Apply ボタンの右寄せ追従
         auto MoveRight = [&](int ctrlId) {
@@ -1347,70 +1748,15 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             int coreCount = static_cast<int>(cores.size());
 
             if (pnm->code == NM_CUSTOMDRAW) {
-                LPNMLVCUSTOMDRAW plvcd = reinterpret_cast<LPNMLVCUSTOMDRAW>(lParam);
-                switch (plvcd->nmcd.dwDrawStage) {
-                case CDDS_PREPAINT:
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
-                    return TRUE;
-                case CDDS_ITEMPREPAINT:
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYSUBITEMDRAW);
-                    return TRUE;
-                case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
-                    int item = static_cast<int>(plvcd->nmcd.dwItemSpec);
-                    int subItem = plvcd->iSubItem;
-
-                    HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
-                    bool isSelected = (ListView_GetItemState(hList, item, LVIS_SELECTED) & LVIS_SELECTED) != 0;
-                    COLORREF clrBk = isSelected ? RGB(225, 238, 254) : RGB(255, 255, 255);
-                    plvcd->clrTextBk = clrBk;
-                    plvcd->clrText = RGB(0, 0, 0);
-
-                    if (subItem >= 1 && subItem <= coreCount) {
-                        HDC hdc = plvcd->nmcd.hdc;
-                        RECT rcSub;
-                        ListView_GetSubItemRect(hList, item, subItem, LVIR_BOUNDS, &rcSub);
-
-                        HBRUSH hBr = CreateSolidBrush(clrBk);
-                        FillRect(hdc, &rcSub, hBr);
-                        DeleteObject(hBr);
-
-                        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(235, 235, 235));
-                        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-                        MoveToEx(hdc, rcSub.right - 1, rcSub.top, nullptr);
-                        LineTo(hdc, rcSub.right - 1, rcSub.bottom);
-                        MoveToEx(hdc, rcSub.left, rcSub.bottom - 1, nullptr);
-                        LineTo(hdc, rcSub.right, rcSub.bottom - 1);
-                        SelectObject(hdc, hOldPen);
-                        DeleteObject(hPen);
-
-                        bool isChecked = false;
-                        int logicalIdx = cores[subItem - 1].logicalIndex;
+                return HandleAffinityCustomDraw(hDlg, IDC_LIST_SETTINGS_CORES, lParam, cores,
+                    [](int item, int logicalIdx) {
                         if (item == 0) {
-                            isChecked = (s_tmpConfig.defaultAudioAffinityMask & (1ULL << logicalIdx)) != 0;
+                            return (s_tmpConfig.defaultAudioAffinityMask & (1ULL << logicalIdx)) != 0;
                         } else if (item == 1) {
-                            isChecked = (s_tmpConfig.normalAffinityMask & (1ULL << logicalIdx)) != 0;
+                            return (s_tmpConfig.normalAffinityMask & (1ULL << logicalIdx)) != 0;
                         }
-
-                        float scale = GetDpiScaleForWindow(hDlg);
-                        int boxSize = static_cast<int>(13 * scale);
-                        if (boxSize < 13) boxSize = 13;
-                        RECT rcBox;
-                        rcBox.left = rcSub.left + (rcSub.right - rcSub.left - boxSize) / 2;
-                        rcBox.top = rcSub.top + (rcSub.bottom - rcSub.top - boxSize) / 2;
-                        rcBox.right = rcBox.left + boxSize;
-                        rcBox.bottom = rcBox.top + boxSize;
-
-                        UINT uState = DFCS_BUTTONCHECK | (isChecked ? DFCS_CHECKED : 0) | DFCS_FLAT;
-                        DrawFrameControl(hdc, &rcBox, DFC_BUTTON, uState);
-
-                        SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                        return TRUE;
-                    }
-
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_DODEFAULT);
-                    return TRUE;
-                }
-                }
+                        return false;
+                    });
             } else if (pnm->code == NM_CLICK) {
                 LPNMITEMACTIVATE pia = reinterpret_cast<LPNMITEMACTIVATE>(lParam);
                 if (pia && pia->iItem >= 0 && pia->iSubItem >= 1 && pia->iSubItem <= coreCount) {
@@ -1629,6 +1975,27 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 static size_t s_editRuleIndex = 0;
 static ati::ProcessRule s_editRule;
 
+static void SyncAudioCoresFromMask(std::vector<int>& cores, DWORD_PTR mask) {
+    std::vector<int> updated;
+    // 既存の順序を尊重して mask に含まれるものを残す
+    for (int c : cores) {
+        if ((mask & (1ULL << c)) != 0) {
+            if (std::find(updated.begin(), updated.end(), c) == updated.end()) {
+                updated.push_back(c);
+            }
+        }
+    }
+    // mask に新しく追加されたビットを追加
+    for (int c = 0; c < 64; ++c) {
+        if ((mask & (1ULL << c)) != 0) {
+            if (std::find(updated.begin(), updated.end(), c) == updated.end()) {
+                updated.push_back(c);
+            }
+        }
+    }
+    cores = updated;
+}
+
 static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_MEASUREITEM: {
@@ -1644,7 +2011,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         break;
     }
     case WM_INITDIALOG: {
-        SetDlgItemTextA(hDlg, IDC_STATIC_PROCESS_NAME, s_editRule.processName.c_str());
+        SetDlgItemTextA(hDlg, IDC_STATIC_PROCESS_NAME, StripExeExtension(s_editRule.processName).c_str());
 
         // メイン画面の当該プロセス行を隠さない直上に重ねて配置
         HWND hMainList = g_hMainDlg ? GetDlgItem(g_hMainDlg, IDC_LIST_PROCESSES) : nullptr;
@@ -1663,15 +2030,15 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             MONITORINFO mi = { sizeof(mi) };
             GetMonitorInfoA(hMon, &mi);
 
-            int newX = rcItem.left + static_cast<int>(10 * scale);
+            int newX = rcItem.left + ScaleI(Layout::kMainMargin, scale);
             if (newX + dlgW > mi.rcWork.right) newX = mi.rcWork.right - dlgW - 10;
             if (newX < mi.rcWork.left) newX = mi.rcWork.left + 10;
 
             // 当該行の上端の直上 (rcItem.top - dlgH - 4) に配置
-            int newY = rcItem.top - dlgH - static_cast<int>(4 * scale);
+            int newY = rcItem.top - dlgH - ScaleI(Layout::kPerAppGap, scale);
             // 画面上部からはみ出る場合は直下 (rcItem.bottom + 4) に配置
             if (newY < mi.rcWork.top + 10) {
-                newY = rcItem.bottom + static_cast<int>(4 * scale);
+                newY = rcItem.bottom + ScaleI(Layout::kPerAppGap, scale);
             }
             SetWindowPos(hDlg, nullptr, newX, newY, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         }
@@ -1681,54 +2048,20 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         float scale = GetDpiScaleForWindow(hDlg);
 
 
-        HFONT hFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
-        if (!hFont) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-
+        InitAffinityListView(hDlg, IDC_LIST_RULE_CORES, scale, cores,
+                             "Audio Core", "Excluded");
         HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
         if (hList) {
-            SubclassAffinityTable(hList);
-            SendMessageA(hList, WM_SETFONT, (WPARAM)hFont, TRUE);
-            HWND hHeader = ListView_GetHeader(hList);
-            if (hHeader) SendMessageA(hHeader, WM_SETFONT, (WPARAM)hFont, TRUE);
-            ListView_SetExtendedListViewStyle(hList, LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-
-            LVCOLUMNA lvc = { 0 };
-            lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
-
-            // 0: Item
-            lvc.fmt = LVCFMT_LEFT;
-            lvc.cx = static_cast<int>(130 * scale);
-            lvc.iSubItem = 0;
-            lvc.pszText = const_cast<LPSTR>("Item");
-            ListView_InsertColumn(hList, 0, &lvc);
-
-            // 1 .. coreCount: コアラベル
-            for (int c = 0; c < coreCount; ++c) {
-                lvc.fmt = LVCFMT_CENTER;
-                lvc.cx = static_cast<int>(34 * scale);
-                lvc.iSubItem = 1 + c;
-                lvc.pszText = const_cast<LPSTR>(cores[c].label.c_str());
-                ListView_InsertColumn(hList, 1 + c, &lvc);
-            }
-
-            // 行 0: Audio Core
-            LVITEMA lvi = { 0 };
-            lvi.mask = LVIF_TEXT;
-            lvi.iItem = 0;
-            lvi.pszText = const_cast<LPSTR>("Audio Core");
-            ListView_InsertItem(hList, &lvi);
-
-            // 行 1: Excluded
-            lvi.iItem = 1;
-            lvi.pszText = const_cast<LPSTR>("Excluded");
-            ListView_InsertItem(hList, &lvi);
-
             ShowScrollBar(hList, SB_VERT, FALSE);
             ListView_Scroll(hList, 0, -9999);
         }
 
         if (s_editRule.audioAffinityMask == 0) {
             s_editRule.audioAffinityMask = (1ULL << s_editRule.audioCore);
+        }
+        SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
+        if (!s_editRule.audioCores.empty()) {
+            s_editRule.audioCore = s_editRule.audioCores[0];
         }
         char aHex[32] = { 0 };
         snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_editRule.audioAffinityMask));
@@ -1761,8 +2094,9 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         // 注釈テキスト (Segoe UI 8pt 小さめフォントを適用)
         HWND hNote = GetDlgItem(hDlg, IDC_STATIC_HALF_ISOLATED_NOTE);
         if (hNote) {
+            HFONT hBaseFont = GetEffectiveFont(hDlg);
             LOGFONTA lf = { 0 };
-            GetObjectA(hFont, sizeof(lf), &lf);
+            GetObjectA(hBaseFont, sizeof(lf), &lf);
             lf.lfHeight = static_cast<LONG>(-11 * scale); // 8pt 相当
             lf.lfWeight = FW_NORMAL;
             HFONT hNoteFont = CreateFontIndirectA(&lf);
@@ -1789,8 +2123,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
     case WM_GETMINMAXINFO: {
         LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
         float scale = GetDpiScaleForWindow(hDlg);
-        lpMMI->ptMinTrackSize.x = static_cast<LONG>(400 * scale);
-        lpMMI->ptMinTrackSize.y = static_cast<LONG>(260 * scale);
+        lpMMI->ptMinTrackSize.x = static_cast<LONG>(ScaleI(Layout::kPerAppMinW, scale));
+        lpMMI->ptMinTrackSize.y = static_cast<LONG>(ScaleI(Layout::kPerAppMinH, scale));
         return 0;
     }
 
@@ -1801,28 +2135,11 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         if (cx <= 0 || cy <= 0) return TRUE;
 
         float scale = GetDpiScaleForWindow(hDlg);
-        int margin = static_cast<int>(14 * scale);
-        int spacing = static_cast<int>(8 * scale);
+        int margin = ScaleI(Layout::kDialogMargin, scale);
+        int spacing = ScaleI(Layout::kCtrlSpacing, scale);
 
-        HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
-        if (hList) {
-            RECT rcList;
-            GetWindowRect(hList, &rcList);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
-            int listW = cx - margin * 2;
-            int listH = rcList.bottom - rcList.top;
-            SetWindowPos(hList, nullptr, margin, rcList.top, listW, listH, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-
-        HWND hNote = GetDlgItem(hDlg, IDC_STATIC_HALF_ISOLATED_NOTE);
-        if (hNote) {
-            RECT rcNote;
-            GetWindowRect(hNote, &rcNote);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcNote), 2);
-            int noteW = cx - margin * 2;
-            int noteH = rcNote.bottom - rcNote.top;
-            SetWindowPos(hNote, nullptr, margin, rcNote.top, noteW, noteH, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
+        ResizeDialogControlWidth(hDlg, IDC_LIST_RULE_CORES, cx, margin);
+        ResizeDialogControlWidth(hDlg, IDC_STATIC_HALF_ISOLATED_NOTE, cx, margin);
 
         HWND hBtnCancel = GetDlgItem(hDlg, IDC_BTN_RULE_CANCEL);
         HWND hBtnOk = GetDlgItem(hDlg, IDC_BTN_RULE_OK);
@@ -1850,70 +2167,15 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             int coreCount = static_cast<int>(cores.size());
 
             if (pnm->code == NM_CUSTOMDRAW) {
-                LPNMLVCUSTOMDRAW plvcd = reinterpret_cast<LPNMLVCUSTOMDRAW>(lParam);
-                switch (plvcd->nmcd.dwDrawStage) {
-                case CDDS_PREPAINT:
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYITEMDRAW);
-                    return TRUE;
-                case CDDS_ITEMPREPAINT:
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_NOTIFYSUBITEMDRAW);
-                    return TRUE;
-                case CDDS_ITEMPREPAINT | CDDS_SUBITEM: {
-                    int item = static_cast<int>(plvcd->nmcd.dwItemSpec);
-                    int subItem = plvcd->iSubItem;
-
-                    HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
-                    bool isSelected = (ListView_GetItemState(hList, item, LVIS_SELECTED) & LVIS_SELECTED) != 0;
-                    COLORREF clrBk = isSelected ? RGB(225, 238, 254) : RGB(255, 255, 255);
-                    plvcd->clrTextBk = clrBk;
-                    plvcd->clrText = RGB(0, 0, 0);
-
-                    if (subItem >= 1 && subItem <= coreCount) {
-                        HDC hdc = plvcd->nmcd.hdc;
-                        RECT rcSub;
-                        ListView_GetSubItemRect(hList, item, subItem, LVIR_BOUNDS, &rcSub);
-
-                        HBRUSH hBr = CreateSolidBrush(clrBk);
-                        FillRect(hdc, &rcSub, hBr);
-                        DeleteObject(hBr);
-
-                        HPEN hPen = CreatePen(PS_SOLID, 1, RGB(235, 235, 235));
-                        HPEN hOldPen = (HPEN)SelectObject(hdc, hPen);
-                        MoveToEx(hdc, rcSub.right - 1, rcSub.top, nullptr);
-                        LineTo(hdc, rcSub.right - 1, rcSub.bottom);
-                        MoveToEx(hdc, rcSub.left, rcSub.bottom - 1, nullptr);
-                        LineTo(hdc, rcSub.right, rcSub.bottom - 1);
-                        SelectObject(hdc, hOldPen);
-                        DeleteObject(hPen);
-
-                        int logicalIdx = cores[subItem - 1].logicalIndex;
-                        bool isChecked = false;
+                return HandleAffinityCustomDraw(hDlg, IDC_LIST_RULE_CORES, lParam, cores,
+                    [](int item, int logicalIdx) {
                         if (item == 0) {
-                            isChecked = (s_editRule.audioAffinityMask & (1ULL << logicalIdx)) != 0;
+                            return (s_editRule.audioAffinityMask & (1ULL << logicalIdx)) != 0;
                         } else if (item == 1) {
-                            isChecked = (s_editRule.normalAffinityMask & (1ULL << logicalIdx)) != 0;
+                            return (s_editRule.normalAffinityMask & (1ULL << logicalIdx)) != 0;
                         }
-
-                        float scale = GetDpiScaleForWindow(hDlg);
-                        int boxSize = static_cast<int>(13 * scale);
-                        if (boxSize < 13) boxSize = 13;
-                        RECT rcBox;
-                        rcBox.left = rcSub.left + (rcSub.right - rcSub.left - boxSize) / 2;
-                        rcBox.top = rcSub.top + (rcSub.bottom - rcSub.top - boxSize) / 2;
-                        rcBox.right = rcBox.left + boxSize;
-                        rcBox.bottom = rcBox.top + boxSize;
-
-                        UINT uState = DFCS_BUTTONCHECK | (isChecked ? DFCS_CHECKED : 0) | DFCS_FLAT;
-                        DrawFrameControl(hdc, &rcBox, DFC_BUTTON, uState);
-
-                        SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                        return TRUE;
-                    }
-
-                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_DODEFAULT);
-                    return TRUE;
-                }
-                }
+                        return false;
+                    });
             } else if (pnm->code == NM_CLICK) {
                 LPNMITEMACTIVATE pia = reinterpret_cast<LPNMITEMACTIVATE>(lParam);
                 if (pia && pia->iItem >= 0 && pia->iSubItem >= 1 && pia->iSubItem <= coreCount) {
@@ -1936,12 +2198,10 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                                 s_editRule.normalAffinityMask &= ~bit; // 相互排他
                             }
                         }
+                        SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
                         int firstCore = 0;
-                        for (int c = 0; c < 64; ++c) {
-                            if ((s_editRule.audioAffinityMask & (1ULL << c)) != 0) {
-                                firstCore = c;
-                                break;
-                            }
+                        if (!s_editRule.audioCores.empty()) {
+                            firstCore = s_editRule.audioCores[0];
                         }
                         s_editRule.audioCore = firstCore;
                     } else if (pia->iItem == 1) {
@@ -1959,12 +2219,10 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             } else {
                                 s_editRule.normalAffinityMask |= bit;
                                 s_editRule.audioAffinityMask &= ~bit; // 相互排他
+                                SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
                                 int firstCore = 0;
-                                for (int c = 0; c < 64; ++c) {
-                                    if ((s_editRule.audioAffinityMask & (1ULL << c)) != 0) {
-                                        firstCore = c;
-                                        break;
-                                    }
+                                if (!s_editRule.audioCores.empty()) {
+                                    firstCore = s_editRule.audioCores[0];
                                 }
                                 s_editRule.audioCore = firstCore;
                             }
@@ -2007,6 +2265,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
+                SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
                 HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
                 if (hList) InvalidateRect(hList, nullptr, FALSE);
             }
@@ -2032,6 +2291,9 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 int sel = static_cast<int>(SendMessageA(hCombo, CB_GETCURSEL, 0, 0));
                 if (sel != CB_ERR) {
                     s_editRule.audioPriority = static_cast<int>(SendMessageA(hCombo, CB_GETITEMDATA, sel, 0));
+                    if (!s_editRule.audioPriorities.empty()) {
+                        s_editRule.audioPriorities[0] = s_editRule.audioPriority;
+                    }
                     s_editRule.wasHalfAutoPromoted = true; // ユーザー明示設定を保護
                 }
             }
@@ -2052,6 +2314,10 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
+                SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
+                if (!s_editRule.audioCores.empty()) {
+                    s_editRule.audioCore = s_editRule.audioCores[0];
+                }
             }
 
             char nBuf[128] = { 0 };
@@ -2095,6 +2361,12 @@ static void OpenRuleEditDialog(HWND hParent, size_t index) {
 
     s_editRuleIndex = index;
     s_editRule = rules[index];
+    if (s_editRule.audioAffinityMask != 0) {
+        SyncAudioCoresFromMask(s_editRule.audioCores, s_editRule.audioAffinityMask);
+        if (!s_editRule.audioCores.empty()) {
+            s_editRule.audioCore = s_editRule.audioCores[0];
+        }
+    }
 
     DialogBoxA(g_hInstance, MAKEINTRESOURCEA(IDD_RULE_EDIT_DIALOG), hParent, RuleEditDlgProc);
 }
@@ -2102,8 +2374,106 @@ static void OpenRuleEditDialog(HWND hParent, size_t index) {
 // ヘッダーサブクラス化プロシージャ (Col 0 の "!" を鮮やかな赤文字かつ太字で中央描画)
 static WNDPROC s_pfnOriginalHeaderProc = nullptr;
 
+// ソート確認ダイアログプロシージャ (タイトル「SORT?」、本文・アイコンなし、OK/Cancelボタンのみ、親ウィンドウ真上にセンタリング)
+static INT_PTR CALLBACK SortConfirmDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    switch (msg) {
+    case WM_INITDIALOG: {
+        HWND hParent = reinterpret_cast<HWND>(lParam);
+        if (!hParent) hParent = GetParent(hDlg);
+        if (hParent) {
+            RECT rcParent, rcDlg;
+            GetWindowRect(hParent, &rcParent);
+            GetWindowRect(hDlg, &rcDlg);
+            int dlgW = rcDlg.right - rcDlg.left;
+            int dlgH = rcDlg.bottom - rcDlg.top;
+            int x = rcParent.left + ((rcParent.right - rcParent.left) - dlgW) / 2;
+            int y = rcParent.top + ((rcParent.bottom - rcParent.top) - dlgH) / 2;
+            SetWindowPos(hDlg, HWND_TOP, x, y, 0, 0, SWP_NOSIZE);
+        }
+        return TRUE;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wParam);
+        if (id == IDOK || id == IDCANCEL) {
+            EndDialog(hDlg, id);
+            return TRUE;
+        }
+        break;
+    }
+    case WM_CLOSE: {
+        EndDialog(hDlg, IDCANCEL);
+        return TRUE;
+    }
+    }
+    return FALSE;
+}
+
+// プロセス名昇順ソート確認＆実行ヘルパー (Process Name カラム見出しクリック時専用)
+static void SortProcessesByName(HWND hDlg) {
+    static bool s_inSortPrompt = false;
+    if (s_inSortPrompt) return;
+    s_inSortPrompt = true;
+
+    INT_PTR ret = DialogBoxParamA(
+        g_hInstance, 
+        MAKEINTRESOURCEA(IDD_SORT_CONFIRM), 
+        hDlg, 
+        SortConfirmDlgProc, 
+        reinterpret_cast<LPARAM>(hDlg)
+    );
+
+    if (ret == IDOK) {
+        g_isolator.SortRulesByName();
+        auto updated = g_isolator.GetConfig();
+        // INI保存は即時実行せず終了処理時のみとする
+        HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+        if (hList) {
+            RefreshListView(hList, updated.rules);
+        }
+    }
+
+    s_inSortPrompt = false;
+}
+
+static POINT s_ptHeaderDown = { 0, 0 };
+
 static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_LBUTTONDOWN) {
+        s_ptHeaderDown.x = static_cast<short>(LOWORD(lParam));
+        s_ptHeaderDown.y = static_cast<short>(HIWORD(lParam));
+    }
+
     LRESULT lRes = CallWindowProcA(s_pfnOriginalHeaderProc, hWnd, msg, wParam, lParam);
+
+    if (msg == WM_LBUTTONUP) {
+        POINT ptUp;
+        ptUp.x = static_cast<short>(LOWORD(lParam));
+        ptUp.y = static_cast<short>(HIWORD(lParam));
+        int dx = abs(ptUp.x - s_ptHeaderDown.x);
+        int dy = abs(ptUp.y - s_ptHeaderDown.y);
+
+        // ドラッグ幅変更中等の移動を排除（3px以内の純粋なクリックのみ）
+        if (dx <= 3 && dy <= 3) {
+            // クリックを離した瞬間に最新のカラム矩形を取得
+            RECT rcCol1 = { 0 };
+            if (SendMessageA(hWnd, HDM_GETITEMRECT, 1, reinterpret_cast<LPARAM>(&rcCol1))) {
+                int colW = rcCol1.right - rcCol1.left;
+                if (colW > 0) {
+                    int margin = static_cast<int>(colW * 0.10f); // 左右10%（境界ドラッグマージン）
+                    int minX = rcCol1.left + margin;
+                    int maxX = rcCol1.right - margin;
+                    // 幅の中央80%範囲内をクリックした場合のみソート発火
+                    if (ptUp.x >= minX && ptUp.x <= maxX) {
+                        HWND hList = GetParent(hWnd);
+                        HWND hDlg = hList ? GetParent(hList) : nullptr;
+                        if (hDlg) {
+                            SortProcessesByName(hDlg);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     if (msg == WM_PAINT) {
         RECT rcItem;
@@ -2115,9 +2485,9 @@ static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                 InflateRect(&rcFill, -1, -1);
                 FillRect(hdc, &rcFill, GetSysColorBrush(COLOR_BTNFACE));
 
-                HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hWnd, WM_GETFONT, 0, 0));
+                HFONT hFont = GetEffectiveFont(hWnd);
                 LOGFONTA lf = { 0 };
-                GetObjectA(hFont ? hFont : GetStockObject(DEFAULT_GUI_FONT), sizeof(lf), &lf);
+                GetObjectA(hFont, sizeof(lf), &lf);
                 lf.lfWeight = FW_BOLD; // 太字
                 HFONT hBoldFont = CreateFontIndirectA(&lf);
 
@@ -2133,21 +2503,21 @@ static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
                 ReleaseDC(hWnd, hdc);
             }
         }
-        RECT rcItem5;
-        if (SendMessageA(hWnd, HDM_GETITEMRECT, 5, reinterpret_cast<LPARAM>(&rcItem5))) {
+        RECT rcItem4; // Col 4: || (Pause)
+        if (SendMessageA(hWnd, HDM_GETITEMRECT, 4, reinterpret_cast<LPARAM>(&rcItem4))) {
             HDC hdc = GetDC(hWnd);
             if (hdc) {
-                RECT rcFill = rcItem5;
+                RECT rcFill = rcItem4;
                 InflateRect(&rcFill, -1, -1);
                 FillRect(hdc, &rcFill, GetSysColorBrush(COLOR_BTNFACE));
 
                 float scale = GetDpiScaleForWindow(hWnd);
-                int barW = (std::max)(1, static_cast<int>(3 * scale));
-                int barH = (std::max)(2, static_cast<int>(9 * scale));
-                int gap  = (std::max)(1, static_cast<int>(2 * scale));
+                int barW = (std::max)(1, ScaleI(Layout::kBarW, scale));
+                int barH = (std::max)(2, ScaleI(Layout::kBarH, scale));
+                int gap  = (std::max)(1, ScaleI(Layout::kBarGap, scale));
                 int totalW = barW * 2 + gap;
-                int startX = rcItem5.left + ((rcItem5.right - rcItem5.left) - totalW) / 2;
-                int startY = rcItem5.top + ((rcItem5.bottom - rcItem5.top) - barH) / 2;
+                int startX = rcItem4.left + ((rcItem4.right - rcItem4.left) - totalW) / 2;
+                int startY = rcItem4.top + ((rcItem4.bottom - rcItem4.top) - barH) / 2;
 
                 RECT rcBar1 = { startX, startY, startX + barW, startY + barH };
                 RECT rcBar2 = { startX + barW + gap, startY, startX + totalW, startY + barH };
@@ -2163,10 +2533,22 @@ static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam, LPA
     return lRes;
 }
 
-// リストビューサブクラス化プロシージャ (Priority 列の直接クリック検知・インプレース ComboBox 展開)
+// リストビューサブクラス化プロシージャ (Priority 列の直接クリック検知・2D Matrix Picker ポップアップ)
 static WNDPROC s_pfnOriginalListProc = nullptr;
 
 static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_STYLECHANGING) {
+        if (wParam == GWL_STYLE) {
+            STYLESTRUCT* pSS = reinterpret_cast<STYLESTRUCT*>(lParam);
+            pSS->styleNew &= ~WS_HSCROLL;
+        }
+    }
+    if (msg == WM_NCCALCSIZE) {
+        LONG_PTR style = GetWindowLongPtrA(hWnd, GWL_STYLE);
+        if (style & WS_HSCROLL) {
+            SetWindowLongPtrA(hWnd, GWL_STYLE, style & ~WS_HSCROLL);
+        }
+    }
     if (msg == WM_ERASEBKGND) {
         // リサイズ時や露出時にアイテム未存在の余白領域を白(COLOR_WINDOW)で確実に消去し、
         // リサイズ前の古い凡例等の残像・透け込みを防止する
@@ -2182,54 +2564,113 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
         lvhti.pt.y = static_cast<short>(HIWORD(lParam));
         ListView_SubItemHitTest(hWnd, &lvhti);
 
-        if (lvhti.iItem >= 0 && lvhti.iSubItem == 6) {
-            // Col 6: Priority クイックアクセス (インプレース ComboBox 展開)
+        if (lvhti.iItem >= 0 && (lvhti.iSubItem == 2 || lvhti.iSubItem == 3)) {
+            // Col 2: Thread Priority または Col 3: Process Priority のクリックで新UI (2D Priority Matrix Picker) をポップアップ
             HWND hDlg = GetParent(hWnd);
             auto rules = g_isolator.GetRulesSnapshot();
-            LogDebug(("CustomListProc: hit Item=" + std::to_string(lvhti.iItem) + ", SubItem=" + std::to_string(lvhti.iSubItem)).c_str());
-            if (lvhti.iItem < static_cast<int>(rules.size()) && s_hInPlaceCombo) {
-                s_inPlaceItemIndex = lvhti.iItem;
-                s_inPlaceCancelled = false;
-                RECT rcSub;
-                ListView_GetSubItemRect(hWnd, lvhti.iItem, 6, LVIR_BOUNDS, &rcSub);
-                MapWindowPoints(hWnd, hDlg, reinterpret_cast<LPPOINT>(&rcSub), 2);
+            size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+            if (rowIdx < g_displayRows.size()) {
+                size_t ruleIdx = g_displayRows[rowIdx].ruleIndex;
+                size_t subIdx = g_displayRows[rowIdx].subIndex;
+                if (ruleIdx < rules.size()) {
+                    const auto& r = rules[ruleIdx];
+                    int currentPrio = (subIdx < r.audioPriorities.size()) ? r.audioPriorities[subIdx] : r.audioPriority;
+                    int initialRank = ati::FindRankByPrio(r.processPriorityClass, currentPrio);
+                    if (initialRank <= 0) initialRank = 25; // デフォルト (Normal/Normal)
 
-                int curPrio = rules[lvhti.iItem].audioPriority;
-                int selIdx = -1;
-                for (int i = 0; i < PRIO_OPTIONS_COUNT; ++i) {
-                    if (PRIO_OPTIONS[i].value == curPrio) {
-                        selIdx = i;
-                        break;
-                    }
+                    ati::ShowPriorityMatrixPicker(hDlg, initialRank, [hDlg, hWnd, ruleIdx, subIdx](int selectedRank) {
+                        const auto* entry = ati::GetMatrixEntryByRank(selectedRank);
+                        if (!entry) return;
+
+                        auto config = g_isolator.GetConfig();
+                        if (ruleIdx < config.rules.size()) {
+                            auto& targetRule = config.rules[ruleIdx];
+                            targetRule.processPriorityClass = entry->processPriorityClass;
+
+                            size_t requiredSlots = (targetRule.ignoreSig && targetRule.ignoreSigCount > 1)
+                                ? static_cast<size_t>(targetRule.ignoreSigCount) : 1;
+                            if (targetRule.audioPriorities.size() < requiredSlots) {
+                                targetRule.audioPriorities.resize(requiredSlots, targetRule.audioPriority);
+                            }
+                            if (subIdx < targetRule.audioPriorities.size()) {
+                                targetRule.audioPriorities[subIdx] = entry->threadPriority;
+                            }
+                            if (subIdx == 0) {
+                                targetRule.audioPriority = entry->threadPriority;
+                            }
+                            g_isolator.UpdateConfig(config);
+
+                            // 稼働中プロセスが存在する場合、即時 SetPriorityClass を発行
+                            if (targetRule.activePid != 0 && entry->processPriorityClass != 0) {
+                                HANDLE hP = OpenProcess(PROCESS_SET_INFORMATION, FALSE, targetRule.activePid);
+                                if (hP) {
+                                    if (!SetPriorityClass(hP, entry->processPriorityClass) && entry->processPriorityClass == REALTIME_PRIORITY_CLASS) {
+                                        SetPriorityClass(hP, HIGH_PRIORITY_CLASS);
+                                    }
+                                    CloseHandle(hP);
+                                }
+                            }
+
+                            // 稼働中スレッド・プロセスへ即時反映
+                            g_isolator.ScanAndIsolate();
+
+                            // INI 保存
+                            SaveConfig(config, g_iniPath);
+
+                            // リストビュー表示を即時更新
+                            auto updated = g_isolator.GetRulesSnapshot();
+                            UpdateListViewDynamic(hWnd, updated);
+                            InvalidateRect(hWnd, nullptr, FALSE);
+                        }
+                    });
+                    return 0; // デフォルトの行選択を抑止しピッカー展開に専念
                 }
-                SendMessageA(s_hInPlaceCombo, CB_SETCURSEL, selIdx, 0);
-
-                float scale = GetDpiScaleForWindow(hDlg);
-                int cellW = rcSub.right - rcSub.left;
-                int cellH = rcSub.bottom - rcSub.top;
-                int comboTotalH = cellH + static_cast<int>(180 * scale);
-                // ComboBox 本体の高さをセル枠内にフィットさせ、ドロップダウン項目の高さを拡大して文字切れを防止
-                SendMessageA(s_hInPlaceCombo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1), static_cast<LPARAM>(cellH > 2 ? cellH - 2 : cellH));
-                SendMessageA(s_hInPlaceCombo, CB_SETITEMHEIGHT, 0, static_cast<LPARAM>(20 * scale));
-                SetWindowPos(s_hInPlaceCombo, HWND_TOP, rcSub.left, rcSub.top + 1, cellW, comboTotalH, SWP_SHOWWINDOW);
-                SetFocus(s_hInPlaceCombo);
-                SendMessageA(s_hInPlaceCombo, CB_SHOWDROPDOWN, TRUE, 0);
-                return 0; // デフォルトの行選択を抑止し ComboBox 展開に専念
-            }
-        } else {
-            LogDebug(("CustomListProc: hit miss or other column: Item=" + std::to_string(lvhti.iItem) + ", SubItem=" + std::to_string(lvhti.iSubItem)).c_str());
-            if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                s_inPlaceItemIndex = -1;
             }
         }
     } else if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL) {
-        if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-            ShowWindow(s_hInPlaceCombo, SW_HIDE);
-            s_inPlaceItemIndex = -1;
+        if (ati::IsPriorityMatrixPickerOpen()) {
+            ati::ClosePriorityMatrixPicker();
         }
     }
-    return CallWindowProcA(s_pfnOriginalListProc, hWnd, msg, wParam, lParam);
+    LRESULT lRes = CallWindowProcA(s_pfnOriginalListProc, hWnd, msg, wParam, lParam);
+    if (msg == WM_NCCALCSIZE || msg == WM_SIZE || msg == WM_WINDOWPOSCHANGED || msg == WM_PAINT) {
+        LONG_PTR style = GetWindowLongPtrA(hWnd, GWL_STYLE);
+        if (style & WS_HSCROLL) {
+            SetWindowLongPtrA(hWnd, GWL_STYLE, style & ~WS_HSCROLL);
+        }
+        ShowScrollBar(hWnd, SB_HORZ, FALSE);
+    }
+    return lRes;
+}
+
+// --- 管理者権限判定ヘルパー ---
+static bool IsRunningAsAdmin() {
+    BOOL isAdmin = FALSE;
+    PSID adminGroup = nullptr;
+    SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(&ntAuthority, 2, SECURITY_BUILTIN_DOMAIN_RID,
+                                 DOMAIN_ALIAS_RID_ADMINS, 0, 0, 0, 0, 0, 0, &adminGroup)) {
+        CheckTokenMembership(nullptr, adminGroup, &isAdmin);
+        FreeSid(adminGroup);
+    }
+    return isAdmin != FALSE;
+}
+
+// --- Realtime 優先度用特権有効化ヘルパー ---
+static bool EnableRealtimePrivilege() {
+    HANDLE hToken = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        return false;
+    }
+    TOKEN_PRIVILEGES tp = { 0 };
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (LookupPrivilegeValueA(nullptr, "SeIncreaseBasePriorityPrivilege", &tp.Privileges[0].Luid)) {
+        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    }
+    DWORD err = GetLastError();
+    CloseHandle(hToken);
+    return (err == ERROR_SUCCESS);
 }
 
 // --- アプリケーション再起動ヘルパー ---
@@ -2247,6 +2688,26 @@ static void RestartApplication(HWND hDlg) {
     }
     ShellExecuteA(nullptr, "open", exePath, params, nullptr, wasInTray ? SW_HIDE : SW_SHOW);
     DestroyWindow(hDlg);
+}
+
+// --- 管理者として再起動ヘルパー (UAC 昇格) ---
+static void RestartAsAdmin(HWND hDlg) {
+    char exePath[MAX_PATH] = { 0 };
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
+    const char* params = wasInTray ? "--tray" : nullptr;
+
+    HINSTANCE hInst = ShellExecuteA(hDlg, "runas", exePath, params, nullptr, wasInTray ? SW_HIDE : SW_SHOW);
+    if (reinterpret_cast<INT_PTR>(hInst) > 32) {
+        KillTimer(hDlg, TIMER_POLLING_ID);
+        RemoveTrayIcon();
+        g_isolator.ResumeAllSuspendedThreads();
+        if (g_hSingleInstanceMutex) {
+            CloseHandle(g_hSingleInstanceMutex);
+            g_hSingleInstanceMutex = nullptr;
+        }
+        DestroyWindow(hDlg);
+    }
 }
 
 static bool s_inSizeMove = false;
@@ -2332,7 +2793,7 @@ static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam, L
                         SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
 
                         RECT rcText = rcClient;
-                        rcText.left = cbX + sz.cx + static_cast<int>(4 * scale);
+                        rcText.left = cbX + sz.cx + ScaleI(Layout::kBtnSpacing, scale);
                         DrawTextA(hdc, text, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
                         SelectObject(hdc, oldFont);
@@ -2343,7 +2804,7 @@ static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam, L
 
         // フォールバック: DrawFrameControl
         if (!themeDrawn) {
-            int cbSize = static_cast<int>(13 * scale);
+            int cbSize = ScaleI(Layout::kCheckboxSize, scale);
             int cbX = 0;
             int cbY = (rcClient.bottom - rcClient.top - cbSize) / 2;
             RECT rcBox = { cbX, cbY, cbX + cbSize, cbY + cbSize };
@@ -2360,7 +2821,7 @@ static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam, L
                 SetTextColor(hdc, GetSysColor(COLOR_BTNTEXT));
 
                 RECT rcText = rcClient;
-                rcText.left = cbX + cbSize + static_cast<int>(4 * scale);
+                rcText.left = cbX + cbSize + ScaleI(Layout::kBtnSpacing, scale);
                 DrawTextA(hdc, text, -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
                 SelectObject(hdc, oldFont);
@@ -2397,7 +2858,7 @@ static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam, L
 }
 
 static void UpdateDialogFonts(HWND hDlg, float scale) {
-    int fontHeight = -MulDiv(9, static_cast<int>(96 * scale), 72);
+    int fontHeight = -MulDiv(Layout::kFontPt, ScaleI(96, scale), 72);
     HFONT hNewFont = CreateFontA(
         fontHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
         DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
@@ -2421,10 +2882,6 @@ static void UpdateDialogFonts(HWND hDlg, float scale) {
         }
     }
 
-    if (s_hInPlaceCombo && IsWindow(s_hInPlaceCombo)) {
-        SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(hNewFont), TRUE);
-    }
-
     HWND hChk = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
     if (hChk) {
         InvalidateRect(hChk, nullptr, TRUE);
@@ -2440,22 +2897,15 @@ static void UpdateListViewColumnsDpi(HWND hDlg, float scale) {
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList) return;
 
-    // Col 0〜7: 定数配列からスケール適用
-    int totalCol0To7 = 0;
-    for (int i = 0; i < kColCount - 1; ++i) {
-        int w = ScaleI(kColBaseWidths[i], scale);
-        ListView_SetColumnWidth(hList, i, w);
-        totalCol0To7 += w;
+    const std::vector<int>& widths = (!g_colWidths.empty() && g_colWidths.size() == kColCount) 
+        ? g_colWidths 
+        : std::vector<int>(kColDefaultWidths, kColDefaultWidths + kColCount);
+
+    for (int i = 0; i < kColCount; ++i) {
+        ListView_SetColumnWidth(hList, i, ScaleI(widths[i], scale));
     }
 
-    // Col 8 (Changes): ListView 残幅をフィル (横スクロール防止)
-    RECT rcListCl;
-    GetClientRect(hList, &rcListCl);
-    int listClientW = rcListCl.right - rcListCl.left;
-    int sbW = (GetWindowLongPtrA(hList, GWL_STYLE) & WS_VSCROLL) ? GetSystemMetrics(SM_CXVSCROLL) : 0;
-    int remainW = listClientW - totalCol0To7 - sbW;
-    int changesW = (remainW > 0) ? remainW : 0;
-    ListView_SetColumnWidth(hList, 8, changesW);
+    ShowScrollBar(hList, SB_HORZ, FALSE);
 }
 
 static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
@@ -2464,9 +2914,13 @@ static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
 
     HWND hHeader = ListView_GetHeader(hList);
 
-    // 1. 各カラムの基本幅の合計 (Col 0〜8 全列)
+    // 1. 各カラムの幅の合計 (Col 0〜8 全列)
+    const std::vector<int>& widths = (!g_colWidths.empty() && g_colWidths.size() == kColCount) 
+        ? g_colWidths 
+        : std::vector<int>(kColDefaultWidths, kColDefaultWidths + kColCount);
+
     int totalBaseColW = 0;
-    for (int i = 0; i < kColCount; ++i) totalBaseColW += ScaleI(kColBaseWidths[i], scale);
+    for (int i = 0; i < kColCount; ++i) totalBaseColW += ScaleI(widths[i], scale);
 
     // 2. 登録行数と 1 行あたりの高さ
     int itemCount = ListView_GetItemCount(hList);
@@ -2489,16 +2943,12 @@ static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
 
     int margin = ScaleI(10, scale);
     int rightColW = ScaleI(115, scale);
-    int bottomLegendH = ScaleI(38, scale);
-    int sbW = GetSystemMetrics(SM_CXVSCROLL); // 垂直スクロールバー幅を常に確保
+    int bottomLegendH = ScaleI(18, scale); // ボタン高さ分 (20*scale) 縮小し、旧ステータス余白を排除 (38 -> 18)
+    int sbW = GetSystemMetrics(SM_CXVSCROLL); // 垂直スクロールバー幅
 
     // 登録行数がすべてスクロールバーなしで収まるために必要な ListView 高さ
     int rows = (itemCount > 0) ? itemCount : 5;
     int reqListH = headerH + rows * itemH + ScaleI(4, scale);
-
-    // 必要なクライアント矩形寸法 (垂直スクロールバー幅を加算して横はみ出し防止)
-    int reqClientW = margin + totalBaseColW + sbW + ScaleI(4, scale) + rightColW + margin;
-    int reqClientH = margin + reqListH + bottomLegendH + margin;
 
     // 現在のウィンドウ矩形とクライアント矩形から外枠（ボーダー・タイトルバー）の差分を取得
     RECT rcDlg, rcCl;
@@ -2510,10 +2960,29 @@ static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
     int curClientW = rcCl.right - rcCl.left;
     int curClientH = rcCl.bottom - rcCl.top;
 
-    int newClientW = (curClientW < reqClientW) ? reqClientW : curClientW;
-    int newClientH = (curClientH < reqClientH) ? reqClientH : curClientH;
+    int newClientH = margin + reqListH + bottomLegendH + margin;
 
-    if (curClientW < reqClientW || curClientH < reqClientH) {
+    // INI に WindowHeight が指定されている場合は優先復元
+    if (g_windowHeight > 0) {
+        int customWndH = ScaleI(g_windowHeight, scale);
+        int customClientH = customWndH - borderH;
+        if (customClientH > 0) {
+            newClientH = customClientH;
+        }
+    }
+
+    // ListView に割り当てられる高さ listH から、表示可能行数 n を算出
+    int listH = newClientH - margin - margin - bottomLegendH;
+    int effectiveListH = listH - headerH - ScaleI(4, scale);
+    int n = (itemH > 0 && effectiveListH > 0) ? (effectiveListH / itemH) : 5;
+
+    // 登録アプリ数 > n の場合にのみ縦スクロールバーが出るので、その分ウィンドウ幅を増やす
+    int vScrollW = (itemCount > n) ? sbW : 0;
+
+    // ウィンドウ幅は余白を内容に縮めてジャストフィット (+ 縦スクロールバー分)
+    int newClientW = margin + totalBaseColW + ScaleI(4, scale) + vScrollW + rightColW + margin;
+
+    if (curClientW != newClientW || curClientH != newClientH) {
         int newWndW = newClientW + borderW;
         int newWndH = newClientH + borderH;
         SetWindowPos(hDlg, nullptr, 0, 0, newWndW, newWndH, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
@@ -2523,9 +2992,9 @@ static void AdjustWindowSizeToContent(HWND hDlg, float scale) {
 static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     if (cx <= 0 || cy <= 0) return;
 
-    int margin = static_cast<int>(10 * scale);
-    int rightColW = static_cast<int>(115 * scale);
-    int bottomLegendH = static_cast<int>(38 * scale);
+    int margin = ScaleI(Layout::kMainMargin, scale);
+    int rightColW = ScaleI(Layout::kRightColW, scale);
+    int bottomLegendH = ScaleI(Layout::kBottomLegendH, scale); // ボタン高さ分 (20*scale) 縮小 (38 -> 18)
 
     // 1. ListView のリサイズ
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
@@ -2543,10 +3012,10 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     int panelLeft = cx - margin - rightColW;
     int panelW = rightColW;
 
-    int btnW = static_cast<int>(80 * scale);
-    int btnH = static_cast<int>(20 * scale);
-    int chkW = static_cast<int>(105 * scale);
-    int chkH = static_cast<int>(22 * scale);
+    int btnW = ScaleI(Layout::kBtnW, scale);
+    int btnH = ScaleI(Layout::kBtnH, scale);
+    int chkW = ScaleI(Layout::kChkW, scale);
+    int chkH = ScaleI(Layout::kChkH, scale);
 
     int btnX = panelLeft + (panelW - btnW) / 2;
     int chkX = btnX;
@@ -2557,13 +3026,12 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     if (hChkTop) {
         SetWindowPos(hChkTop, nullptr, chkX, curY, chkW, chkH, SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
     }
-    curY += chkH + static_cast<int>(6 * scale);
+    curY += chkH + ScaleI(Layout::kChkTopPad, scale);
 
-    auto PlaceBtn = [&](int ctrlId) {
+    auto PlaceBtnAt = [&](int ctrlId, int y) {
         HWND hBtn = GetDlgItem(hDlg, ctrlId);
         if (hBtn) {
-            SetWindowPos(hBtn, nullptr, btnX, curY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
-            curY += btnH + static_cast<int>(4 * scale);
+            SetWindowPos(hBtn, nullptr, btnX, y, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
         }
     };
 
@@ -2573,100 +3041,52 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
         ShowWindow(hBtnHide, SW_HIDE);
     }
 
-    // 現状の 12345 のボタン枠を上から順に: EDIT -> ADD -> REMOVE -> なし -> SETTINGS
-    PlaceBtn(IDC_BTN_EDIT);
-    PlaceBtn(IDC_BTN_ADD);
-    PlaceBtn(IDC_BTN_REMOVE);
-    curY += btnH + static_cast<int>(4 * scale); // 枠4: なし (1ボタン分の空き枠)
-    PlaceBtn(IDC_BTN_SETTINGS);
+    // 上部ボタングループ: EDIT -> ADD -> REMOVE
+    int btnSpacing = ScaleI(Layout::kBtnSpacing, scale);
+    int yEdit = curY;
+    int yAdd = yEdit + btnH + btnSpacing;
+    int yRemove = yAdd + btnH + btnSpacing;
 
-    // Exit ボタンは最下部に配置 (SETTINGS との重なり防止)
+    PlaceBtnAt(IDC_BTN_EDIT, yEdit);
+    PlaceBtnAt(IDC_BTN_ADD, yAdd);
+    PlaceBtnAt(IDC_BTN_REMOVE, yRemove);
+
+    // 下部ボタングループ: EXIT は常にクライアント下端から margin 内側
+    int exitY = cy - margin - btnH;
+    if (exitY < margin) exitY = margin;
+
+    // SETTINGS ボタンの配置:
+    // 高さに余裕がある場合は従来の枠4（空きスペース）を保持し、
+    // ウィンドウ高さを縮めた際は EXIT と衝突しないよう空きスペースを自動圧縮して上に追従
+    int defaultSettingsY = yRemove + btnH + btnSpacing + btnH + btnSpacing; // 従来の空き枠込み
+    int maxSettingsY = exitY - btnSpacing - btnH; // EXIT 直上
+    int minSettingsY = yRemove + btnH + btnSpacing; // REMOVE 直下
+
+    int settingsY = defaultSettingsY;
+    if (settingsY > maxSettingsY) {
+        settingsY = maxSettingsY;
+    }
+    if (settingsY < minSettingsY) {
+        settingsY = minSettingsY;
+    }
+    PlaceBtnAt(IDC_BTN_SETTINGS, settingsY);
+
+    // Exit ボタンは最下部に配置し、高さを縮めた場合でも画面外へ押し出されず最前面表示
     HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
-    HWND hBtnSettings = GetDlgItem(hDlg, IDC_BTN_SETTINGS);
     if (hBtnExit) {
-        int exitY = cy - margin - btnH;
-        if (hBtnSettings) {
-            RECT rcSet;
-            GetWindowRect(hBtnSettings, &rcSet);
-            MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcSet), 2);
-            int minExitY = rcSet.bottom + static_cast<int>(6 * scale);
-            if (exitY < minExitY) exitY = minExitY;
-        }
-        SetWindowPos(hBtnExit, nullptr, btnX, exitY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+        SetWindowPos(hBtnExit, HWND_TOP, btnX, exitY, btnW, btnH, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        BringWindowToTop(hBtnExit);
+        InvalidateRect(hBtnExit, nullptr, TRUE);
     }
 }
 
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-    case WM_MEASUREITEM: {
-        LPMEASUREITEMSTRUCT pmis = reinterpret_cast<LPMEASUREITEMSTRUCT>(lParam);
-        if (pmis && pmis->CtlID == IDC_COMBO_INPLACE_PRIO) {
-            float scale = GetDpiScaleForWindow(hDlg);
-            pmis->itemHeight = static_cast<UINT>(20 * scale);
-            return TRUE;
-        }
-        break;
-    }
-
-    case WM_DRAWITEM: {
-        LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
-        if (pdis && pdis->CtlID == IDC_COMBO_INPLACE_PRIO) {
-            if (pdis->itemID == static_cast<UINT>(-1)) return TRUE;
-
-            HDC hdc = pdis->hDC;
-            RECT rc = pdis->rcItem;
-            bool isSelected = (pdis->itemState & ODS_SELECTED) != 0;
-            bool isDisabled = (pdis->itemState & ODS_DISABLED) != 0;
-            bool isComboEdit = (pdis->itemState & ODS_COMBOBOXEDIT) != 0;
-
-            COLORREF bkCol = isDisabled ? GetSysColor(COLOR_BTNFACE) : (isSelected ? GetSysColor(COLOR_HIGHLIGHT) : GetSysColor(COLOR_WINDOW));
-            COLORREF textCol = isDisabled ? GetSysColor(COLOR_GRAYTEXT) : (isSelected ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT));
-
-            HBRUSH hBr = CreateSolidBrush(bkCol);
-            FillRect(hdc, &rc, hBr);
-            DeleteObject(hBr);
-
-            char text[64] = { 0 };
-            SendMessageA(pdis->hwndItem, CB_GETLBTEXT, pdis->itemID, reinterpret_cast<LPARAM>(text));
-
-            HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(pdis->hwndItem, WM_GETFONT, 0, 0));
-            if (!hFont) hFont = reinterpret_cast<HFONT>(SendMessageA(hDlg, WM_GETFONT, 0, 0));
-            if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-            HGDIOBJ oldFont = SelectObject(hdc, hFont);
-
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, textCol);
-
-            float scale = GetDpiScaleForWindow(hDlg);
-            SIZE szSp;
-            GetTextExtentPoint32A(hdc, "  ", 2, &szSp);
-            int extraPx = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px
-            int rightMargin = szSp.cx + extraPx;
-
-            RECT rcText = rc;
-            if (isComboEdit) {
-                rcText.right -= rightMargin;
-            } else {
-                int arrowW = GetSystemMetrics(SM_CXVSCROLL);
-                rcText.right -= (arrowW + rightMargin);
-            }
-            DrawTextA(hdc, text, -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-
-            SelectObject(hdc, oldFont);
-
-            if (pdis->itemState & ODS_FOCUS) {
-                DrawFocusRect(hdc, &rc);
-            }
-            return TRUE;
-        }
-        break;
-    }
-
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.3");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.4");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -2693,51 +3113,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             hList, 
             LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER
         );
-
-        // カラム挿入: 固定 8 列監視専用テーブル
-
-        LVCOLUMNA lvc = { 0 };
-        lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
-
-        int colIdx = 0;
-
-        // カラムヘッダー定義 (列名・書式)
-        static const struct { const char* text; int fmt; } kColDefs[kColCount] = {
-            { "",                 LVCFMT_CENTER }, // 0: !
-            { "Process Name",     LVCFMT_LEFT   }, // 1: Process Name
-            { "Audio",            LVCFMT_CENTER }, // 2: Audio
-            { "Excluded",         LVCFMT_CENTER }, // 3: Excluded
-            { "Audio Core PID/TID", LVCFMT_CENTER }, // 4: PID/TID
-            { "",                 LVCFMT_CENTER }, // 5: || (Pause)
-            { "Priority",         LVCFMT_CENTER }, // 6: Priority
-            { "TIDs",             LVCFMT_CENTER }, // 7: TIDs
-            { "Changes",          LVCFMT_CENTER }, // 8: Changes
-        };
-        for (int i = 0; i < kColCount; ++i) {
-            lvc.fmt = kColDefs[i].fmt;
-            lvc.cx = ScaleI(kColBaseWidths[i], scale);
-            lvc.iSubItem = colIdx;
-            lvc.pszText = const_cast<LPSTR>(kColDefs[i].text);
-            ListView_InsertColumn(hList, colIdx++, &lvc);
-        }
-
-        // カラム挿入後にヘッダー自動調整 (LVSCW_AUTOSIZE_USEHEADER) を適用 (固定幅の Col 0, 1, 5, 6 は除外)
-        for (int i = 0; i < colIdx; ++i) {
-            if (i == 0 || i == 1 || i == 5 || i == 6) {
-                ListView_SetColumnWidth(hList, i, ScaleI(kColBaseWidths[i], scale));
-                continue;
-            }
-            int initialW = ListView_GetColumnWidth(hList, i);
-            ListView_SetColumnWidth(hList, i, LVSCW_AUTOSIZE_USEHEADER);
-            int autoW = ListView_GetColumnWidth(hList, i);
-            if (autoW < initialW) {
-                ListView_SetColumnWidth(hList, i, initialW);
-            } else {
-                ListView_SetColumnWidth(hList, i, autoW + ScaleI(10, scale));
-            }
-        }
-
-        LogDebug(("WM_INITDIALOG: 9 columns inserted, scale=" + std::to_string(scale)).c_str());
+        ShowScrollBar(hList, SB_HORZ, FALSE);
+        EnableScrollBar(hList, SB_HORZ, ESB_DISABLE_BOTH);
 
         g_iniPath = GetIniFilePath();
         LogDebug(("WM_INITDIALOG: iniPath=" + g_iniPath).c_str());
@@ -2745,6 +3122,40 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         ati::GlobalConfig config;
         LoadConfig(config, g_iniPath);
         LogDebug("WM_INITDIALOG: LoadConfig done");
+
+        // カラム挿入: 固定 9 列監視専用テーブル
+        LVCOLUMNA lvc = { 0 };
+        lvc.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT | LVCF_SUBITEM;
+
+        int colIdx = 0;
+
+        // カラムヘッダー定義 (列名・書式)
+        static const struct { const char* text; int fmt; } kColDefs[kColCount] = {
+            { "",                   LVCFMT_CENTER }, // 0: !
+            { "Process Name",       LVCFMT_LEFT   }, // 1: Process Name
+            { "Thread Priority",    LVCFMT_CENTER }, // 2: Thread Priority
+            { "Process Priority",   LVCFMT_CENTER }, // 3: Process Priority
+            { "",                   LVCFMT_CENTER }, // 4: || (Pause)
+            { "Audio Core PID/TID", LVCFMT_CENTER }, // 5: Audio Core PID/TID
+            { "TIDs",               LVCFMT_CENTER }, // 6: TIDs
+            { "Chgs",               LVCFMT_CENTER }, // 7: Chgs
+            { "Audio",              LVCFMT_CENTER }, // 8: Audio
+            { "Excluded",           LVCFMT_CENTER }, // 9: Excluded
+        };
+
+        const std::vector<int>& widths = (!g_colWidths.empty() && g_colWidths.size() == kColCount)
+            ? g_colWidths
+            : std::vector<int>(kColDefaultWidths, kColDefaultWidths + kColCount);
+
+        for (int i = 0; i < kColCount; ++i) {
+            lvc.fmt = kColDefs[i].fmt;
+            lvc.cx = ScaleI(widths[i], scale);
+            lvc.iSubItem = colIdx;
+            lvc.pszText = const_cast<LPSTR>(kColDefs[i].text);
+            ListView_InsertColumn(hList, colIdx++, &lvc);
+        }
+
+        LogDebug(("WM_INITDIALOG: 10 columns inserted, scale=" + std::to_string(scale)).c_str());
 
         // Always on Top の初期状態適用および DPI 追従描画サブクラス化
         HWND hChkTop = GetDlgItem(hDlg, IDC_CHK_ALWAYS_ON_TOP);
@@ -2771,23 +3182,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
         RefreshListView(hList, config.rules);
         LogDebug("WM_INITDIALOG: RefreshListView done");
-
-        // クイックアクセス用インプレース ComboBox の生成
-        s_hInPlaceCombo = CreateWindowExA(
-            0, "COMBOBOX", "",
-            WS_CHILD | CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL,
-            0, 0, 0, 0,
-            hDlg,
-            reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_COMBO_INPLACE_PRIO)),
-            g_hInstance,
-            nullptr
-        );
-        if (s_hInPlaceCombo) {
-            SendMessageA(s_hInPlaceCombo, WM_SETFONT, reinterpret_cast<WPARAM>(s_hMainFont), TRUE);
-            for (int i = 0; i < PRIO_OPTIONS_COUNT; ++i) {
-                SendMessageA(s_hInPlaceCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(PRIO_OPTIONS[i].label));
-            }
-        }
 
         HICON hAppIcon = LoadIconA(g_hInstance, MAKEINTRESOURCEA(IDI_APP_ICON));
         if (hAppIcon) {
@@ -2851,9 +3245,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     }
 
     case WM_SIZE: {
-        if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-            ShowWindow(s_hInPlaceCombo, SW_HIDE);
-            s_inPlaceItemIndex = -1;
+        if (ati::IsPriorityMatrixPickerOpen()) {
+            ati::ClosePriorityMatrixPicker();
         }
         if (wParam == SIZE_MINIMIZED) return TRUE;
         int cx = LOWORD(lParam);
@@ -2880,20 +3273,21 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             GetWindowRect(hList, &rcList);
             MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
 
-            int startY = rcList.bottom + static_cast<int>(4 * scale);
-            int startX = rcList.left + static_cast<int>(4 * scale);
-            int dotSize = static_cast<int>(8 * scale);
+            int startY = rcList.bottom + ScaleI(Layout::kBtnSpacing, scale);
+            int startX = rcList.left + ScaleI(Layout::kBtnSpacing, scale);
+            int dotSize = ScaleI(Layout::kDotSize, scale);
 
-            HFONT hFont = (HFONT)SendMessageA(hDlg, WM_GETFONT, 0, 0);
-            if (!hFont) hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+            HFONT hFont = GetEffectiveFont(hDlg);
             HGDIOBJ oldFont = SelectObject(hdc, hFont);
             SetBkMode(hdc, TRANSPARENT);
             SetTextColor(hdc, RGB(60, 60, 60));
 
-            // 凡例領域の背景を先に塗りつぶし（ListView下端からダイアログ底まで、リサイズ時の残像防止）
+            // 凡例領域の背景を先に塗りつぶし（ListView下端からダイアログ底まで、右パネルボタン領域を侵食しないよう rcList.right までに限定）
             RECT rcClient;
             GetClientRect(hDlg, &rcClient);
-            RECT rcLegendArea = { 0, rcList.bottom, rcClient.right, rcClient.bottom };
+            int legendRight = rcList.right;
+            if (legendRight <= 0) legendRight = rcClient.right - ScaleI(Layout::kRightColW, scale);
+            RECT rcLegendArea = { 0, rcList.bottom, legendRight, rcClient.bottom };
             FillRect(hdc, &rcLegendArea, GetSysColorBrush(COLOR_BTNFACE));
 
             // 1行目: カラー凡例 4種 (左寄せ配置: 1: Half-Isolated, 2: Fully Isolated, 3: Standby / Scanning, 4: Sleeping (Restart))
@@ -2906,10 +3300,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             GetTextExtentPoint32A(hdc, txt2.c_str(), static_cast<int>(txt2.length()), &sz2);
             GetTextExtentPoint32A(hdc, txt3.c_str(), static_cast<int>(txt3.length()), &sz3);
             GetTextExtentPoint32A(hdc, txt4.c_str(), static_cast<int>(txt4.length()), &sz4);
-            int spacing = static_cast<int>(12 * scale);
-            int legendStartX = rcList.left + static_cast<int>(4 * scale);
+            int spacing = ScaleI(Layout::kLegendSpacing, scale);
+            int legendStartX = rcList.left + ScaleI(Layout::kBtnSpacing, scale);
 
-            int dotY = startY + static_cast<int>(3 * scale);
+            int dotY = startY + ScaleI(3, scale);
 
             bool anyRunning = false;
             auto rules = g_isolator.GetRulesSnapshot();
@@ -3045,7 +3439,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         GetWindowRect(hList, &rcList);
                         MapWindowPoints(HWND_DESKTOP, hDlg, reinterpret_cast<LPPOINT>(&rcList), 2);
                         float scale = GetDpiScaleForWindow(hDlg);
-                        RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + static_cast<int>(20 * scale) };
+                        RECT rcStatus = { rcList.left, rcList.bottom, rcList.right, rcList.bottom + ScaleI(Layout::kBtnH, scale) };
                         InvalidateRect(hDlg, &rcStatus, FALSE);
                     }
                 }
@@ -3084,58 +3478,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             return TRUE;
         }
 
-        else if (cmdId == IDC_COMBO_INPLACE_PRIO) {
-            WORD notif = HIWORD(wParam);
-            auto ApplyChange = [&]() {
-                LogDebug(("ApplyChange called: s_inPlaceItemIndex=" + std::to_string(s_inPlaceItemIndex)).c_str());
-                if (s_hInPlaceCombo && s_inPlaceItemIndex >= 0) {
-                    int sel = static_cast<int>(SendMessageA(s_hInPlaceCombo, CB_GETCURSEL, 0, 0));
-                    LogDebug(("ApplyChange: sel=" + std::to_string(sel)).c_str());
-                    if (sel >= 0 && sel < PRIO_OPTIONS_COUNT) {
-                        int newPrio = PRIO_OPTIONS[sel].value;
-                        LogDebug(("ApplyChange: newPrio=" + std::to_string(newPrio)).c_str());
-                        auto config = g_isolator.GetConfig();
-                        if (static_cast<size_t>(s_inPlaceItemIndex) < config.rules.size()) {
-                            config.rules[s_inPlaceItemIndex].audioPriority = newPrio;
-                            g_isolator.UpdateConfig(config);
-
-                            // 即時再隔離・スキャン実行 (稼働中スレッドへ即時反映)
-                            g_isolator.ScanAndIsolate();
-
-                            // リストビュー表示を即時更新
-                            HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-                            auto updated = g_isolator.GetRulesSnapshot();
-                            UpdateListViewDynamic(hList, updated);
-                            InvalidateRect(hList, nullptr, FALSE);
-                        }
-                    }
-                }
-            };
-
-            if (notif == CBN_SELCHANGE || notif == CBN_SELENDOK) {
-                LogDebug(("InPlaceCombo: SELCHANGE/SELENDOK (notif=" + std::to_string(notif) + ")").c_str());
-                s_inPlaceCancelled = false;
-                ApplyChange();
-                return TRUE;
-            } else if (notif == CBN_SELENDCANCEL) {
-                LogDebug("InPlaceCombo: SELENDCANCEL");
-                s_inPlaceCancelled = true;
-                return TRUE;
-            } else if (notif == CBN_CLOSEUP) {
-                LogDebug(("InPlaceCombo: CLOSEUP (cancelled=" + std::to_string(s_inPlaceCancelled ? 1 : 0) + ")").c_str());
-                if (!s_inPlaceCancelled) {
-                    ApplyChange();
-                }
-                if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                    ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                    s_inPlaceItemIndex = -1;
-                    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-                    if (hList) InvalidateRect(hList, nullptr, FALSE);
-                }
-                return TRUE;
-            }
-            return TRUE;
-        }
         else if (cmdId == IDC_BTN_HIDE || cmdId == IDCANCEL) {
             LogDebug("MainDlg: Hiding window (IDC_BTN_HIDE or IDCANCEL)");
             ShowWindow(hDlg, SW_HIDE);
@@ -3182,25 +3524,29 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 SaveConfig(updated, g_iniPath);
                 HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
                 RefreshListView(hList, updated.rules);
+                AdjustWindowSizeToContent(hDlg, GetDpiScaleForWindow(hDlg));
             }
             return TRUE;
         }
         else if (cmdId == IDC_BTN_REMOVE) {
             HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
             int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
-            if (sel >= 0) {
-                g_isolator.RemoveRule(static_cast<size_t>(sel));
+            if (sel >= 0 && static_cast<size_t>(sel) < g_displayRows.size()) {
+                size_t ruleIdx = g_displayRows[sel].ruleIndex;
+                g_isolator.RemoveRule(ruleIdx);
                 auto updated = g_isolator.GetConfig();
                 SaveConfig(updated, g_iniPath);
                 RefreshListView(hList, updated.rules);
+                AdjustWindowSizeToContent(hDlg, GetDpiScaleForWindow(hDlg));
             }
             return TRUE;
         }
         else if (cmdId == IDC_BTN_EDIT) {
             HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
             int sel = ListView_GetNextItem(hList, -1, LVNI_SELECTED);
-            if (sel >= 0) {
-                OpenRuleEditDialog(hDlg, static_cast<size_t>(sel));
+            if (sel >= 0 && static_cast<size_t>(sel) < g_displayRows.size()) {
+                size_t ruleIdx = g_displayRows[sel].ruleIndex;
+                OpenRuleEditDialog(hDlg, ruleIdx);
             }
             return TRUE;
         }
@@ -3224,6 +3570,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             RestartApplication(hDlg);
             return TRUE;
         }
+        else if (cmdId == ID_TRAY_RESTART_ADMIN) {
+            RestartAsAdmin(hDlg);
+            return TRUE;
+        }
         break;
     }
 
@@ -3232,14 +3582,16 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
         if (pnm && pnm->idFrom == IDC_LIST_PROCESSES) {
             if (pnm->code == NM_DBLCLK) {
-                if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                    ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                    s_inPlaceItemIndex = -1;
+                if (ati::IsPriorityMatrixPickerOpen()) {
+                    ati::ClosePriorityMatrixPicker();
                 }
                 LPNMITEMACTIVATE pia = reinterpret_cast<LPNMITEMACTIVATE>(lParam);
-                if (pia && pia->iItem >= 0) {
-                    OpenRuleEditDialog(hDlg, static_cast<size_t>(pia->iItem));
-                    return TRUE;
+                if (pia && pia->iItem >= 0 && pia->iSubItem != 2 && pia->iSubItem != 3 && pia->iSubItem != 4 && pia->iSubItem != 5) {
+                    size_t rowIdx = static_cast<size_t>(pia->iItem);
+                    if (rowIdx < g_displayRows.size()) {
+                        OpenRuleEditDialog(hDlg, g_displayRows[rowIdx].ruleIndex);
+                        return TRUE;
+                    }
                 }
             } else if (pnm->code == NM_CLICK) {
                 HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
@@ -3249,81 +3601,116 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 ListView_SubItemHitTest(hList, &lvhti);
 
                 if (lvhti.iItem >= 0 && lvhti.iSubItem == 0) {
-                    if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                        ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                        s_inPlaceItemIndex = -1;
+                    if (ati::IsPriorityMatrixPickerOpen()) {
+                        ati::ClosePriorityMatrixPicker();
                     }
-                    auto rules = g_isolator.GetRulesSnapshot();
-                    if (lvhti.iItem < static_cast<int>(rules.size())) {
-                        const auto& targetRule = rules[lvhti.iItem];
+                    size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+                    if (rowIdx < g_displayRows.size()) {
+                        size_t ruleIdx = g_displayRows[rowIdx].ruleIndex;
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (ruleIdx < rules.size()) {
+                            const auto& targetRule = rules[ruleIdx];
 
-                        // sleeping... 状態のナッジ点滅 ● クリック時: bypass 解除時と同様に探索を即時リスタート
-                        if (targetRule.isRunning && !targetRule.isBypassed && targetRule.detectedThreadName == "sleeping...") {
-                            g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
-                            g_isolator.ScanAndIsolate();
-                            auto updatedRules = g_isolator.GetRulesSnapshot();
-                            UpdateListViewDynamic(hList, updatedRules);
-                            InvalidateRect(hList, nullptr, FALSE);
+                            // sleeping... 状態のナッジ点滅 ● クリック時: bypass 解除時と同様に探索を即時リスタート
+                            const auto& dr = g_displayRows[rowIdx];
+                            if (targetRule.isRunning && !targetRule.isBypassed) {
+                                if (targetRule.ignoreSig && targetRule.ignoreSigCount > 1) {
+                                    bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size());
+                                    if (!isSlotConfirmed && targetRule.multiSearchSleeping) {
+                                        g_isolator.ResumeMultiSearch(ruleIdx);
+                                        g_isolator.ScanAndIsolate();
+                                        auto updatedRules = g_isolator.GetRulesSnapshot();
+                                        UpdateListViewDynamic(hList, updatedRules);
+                                        InvalidateRect(hList, nullptr, FALSE);
+                                        return TRUE;
+                                    }
+                                } else if (targetRule.detectedThreadName == "sleeping...") {
+                                    g_isolator.RestartSearch(ruleIdx);
+                                    g_isolator.ScanAndIsolate();
+                                    auto updatedRules = g_isolator.GetRulesSnapshot();
+                                    UpdateListViewDynamic(hList, updatedRules);
+                                    InvalidateRect(hList, nullptr, FALSE);
+                                    return TRUE;
+                                }
+                            }
+
+                            // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
+                            // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
+                            // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
+                            {
+                                bool wasRunning = targetRule.isRunning;
+                                g_isolator.ToggleProcessBypass(ruleIdx);
+                                SaveConfig(g_isolator.GetConfig(), g_iniPath);
+
+                                // 起動中の Bypass 解除時は直ちにアイソレーターを即時実行
+                                if (wasRunning) {
+                                    g_isolator.ScanAndIsolate();
+                                }
+
+                                auto updatedRules = g_isolator.GetRulesSnapshot();
+                                UpdateListViewDynamic(hList, updatedRules);
+                                InvalidateRect(hList, nullptr, FALSE);
+                            }
                             return TRUE;
                         }
-
-                        // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass 切替
-                        // ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示
-                        // ☑ 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
-                        {
-                            bool wasRunning = targetRule.isRunning;
-                            g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
-                            SaveConfig(g_isolator.GetConfig(), g_iniPath);
-
-                            // 起動中の Bypass 解除時は直ちにアイソレーターを即時実行
-                            if (wasRunning) {
-                                g_isolator.ScanAndIsolate();
-                            }
-
-                            auto updatedRules = g_isolator.GetRulesSnapshot();
-                            UpdateListViewDynamic(hList, updatedRules);
-                            InvalidateRect(hList, nullptr, FALSE);
-                        }
-                        return TRUE;
                     }
                 } else if (lvhti.iItem >= 0 && lvhti.iSubItem == 4) {
-                    // Col 4 (Audio Core PID/TID 列):
-                    // - sleeping... 状態時: bypass 解除時と同様に探索を即時リスタート
-                    // - Standby (稼働) 状態時: Bypass へ切り替え、! カラムに ☑ を表示
-                    if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                        ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                        s_inPlaceItemIndex = -1;
+                    // Col 4: Pause / Verify (一時停止・検証チェックボックス - 個別TID対応)
+                    if (ati::IsPriorityMatrixPickerOpen()) {
+                        ati::ClosePriorityMatrixPicker();
                     }
-                    auto rules = g_isolator.GetRulesSnapshot();
-                    if (lvhti.iItem < static_cast<int>(rules.size())) {
-                        const auto& targetRule = rules[lvhti.iItem];
-                        if (targetRule.detectedThreadName == "sleeping...") {
-                            g_isolator.RestartSearch(static_cast<size_t>(lvhti.iItem));
-                            g_isolator.ScanAndIsolate();
-                        } else {
-                            bool wasRunning = targetRule.isRunning;
-                            g_isolator.ToggleProcessBypass(static_cast<size_t>(lvhti.iItem));
-                            SaveConfig(g_isolator.GetConfig(), g_iniPath);
-                            if (wasRunning && targetRule.isBypassed) {
-                                // Bypass 解除時は直ちにスキャン実行
-                                g_isolator.ScanAndIsolate();
+                    size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+                    if (rowIdx < g_displayRows.size()) {
+                        const auto& dr = g_displayRows[rowIdx];
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (dr.ruleIndex < rules.size()) {
+                            const auto& targetRule = rules[dr.ruleIndex];
+                            if (targetRule.isRunning && dr.tid != 0) {
+                                g_isolator.ToggleSuspendAudioThread(dr.ruleIndex, dr.tid);
+                                auto updatedRules = g_isolator.GetRulesSnapshot();
+                                UpdateListViewDynamic(hList, updatedRules);
+                                InvalidateRect(hList, nullptr, FALSE);
+                                return TRUE;
                             }
                         }
-                        auto updatedRules = g_isolator.GetRulesSnapshot();
-                        UpdateListViewDynamic(hList, updatedRules);
-                        InvalidateRect(hList, nullptr, FALSE);
-                        return TRUE;
                     }
                 } else if (lvhti.iItem >= 0 && lvhti.iSubItem == 5) {
-                    if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                        ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                        s_inPlaceItemIndex = -1;
+                    // Col 5 (Audio Core PID/TID 列):
+                    // - sleeping... 状態時: bypass 解除時と同様に探索を即時リスタート
+                    // - Standby (稼働) 状態時: Bypass へ切り替え、! カラムに ☑ を表示
+                    if (ati::IsPriorityMatrixPickerOpen()) {
+                        ati::ClosePriorityMatrixPicker();
                     }
-                    auto rules = g_isolator.GetRulesSnapshot();
-                    if (lvhti.iItem < static_cast<int>(rules.size())) {
-                        const auto& targetRule = rules[lvhti.iItem];
-                        if (targetRule.isRunning && targetRule.activeAudioTid != 0) {
-                            g_isolator.ToggleSuspendAudioThread(static_cast<size_t>(lvhti.iItem));
+                    size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+                    if (rowIdx < g_displayRows.size()) {
+                        size_t ruleIdx = g_displayRows[rowIdx].ruleIndex;
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (ruleIdx < rules.size()) {
+                            const auto& targetRule = rules[ruleIdx];
+                            bool isHandled = false;
+                            if (targetRule.ignoreSig && targetRule.ignoreSigCount > 1) {
+                                const auto& dr = g_displayRows[rowIdx];
+                                bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size());
+                                if (!isSlotConfirmed && targetRule.multiSearchSleeping) {
+                                    g_isolator.ResumeMultiSearch(ruleIdx);
+                                    g_isolator.ScanAndIsolate();
+                                    isHandled = true;
+                                }
+                            }
+                            if (!isHandled) {
+                                if (targetRule.detectedThreadName == "sleeping...") {
+                                    g_isolator.RestartSearch(ruleIdx);
+                                    g_isolator.ScanAndIsolate();
+                                } else {
+                                    bool wasRunning = targetRule.isRunning;
+                                    g_isolator.ToggleProcessBypass(ruleIdx);
+                                    SaveConfig(g_isolator.GetConfig(), g_iniPath);
+                                    if (wasRunning && targetRule.isBypassed) {
+                                        // Bypass 解除時は直ちにスキャン実行
+                                        g_isolator.ScanAndIsolate();
+                                    }
+                                }
+                            }
                             auto updatedRules = g_isolator.GetRulesSnapshot();
                             UpdateListViewDynamic(hList, updatedRules);
                             InvalidateRect(hList, nullptr, FALSE);
@@ -3331,9 +3718,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         }
                     }
                 } else {
-                    if (s_hInPlaceCombo && IsWindowVisible(s_hInPlaceCombo)) {
-                        ShowWindow(s_hInPlaceCombo, SW_HIDE);
-                        s_inPlaceItemIndex = -1;
+                    if (ati::IsPriorityMatrixPickerOpen()) {
+                        ati::ClosePriorityMatrixPicker();
                     }
                 }
             } else if (pnm->code == NM_CUSTOMDRAW) {
@@ -3360,89 +3746,162 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
 
                     if (plvcd->iSubItem == 0) {
                         auto rules = g_isolator.GetRulesSnapshot();
-                        if (row >= 0 && row < static_cast<int>(rules.size())) {
-                            const auto& r = rules[row];
-                            RECT rcSub;
-                            ListView_GetSubItemRect(hList, row, 0, LVIR_BOUNDS, &rcSub);
-                            // Windows の SysListView32 仕様上、iSubItem == 0 で LVIR_BOUNDS を指定すると行全体の幅が返るため、
-                            // Col 0 の正確な右端座標は ListView_GetColumnWidth(hList, 0) で補正する。
-                            int col0W = ListView_GetColumnWidth(hList, 0);
-                            rcSub.right = rcSub.left + col0W;
-
-                            HDC hdc = plvcd->nmcd.hdc;
-
-                            // 背景のクリア (ゼブラ配色または行選択状態に応じて背景色を描画)
-                            HBRUSH hBkBrush = (state & LVIS_SELECTED) 
-                                ? GetSysColorBrush(COLOR_HIGHLIGHT) 
-                                : CreateSolidBrush(rowBkCol);
-                            FillRect(hdc, &rcSub, hBkBrush);
-                            if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
-
-                            int cellW = rcSub.right - rcSub.left;
-                            int cellH = rcSub.bottom - rcSub.top;
-                            float scale = GetDpiScaleForWindow(hDlg);
-
-                            if (r.isRunning && !r.isBypassed) {
-                                // 起動中（稼働中）: チェックボックスの位置（セル中央）に丸印インジケーターを描画
-                                int dotSize = static_cast<int>(10 * scale);
-                                if (dotSize > cellH - 4) dotSize = cellH - 4;
-                                if (dotSize < 6) dotSize = 6;
-
-                                int dotX = rcSub.left + (cellW - dotSize) / 2;
-                                int dotY = rcSub.top + (cellH - dotSize) / 2;
-
-                                COLORREF col;
-                                if (r.isAudioIsolated) {
-                                    if (r.hasIntruderThreads) {
-                                        // 侵入・同居スレッド制圧中: 鈍い黄色と青緑をパカパカ交互点滅 (Half-Isolated)
-                                        col = s_pulseTick ? RGB(124, 224, 173) : RGB(216, 178, 76);
-                                    } else {
-                                        // 通常の隔離完了: 青緑 #7CE0AD (Fully Isolated)
-                                        col = s_pulseTick ? RGB(124, 224, 173) : RGB(111, 201, 155);
-                                    }
-                                } else if (r.detectedThreadName == "sleeping...") {
-                                    // スリープ休眠中 (再生＆リスタートのナッジ): 薄紫と (255, 80, 120) でパカパカ点滅
-                                    col = s_pulseTick ? RGB(255, 80, 120) : RGB(190, 160, 235);
-                                } else {
-                                    // 未特定 (Standby / Scanning): コーラルピンク #E09B97
-                                    col = s_pulseTick ? RGB(224, 155, 151) : RGB(201, 139, 135);
-                                }
-
-                                HBRUSH hBr = CreateSolidBrush(col);
-                                HPEN hPen = CreatePen(PS_SOLID, 1, col);
-                                HGDIOBJ oldBrush = SelectObject(hdc, hBr);
-                                HGDIOBJ oldPen = SelectObject(hdc, hPen);
-                                Ellipse(hdc, dotX, dotY, dotX + dotSize, dotY + dotSize);
-                                SelectObject(hdc, oldPen);
-                                SelectObject(hdc, oldBrush);
-                                DeleteObject(hPen);
-                                DeleteObject(hBr);
-                            } else {
-                                // 未起動時 (または起動中監視除外時): セル中央にチェックボックス (☐ または ☑) を描画
-                                int cbSize = static_cast<int>(13 * scale);
-                                int cbX = rcSub.left + (cellW - cbSize) / 2;
-                                int cbY = rcSub.top + (cellH - cbSize) / 2;
-                                RECT rcCb = { cbX, cbY, cbX + cbSize, cbY + cbSize };
-                                UINT uState = DFCS_BUTTONCHECK | (r.isBypassed ? DFCS_CHECKED : 0);
-                                DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
-                            }
-
-                            SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                            return TRUE;
-                        }
-                    } else if (plvcd->iSubItem == 3) {
-                        // Col 3 (Other than 列): 稼働中かつ監視通常の場合、退避済みであるため先頭の '!' を赤太字で描画
-                        auto rules = g_isolator.GetRulesSnapshot();
-                        if (row >= 0 && row < static_cast<int>(rules.size())) {
-                            const auto& r = rules[row];
-                            if (r.isRunning && !r.isBypassed) {
+                        if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
+                            const auto& dr = g_displayRows[row];
+                            if (dr.ruleIndex < rules.size()) {
+                                const auto& r = rules[dr.ruleIndex];
                                 RECT rcSub;
-                                ListView_GetSubItemRect(hList, row, 3, LVIR_BOUNDS, &rcSub);
+                                ListView_GetSubItemRect(hList, row, 0, LVIR_BOUNDS, &rcSub);
+                                int col0W = ListView_GetColumnWidth(hList, 0);
+                                rcSub.right = rcSub.left + col0W;
+
                                 HDC hdc = plvcd->nmcd.hdc;
 
-                                // クリッピング領域をセル矩形内に限定（隣接カラムへの文字漏れを防止）
-                                HRGN hClip = CreateRectRgn(rcSub.left, rcSub.top, rcSub.right, rcSub.bottom);
-                                SelectClipRgn(hdc, hClip);
+                                // 背景のクリア
+                                HBRUSH hBkBrush = (state & LVIS_SELECTED) 
+                                    ? GetSysColorBrush(COLOR_HIGHLIGHT) 
+                                    : CreateSolidBrush(rowBkCol);
+                                FillRect(hdc, &rcSub, hBkBrush);
+                                if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+
+                                int cellW = rcSub.right - rcSub.left;
+                                int cellH = rcSub.bottom - rcSub.top;
+                                float scale = GetDpiScaleForWindow(hDlg);
+
+                                if (r.isRunning && !r.isBypassed) {
+                                    // 起動中（稼働中）: 丸印インジケーターを描画
+                                    int dotSize = ScaleI(10, scale);
+                                    if (dotSize > cellH - 4) dotSize = cellH - 4;
+                                    if (dotSize < 6) dotSize = 6;
+
+                                    int dotX = rcSub.left + (cellW - dotSize) / 2;
+                                    int dotY = rcSub.top + (cellH - dotSize) / 2;
+
+                                    COLORREF col;
+                                    if (r.ignoreSig && r.ignoreSigCount > 1) {
+                                        bool isSlotConfirmed = (dr.subIndex < r.activeAudioTids.size());
+                                        if (isSlotConfirmed) {
+                                            if (r.hasIntruderThreads) {
+                                                col = s_pulseTick ? RGB(124, 224, 173) : RGB(216, 178, 76);
+                                            } else {
+                                                col = s_pulseTick ? RGB(124, 224, 173) : RGB(111, 201, 155);
+                                            }
+                                        } else if (r.multiSearchSleeping) {
+                                            col = s_pulseTick ? RGB(255, 80, 120) : RGB(190, 160, 235);
+                                        } else {
+                                            col = s_pulseTick ? RGB(224, 155, 151) : RGB(201, 139, 135);
+                                        }
+                                    } else {
+                                        if (r.isAudioIsolated) {
+                                            if (r.hasIntruderThreads) {
+                                                col = s_pulseTick ? RGB(124, 224, 173) : RGB(216, 178, 76);
+                                            } else {
+                                                col = s_pulseTick ? RGB(124, 224, 173) : RGB(111, 201, 155);
+                                            }
+                                        } else if (r.detectedThreadName == "sleeping...") {
+                                            col = s_pulseTick ? RGB(255, 80, 120) : RGB(190, 160, 235);
+                                        } else {
+                                            col = s_pulseTick ? RGB(224, 155, 151) : RGB(201, 139, 135);
+                                        }
+                                    }
+
+                                    HBRUSH hBr = CreateSolidBrush(col);
+                                    HPEN hPen = CreatePen(PS_SOLID, 1, col);
+                                    HGDIOBJ oldBrush = SelectObject(hdc, hBr);
+                                    HGDIOBJ oldPen = SelectObject(hdc, hPen);
+                                    Ellipse(hdc, dotX, dotY, dotX + dotSize, dotY + dotSize);
+                                    SelectObject(hdc, oldPen);
+                                    SelectObject(hdc, oldBrush);
+                                    DeleteObject(hPen);
+                                    DeleteObject(hBr);
+                                } else if (dr.subIndex == 0) {
+                                    // 未起動時 (親行のみチェックボックス描画)
+                                    int cbSize = ScaleI(Layout::kCheckboxSize, scale);
+                                    int cbX = rcSub.left + (cellW - cbSize) / 2;
+                                    int cbY = rcSub.top + (cellH - cbSize) / 2;
+                                    RECT rcCb = { cbX, cbY, cbX + cbSize, cbY + cbSize };
+                                    UINT uState = DFCS_BUTTONCHECK | (r.isBypassed ? DFCS_CHECKED : 0);
+                                    DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
+                                }
+
+                                SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                                return TRUE;
+                            }
+                        }
+                    } else if (plvcd->iSubItem == 1) {
+                        // Col 1: Process Name (2行目以降は GDI ペンによる「└」L 字ツリー線 + プロセス名を描画)
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
+                            const auto& dr = g_displayRows[row];
+                            if (dr.ruleIndex < rules.size()) {
+                                const auto& r = rules[dr.ruleIndex];
+                                RECT rcSub;
+                                ListView_GetSubItemRect(hList, row, 1, LVIR_BOUNDS, &rcSub);
+                                HDC hdc = plvcd->nmcd.hdc;
+                                float scale = GetDpiScaleForWindow(hDlg);
+
+                                // 背景塗りつぶし
+                                HBRUSH hBkBrush = (state & LVIS_SELECTED) 
+                                    ? GetSysColorBrush(COLOR_HIGHLIGHT) 
+                                    : CreateSolidBrush(rowBkCol);
+                                FillRect(hdc, &rcSub, hBkBrush);
+                                if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+
+                                std::string procName = StripExeExtension(r.processName);
+                                HFONT hFont = GetEffectiveFont(hList);
+                                HGDIOBJ oldFont = SelectObject(hdc, hFont);
+                                SetBkMode(hdc, TRANSPARENT);
+                                COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
+                                SetTextColor(hdc, textCol);
+
+                                int cellH = rcSub.bottom - rcSub.top;
+                                int startX = rcSub.left + ScaleI(6, scale);
+
+                                if (dr.subIndex > 0) {
+                                    // 2行目以降: GDI ペンによる「└」L 字ツリー線描画 (高 DPI・多言語完全両立)
+                                    int penW = (std::max)(1, ScaleI(1, scale));
+                                    COLORREF lineColor = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : RGB(140, 140, 140);
+                                    HPEN hPen = CreatePen(PS_SOLID, penW, lineColor);
+                                    HGDIOBJ oldPen = SelectObject(hdc, hPen);
+
+                                    int treeX = rcSub.left + ScaleI(8, scale);
+                                    int treeMidY = rcSub.top + cellH / 2;
+                                    int armW = ScaleI(8, scale);
+
+                                    // 縦線: セル上端 (rcSub.top) から中央 (treeMidY) まで
+                                    MoveToEx(hdc, treeX, rcSub.top, nullptr);
+                                    LineTo(hdc, treeX, treeMidY + penW);
+
+                                    // 横線: 縦線交点 (treeX) から右へ armW まで
+                                    MoveToEx(hdc, treeX, treeMidY, nullptr);
+                                    LineTo(hdc, treeX + armW, treeMidY);
+
+                                    SelectObject(hdc, oldPen);
+                                    DeleteObject(hPen);
+
+                                    startX = treeX + armW + ScaleI(4, scale);
+                                }
+
+                                RECT rcText = rcSub;
+                                rcText.left = startX;
+                                rcText.right = rcSub.right - ScaleI(4, scale);
+                                DrawTextA(hdc, procName.c_str(), -1, &rcText, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+                                SelectObject(hdc, oldFont);
+                                SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                                return TRUE;
+                            }
+                        }
+                    } else if (plvcd->iSubItem == 2 || plvcd->iSubItem == 3) {
+                        // Col 2: Thread Priority / Col 3: Process Priority (右詰め + 半角SP2個 + 4px[200%時]の余白)
+                        auto rules = g_isolator.GetRulesSnapshot();
+                        if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
+                            const auto& dr = g_displayRows[row];
+                            if (dr.ruleIndex < rules.size()) {
+                                RECT rcSub;
+                                ListView_GetSubItemRect(hList, row, plvcd->iSubItem, LVIR_BOUNDS, &rcSub);
+                                HDC hdc = plvcd->nmcd.hdc;
+                                float scale = GetDpiScaleForWindow(hDlg);
 
                                 HBRUSH hBkBrush = (state & LVIS_SELECTED) 
                                     ? GetSysColorBrush(COLOR_HIGHLIGHT) 
@@ -3451,135 +3910,143 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                 if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
 
                                 char txtBuf[64] = { 0 };
-                                ListView_GetItemText(hList, row, 3, txtBuf, sizeof(txtBuf));
+                                ListView_GetItemText(hList, row, plvcd->iSubItem, txtBuf, sizeof(txtBuf));
                                 std::string text(txtBuf);
 
                                 if (!text.empty()) {
-                                    HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hList, WM_GETFONT, 0, 0));
-                                    if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
+                                    HFONT hFont = GetEffectiveFont(hList);
                                     HGDIOBJ oldFont = SelectObject(hdc, hFont);
                                     SetBkMode(hdc, TRANSPARENT);
 
-                                    SIZE szTotal;
-                                    GetTextExtentPoint32A(hdc, text.c_str(), static_cast<int>(text.length()), &szTotal);
-                                    int cellW = rcSub.right - rcSub.left;
-                                    // セル幅に収まる場合は中央揃え、溢れる場合は左端 (rcSub.left + 4) にクランプして左列への突き抜けを防止
-                                    int startX = (szTotal.cx < cellW) ? (rcSub.left + (cellW - szTotal.cx) / 2) : (rcSub.left + 4);
-                                    int startY = rcSub.top + (rcSub.bottom - rcSub.top - szTotal.cy) / 2;
+                                    COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
+                                    SetTextColor(hdc, textCol);
 
-                                    if (text[0] == '!') {
-                                        LOGFONTA lf = { 0 };
-                                        GetObjectA(hFont, sizeof(lf), &lf);
-                                        lf.lfWeight = FW_BOLD;
-                                        HFONT hBold = CreateFontIndirectA(&lf);
-                                        SelectObject(hdc, hBold);
-                                        SetTextColor(hdc, RGB(220, 50, 50)); // 鮮やかな赤
-                                        TextOutA(hdc, startX, startY, "!", 1);
+                                    SIZE szSp;
+                                    GetTextExtentPoint32A(hdc, "  ", 2, &szSp);
+                                    int extraPx = ScaleI(2, scale); // 200%環境で4px
+                                    int rightMargin = szSp.cx + extraPx;
 
-                                        SIZE szEx;
-                                        GetTextExtentPoint32A(hdc, "!", 1, &szEx);
-                                        SelectObject(hdc, hFont);
-                                        DeleteObject(hBold);
-
-                                        COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
-                                        SetTextColor(hdc, textCol);
-                                        TextOutA(hdc, startX + szEx.cx, startY, text.c_str() + 1, static_cast<int>(text.length() - 1));
-                                    } else {
-                                        COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
-                                        SetTextColor(hdc, textCol);
-                                        TextOutA(hdc, startX, startY, text.c_str(), static_cast<int>(text.length()));
-                                    }
+                                    RECT rcText = rcSub;
+                                    rcText.right -= rightMargin;
+                                    DrawTextA(hdc, text.c_str(), -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
 
                                     SelectObject(hdc, oldFont);
                                 }
-
-                                // クリッピング解除
-                                SelectClipRgn(hdc, NULL);
-                                DeleteObject(hClip);
 
                                 SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
                                 return TRUE;
                             }
                         }
-                    } else if (plvcd->iSubItem == 5) {
-                        // Col 5: Pause / Verify (一時停止・検証チェックボックス)
+                    } else if (plvcd->iSubItem == 4) {
+                        // Col 4: Pause / Verify (一時停止・検証チェックボックス - 個別TID対応)
                         auto rules = g_isolator.GetRulesSnapshot();
-                        if (row >= 0 && row < static_cast<int>(rules.size())) {
-                            const auto& r = rules[row];
-                            RECT rcSub;
-                            ListView_GetSubItemRect(hList, row, 5, LVIR_BOUNDS, &rcSub);
-                            HDC hdc = plvcd->nmcd.hdc;
-                            float scale = GetDpiScaleForWindow(hDlg);
-                            int cellW = rcSub.right - rcSub.left;
-                            int cellH = rcSub.bottom - rcSub.top;
+                        if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
+                            const auto& dr = g_displayRows[row];
+                            if (dr.ruleIndex < rules.size()) {
+                                const auto& r = rules[dr.ruleIndex];
+                                bool isSusp = g_isolator.IsAudioThreadSuspended(dr.ruleIndex, dr.tid);
 
-                            // 背景塗りつぶし (一時停止中は注意を促す薄赤ハイライト、通常時は行背景色)
-                            COLORREF cellBkCol = (r.isAudioThreadSuspended) ? RGB(255, 230, 230) : rowBkCol;
-                            HBRUSH hBkBrush = (state & LVIS_SELECTED) 
-                                ? GetSysColorBrush(COLOR_HIGHLIGHT) 
-                                : CreateSolidBrush(cellBkCol);
-                            FillRect(hdc, &rcSub, hBkBrush);
-                            if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+                                RECT rcSub;
+                                ListView_GetSubItemRect(hList, row, 4, LVIR_BOUNDS, &rcSub);
+                                HDC hdc = plvcd->nmcd.hdc;
+                                float scale = GetDpiScaleForWindow(hDlg);
+                                int cellW = rcSub.right - rcSub.left;
+                                int cellH = rcSub.bottom - rcSub.top;
 
-                            // セル中央にチェックボックス (☐ または ☑) を描画
-                            int cbSize = static_cast<int>(13 * scale);
-                            int cbX = rcSub.left + (cellW - cbSize) / 2;
-                            int cbY = rcSub.top + (cellH - cbSize) / 2;
-                            RECT rcCb = { cbX, cbY, cbX + cbSize, cbY + cbSize };
-                            UINT uState = DFCS_BUTTONCHECK;
-                            if (!r.isRunning || r.activeAudioTid == 0) {
-                                uState |= DFCS_INACTIVE;
-                            } else if (r.isAudioThreadSuspended) {
-                                uState |= DFCS_CHECKED;
+                                // 背景塗りつぶし (一時停止中は注意を促す薄赤ハイライト、通常時は行背景色)
+                                COLORREF cellBkCol = isSusp ? RGB(255, 230, 230) : rowBkCol;
+                                HBRUSH hBkBrush = (state & LVIS_SELECTED) 
+                                    ? GetSysColorBrush(COLOR_HIGHLIGHT) 
+                                    : CreateSolidBrush(cellBkCol);
+                                FillRect(hdc, &rcSub, hBkBrush);
+                                if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+
+                                // セル中央にチェックボックス (☐ または ☑) を描画
+                                int cbSize = ScaleI(Layout::kCheckboxSize, scale);
+                                int cbX = rcSub.left + (cellW - cbSize) / 2;
+                                int cbY = rcSub.top + (cellH - cbSize) / 2;
+                                RECT rcCb = { cbX, cbY, cbX + cbSize, cbY + cbSize };
+                                UINT uState = DFCS_BUTTONCHECK;
+                                if (!r.isRunning || dr.tid == 0) {
+                                    uState |= DFCS_INACTIVE;
+                                } else if (isSusp) {
+                                    uState |= DFCS_CHECKED;
+                                }
+                                DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
+
+                                SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                                return TRUE;
                             }
-                            DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
-
-                            SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                            return TRUE;
                         }
-                    } else if (plvcd->iSubItem == 6) {
-                        // Col 6: Priority (右詰め + 半角SP2個 + 4px[200%時]の余白)
+                    } else if (plvcd->iSubItem == 9) {
+                        // Col 9 (Excluded 列): 稼働中かつ監視通常の場合、退避済みであるため先頭の '!' を赤太字で描画
                         auto rules = g_isolator.GetRulesSnapshot();
-                        if (row >= 0 && row < static_cast<int>(rules.size())) {
-                            const auto& r = rules[row];
-                            RECT rcSub;
-                            ListView_GetSubItemRect(hList, row, 6, LVIR_BOUNDS, &rcSub);
-                            HDC hdc = plvcd->nmcd.hdc;
-                            float scale = GetDpiScaleForWindow(hDlg);
+                        if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
+                            const auto& dr = g_displayRows[row];
+                            if (dr.ruleIndex < rules.size()) {
+                                const auto& r = rules[dr.ruleIndex];
+                                if (r.isRunning && !r.isBypassed) {
+                                    RECT rcSub;
+                                    ListView_GetSubItemRect(hList, row, 9, LVIR_BOUNDS, &rcSub);
+                                    HDC hdc = plvcd->nmcd.hdc;
 
-                            HBRUSH hBkBrush = (state & LVIS_SELECTED) 
-                                ? GetSysColorBrush(COLOR_HIGHLIGHT) 
-                                : CreateSolidBrush(rowBkCol);
-                            FillRect(hdc, &rcSub, hBkBrush);
-                            if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
+                                    HRGN hClip = CreateRectRgn(rcSub.left, rcSub.top, rcSub.right, rcSub.bottom);
+                                    SelectClipRgn(hdc, hClip);
 
-                            char txtBuf[64] = { 0 };
-                            ListView_GetItemText(hList, row, 6, txtBuf, sizeof(txtBuf));
-                            std::string text(txtBuf);
+                                    HBRUSH hBkBrush = (state & LVIS_SELECTED) 
+                                        ? GetSysColorBrush(COLOR_HIGHLIGHT) 
+                                        : CreateSolidBrush(rowBkCol);
+                                    FillRect(hdc, &rcSub, hBkBrush);
+                                    if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
 
-                            if (!text.empty()) {
-                                HFONT hFont = reinterpret_cast<HFONT>(SendMessageA(hList, WM_GETFONT, 0, 0));
-                                if (!hFont) hFont = reinterpret_cast<HFONT>(GetStockObject(DEFAULT_GUI_FONT));
-                                HGDIOBJ oldFont = SelectObject(hdc, hFont);
-                                SetBkMode(hdc, TRANSPARENT);
+                                    char txtBuf[64] = { 0 };
+                                    ListView_GetItemText(hList, row, 9, txtBuf, sizeof(txtBuf));
+                                    std::string text(txtBuf);
 
-                                COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
-                                SetTextColor(hdc, textCol);
+                                    if (!text.empty()) {
+                                        HFONT hFont = GetEffectiveFont(hList);
+                                        HGDIOBJ oldFont = SelectObject(hdc, hFont);
+                                        SetBkMode(hdc, TRANSPARENT);
 
-                                SIZE szSp;
-                                GetTextExtentPoint32A(hdc, "  ", 2, &szSp);
-                                int extraPx = static_cast<int>(std::round(2.0f * scale)); // 200%環境で4px
-                                int rightMargin = szSp.cx + extraPx;
+                                        SIZE szTotal;
+                                        GetTextExtentPoint32A(hdc, text.c_str(), static_cast<int>(text.length()), &szTotal);
+                                        int cellW = rcSub.right - rcSub.left;
+                                        int startX = (szTotal.cx < cellW) ? (rcSub.left + (cellW - szTotal.cx) / 2) : (rcSub.left + 4);
+                                        int startY = rcSub.top + (rcSub.bottom - rcSub.top - szTotal.cy) / 2;
 
-                                RECT rcText = rcSub;
-                                rcText.right -= rightMargin;
-                                DrawTextA(hdc, text.c_str(), -1, &rcText, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+                                        if (text[0] == '!') {
+                                            LOGFONTA lf = { 0 };
+                                            GetObjectA(hFont, sizeof(lf), &lf);
+                                            lf.lfWeight = FW_BOLD;
+                                            HFONT hBold = CreateFontIndirectA(&lf);
+                                            SelectObject(hdc, hBold);
+                                            SetTextColor(hdc, RGB(220, 50, 50)); // 鮮やかな赤
+                                            TextOutA(hdc, startX, startY, "!", 1);
 
-                                SelectObject(hdc, oldFont);
+                                            SIZE szEx;
+                                            GetTextExtentPoint32A(hdc, "!", 1, &szEx);
+                                            SelectObject(hdc, hFont);
+                                            DeleteObject(hBold);
+
+                                            COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
+                                            SetTextColor(hdc, textCol);
+                                            TextOutA(hdc, startX + szEx.cx, startY, text.c_str() + 1, static_cast<int>(text.length() - 1));
+                                        } else {
+                                            COLORREF textCol = (state & LVIS_SELECTED) ? GetSysColor(COLOR_HIGHLIGHTTEXT) : GetSysColor(COLOR_WINDOWTEXT);
+                                            SetTextColor(hdc, textCol);
+                                            TextOutA(hdc, startX, startY, text.c_str(), static_cast<int>(text.length()));
+                                        }
+
+                                        SelectObject(hdc, oldFont);
+                                    }
+
+                                    SelectClipRgn(hdc, NULL);
+                                    DeleteObject(hClip);
+
+                                    SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
+                                    return TRUE;
+                                }
                             }
-
-                            SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_SKIPDEFAULT);
-                            return TRUE;
                         }
                     }
                     SetWindowLongPtrA(hDlg, DWLP_MSGRESULT, CDRF_DODEFAULT);
@@ -3608,6 +4075,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                     ID_TRAY_STARTUP, 
                     IsStartupEnabled() ? MF_CHECKED : MF_UNCHECKED
                 );
+                if (IsRunningAsAdmin()) {
+                    RemoveMenu(hSub, ID_TRAY_RESTART_ADMIN, MF_BYCOMMAND);
+                }
                 POINT pt;
                 GetCursorPos(&pt);
                 SetForegroundWindow(hDlg);
@@ -3622,17 +4092,43 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         ShowWindow(hDlg, SW_HIDE);
         return TRUE;
 
-    case WM_DESTROY:
+    case WM_DESTROY: {
         KillTimer(hDlg, TIMER_POLLING_ID);
         RemoveTrayIcon();
         g_isolator.ResumeAllSuspendedThreads();
-        SaveConfig(g_isolator.GetConfig(), g_iniPath);
+
+        // 終了時に現在のカラム幅およびウィンドウ高さを論理ピクセル換算で退避
+        HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+        float scale = GetDpiScaleForWindow(hDlg);
+        if (scale <= 0.0f) scale = 1.0f;
+        if (hList) {
+            g_colWidths.clear();
+            for (int i = 0; i < kColCount; ++i) {
+                int colW = ListView_GetColumnWidth(hList, i);
+                int baseW = static_cast<int>(std::round(colW / scale));
+                if (baseW < 10) baseW = kColDefaultWidths[i];
+                g_colWidths.push_back(baseW);
+            }
+        }
+        RECT rcDlg;
+        if (GetWindowRect(hDlg, &rcDlg)) {
+            int curH = rcDlg.bottom - rcDlg.top;
+            g_windowHeight = static_cast<int>(std::round(curH / scale));
+        }
+
+        ati::GlobalConfig curCfg = g_isolator.GetConfig();
+        curCfg.columnWidths = g_colWidths;
+        curCfg.windowHeight = g_windowHeight;
+        SaveConfig(curCfg, g_iniPath);
+
         if (s_hMainFont) {
             DeleteObject(s_hMainFont);
             s_hMainFont = nullptr;
         }
+        ati::ShutdownGdiPlus();
         PostQuitMessage(0);
         return TRUE;
+    }
     }
 
     return FALSE;
@@ -3643,11 +4139,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
     InitializeHighDpi();
     LogDebug("WinMain: start (High-DPI PerMonitorV2 enabled)");
 
+    if (IsRunningAsAdmin()) {
+        if (EnableRealtimePrivilege()) {
+            LogDebug("WinMain: Running as Admin, SeIncreaseBasePriorityPrivilege enabled");
+        } else {
+            LogDebug("WinMain: Running as Admin, failed to enable SeIncreaseBasePriorityPrivilege");
+        }
+    }
+
     // 単一インスタンス制御 (多重起動の物理的防止)
     g_hSingleInstanceMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
+        if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
         if (hExisting) {
             ShowWindow(hExisting, SW_SHOWNORMAL);
@@ -3726,6 +4231,12 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
             loggedDestroy = true;
         }
         HWND hActive = GetActiveWindow();
+        if (hActive && (hActive == hDlg || IsChild(hDlg, hActive))) {
+            if (msg.message == WM_SYSKEYDOWN && (msg.wParam == 'D' || msg.wParam == 'd')) {
+                SendMessage(hDlg, WM_COMMAND, MAKEWPARAM(IDC_BTN_REMOVE, BN_CLICKED), reinterpret_cast<LPARAM>(GetDlgItem(hDlg, IDC_BTN_REMOVE)));
+                continue;
+            }
+        }
         if (hActive && IsDialogMessageA(hActive, &msg)) {
             continue;
         }

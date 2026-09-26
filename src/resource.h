@@ -3,6 +3,7 @@
 #define IDD_MAIN_DIALOG         101
 #define IDD_PROCESS_PICKER      102
 #define IDD_SETTINGS_DIALOG     103
+#define IDD_SORT_CONFIRM        105
 
 #define IDC_LIST_PROCESSES      1001
 #define IDC_BTN_ADD             1002
@@ -43,13 +44,16 @@
 #define IDC_LIST_RULE_CORES     1036
 #define IDC_EDIT_RULE_NORMAL_CORES 1037
 #define IDC_STATIC_HALF_ISOLATED_NOTE 1038
-#define IDC_COMBO_INPLACE_PRIO  1039
 
 #define IDR_TRAY_MENU           201
 #define ID_TRAY_OPEN            2001
 #define ID_TRAY_EXIT            2002
 #define ID_TRAY_STARTUP         2003
 #define ID_TRAY_RESTART         2004
+#define ID_TRAY_RESTART_ADMIN   2005
 
 #define IDI_APP_ICON            301
 
+#define IDR_MATRIX_HITMAP       3000
+#define IDR_MATRIX_BASE_DARK    3001
+#define IDR_MATRIX_RANK_BASE    3100
