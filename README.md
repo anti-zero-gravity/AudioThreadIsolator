@@ -4,6 +4,8 @@
 
 # Audio Thread Isolator (ATI)
 
+[![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-F16061?style=flat-square&logo=ko-fi&logoColor=white)](https://ko-fi.com/antizerogravity)
+
 **Audio Thread Isolator (ATI)** is a lightweight Windows background utility that automatically detects, isolates, and optimizes real-time audio playback threads (WASAPI, ASIO, etc.) to dedicated CPU cores.
 
 By isolating critical audio threads onto dedicated cores and migrating heavy background threads (UI rendering, decoding, network I/O, etc.) to other cores, ATI effectively minimizes buffer underruns, audio dropouts, and micro-jitter caused by CPU core contention.
@@ -16,7 +18,7 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
   - Implemented in modern C++17 using pure Win32 API and Common Controls.
   - Zero external dependencies or runtime requirements (no .NET or VC++ runtimes).
   - Single compact binary (~1.15 MB) with negligible memory footprint (~1–2 MB) and near-zero CPU usage.
-- **Intelligent 3-Stage Audio Thread Detection Engine**:
+- **3-Stage Audio Thread Detection Engine**:
   - Automatically identifies real-time playback threads across media players, browsers (Chromium / Vivaldi / Chrome), DAWs, and audio editors (iZotope RX, etc.).
 - **Multi-Core Affinity Support**:
   - Assign playback threads to one or multiple dedicated CPU cores (e.g., `#1` or `#1, #2`) to handle heavy real-time audio workloads without dropouts.
@@ -32,7 +34,7 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
 
 ---
 
-## 3-Stage Audio Thread Detection Engine
+## How It Works
 
 ATI employs a robust, 3-stage heuristic engine to reliably detect and isolate audio playback threads in both known and unknown applications:
 

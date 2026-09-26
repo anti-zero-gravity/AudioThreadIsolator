@@ -21,6 +21,8 @@
 
 # Executables
 *.exe
+!ATI.exe
+!docs/EcoQoSMonitor.exe
 *.out
 *.app
 

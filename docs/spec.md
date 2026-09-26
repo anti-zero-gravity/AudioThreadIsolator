@@ -72,7 +72,7 @@
 - **Rank Selection via 2D Priority Matrix Overlay Picker**:
   - Clicking the `Thread Priority` (Col 2) or `Process Priority` (Col 3) cell pops up a 7x7 3D visual matrix overlaid on the center of the main window.
   - Hovering over pillars updates HUD information in real-time (Base Priority, Rank #, Process Class, Thread Priority, formula).
-  - Clicking a pillar (Rank 1 to 49) commits both Process Class and Thread Priority, applying them immediately to the active process/threads and persisting to INI.
+  - Clicking a pillar (Rank 1 to 49) commits both Process Class and Thread Priority, applying them immediately to the active process/threads and saving directly to `ATI.ini`.
 
 - **Ascending Sort by Clicking `Process Name` Header**:
   - Clicking the `Process Name` header shows a confirmation prompt ("SORT?") and sorts the list alphabetically upon confirmation.
@@ -106,8 +106,8 @@ Under standard applications (Normal process priority class), each setting corres
 - **Unlocking Realtime Priority (Base Priority 16-31)**:
   - Ranks 43-49 in the 2D Priority Matrix Picker (Realtime priority class) require the process to run with administrator privileges (`SeIncreaseBasePriorityPrivilege` enabled).
   - When not running as Administrator, ATI and the Windows kernel silently fall back to High priority (clamped to Base Priority 15). Restarting via **`Restart as Administrator`** in the tray menu enables elevated Base Priority from 16 to 31.
-- **Instant Preview and Persistence**:
-  Priorities selected from table cells are immediately applied to active threads for instant listening comparison. To persist changes across launches, save via the per-process settings dialog (`[Edit]`).
+- **Instant Application and Settings Saving**:
+  Priorities selected via the 2D Priority Matrix Picker are immediately applied to active processes and threads, and automatically saved to `ATI.ini`. Settings can also be adjusted manually via the per-process edit dialog (`[Edit]`).
 - **Half-Isolated Co-existing Thread Suppression (Graphics Drivers, etc.)**:
   If an unmigratable thread (e.g., driver threads locked to specific CPU cores) is detected co-existing on the dedicated audio core, ATI automatically promotes `Idle (-15)` audio threads to `Lowest (-2)`. Co-existing threads are throttled to one level below the audio thread priority.
 

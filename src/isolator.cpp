@@ -2105,6 +2105,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
+      // Audio Service プロセスに対して HighQoS (Power Throttling / EcoQoS 解除) を適用
+      // (親プロセスの HighQoS 状態はカーネルの自動継承機構により配下の全オーディオスレッドに波及)
+      ApplyProcessHighQoS(hAsProc);
+
       totalThreadCount = static_cast<int>(ptIt->second.size());
       auto &tracks = m_chromiumThreadTracks[audioServicePid];
 
