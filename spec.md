@@ -1,225 +1,231 @@
-# Audio Thread Isolator (ATI) v1.0.4 - 仕様書・ユーザー説明書 (spec.md)
+# Audio Thread Isolator (ATI) v1.0.4 - Specification & User Manual (spec.md)
 
-※ 本書は配布されたユーザー向けの説明書です。コード設計上の詳細仕様・アルゴリズム内部ロジックは [arc.md](file:///c:/Users/YK-PC/.gemini/antigravity-ide/scratch/ATI/arc.md) に記録されています。
+*Note: This document is the end-user manual for distribution. Detailed internal architectural specifications and algorithmic logic are documented in [arc.md](file:///c:/Users/YK-PC/.gemini/antigravity-ide/scratch/ATI/arc.md).*
 
-## 1. アプリケーション概要
+## 1. Application Overview
 
-- **名称**: 再生スレッドアイソレーター / Audio Thread Isolator (略称: ATI)
-- **種別**: Windows ネイティブ常駐ユーティリティ（C++17 / Pure Win32 API / Comctl32 / GDI+）
-- **バイナリ形態**: **フォルダ不要の完全単一 .exe 完結型（スタンドアロン）**
-  - 7×7 Priority Matrix オーバーレイピッカーに必要な全リソース（HitMapバイナリ、基底背景、全 49 ランク立体合成画像など計 51 アセット）を実行ファイル内に `RCDATA` として完全内包。外部の `ui_parts/` フォルダなしで `ATI.exe` 単体のみで動作します。
-- **目的**:
-  オーディオ再生やマルチメディアアプリの実行中プロセスから、オーディオ再生スレッドを自動特定し、指定したオーディオ用CPUコアへ隔離します。同時にそれ以外を指定した複数の除外コアへ退避させます。高負荷スレッドがオーディオスレッドと同じコアを使わなくすることで、マイクロジッター（実行待ちキューに登録されてから実行されるまでのによる再生タイミングの等時性揺らぎ）を極小化します。
+- **Name**: Audio Thread Isolator (ATI)
+- **Type**: Windows Native Resident Utility (C++17 / Pure Win32 API / Comctl32 / GDI+)
+- **Binary Architecture**: **Completely Standalone Single .exe File (No folders required)**
+  - All resources required for the 7x7 Priority Matrix Overlay Picker (HitMap binary, base background, and all 49 rank 3D composite images; total 51 assets) are fully embedded within the executable as `RCDATA`. Works out of the box with `ATI.exe` alone without needing an external `ui_parts/` folder.
+- **Purpose**:
+  Automatically identifies the audio playback thread from running audio and multimedia processes, isolating it onto designated audio CPU core(s) while evicting all other non-audio threads to separate excluded cores. By preventing high-load threads from sharing cores with audio threads, micro-jitter (isochronous timing fluctuation from queuing latency) is minimized.
+- **Automatic HighQoS (Power Throttling OFF) Enforcement**:
+  For all processes registered for monitoring, ATI automatically disables Windows Power Throttling (EcoQoS) upon detection, enforcing HighQoS (maximum execution speed and timer resolution preservation). By applying this at the process level, Windows kernel inheritance ensures all threads (both existing and newly spawned) run at full clock speed without power-saving latency or throttling.
 
 ---
 
-## 2. 画面構成と操作方法
+## 2. UI Structure and Operations
 
-### 2.1 メイン画面 (Main Window)
-- **概要**: 登録プロセスの監視状態の確認と、クイック操作（除外、一時停止、優先度変更）を行うメイン画面です。
-- **高DPI・解像度追従**: デュアルモードディスプレイ等による解像度や拡大縮小（スケーリング）変更時も、レイアウトや文字が崩れず自動的に最適なサイズで表示されます。
-- **操作の責務分離**: メイン画面は日常の監視とリアルタイム調整用とし、プロセスの詳細なアフィニティ（コア割り当て）設定は行ダブルクリックまたは `[Edit]` ボタンで開く個別設定画面で行います。
+### 2.1 Main Window
+- **Overview**: The primary monitoring and quick-control interface for registered processes (bypass, suspend, priority adjustment).
+- **High-DPI & Resolution Adaptive**: Automatically adjusts layout and font size smoothly without distortion during resolution or scaling changes (e.g., dual-mode monitors, 5K 200%).
+- **Separation of Concerns**: Daily monitoring and instant tuning are handled on the main screen, while core affinity configuration is managed via the per-process settings dialog (double-click row or `[Edit]`).
 
-#### 操作ボタン構成（右側パネル）
-- **`Always on Top`**: メインウィンドウを常に最前面に表示します。
-- **`[Edit]`**: 選択したプロセスの個別設定画面を開きます（行のダブルクリックでも同様）。
-- **`[Add]`**: 稼働中のプロセス一覧から監視対象を追加するダイアログを開きます。
-- **`[Remove]`**: 選択したプロセスを監視リストから削除します。
-- **`[Settings]`**: システム全体のデフォルト設定や専用コア保護を行う全体設定画面を開きます。
-- **`[Exit]`**: アプリケーションを終了します。
+#### Control Buttons (Right Panel)
+- **`Always on Top`**: Pins the main window to always stay in the foreground.
+- **`[Edit]`**: Opens the settings dialog for the selected process (or double-click row).
+- **`[Add]`**: Opens a dialog to pick and add running processes to the monitoring list.
+- **`[Remove]`**: Removes the selected process from the monitoring list.
+- **`[Settings]`**: Opens global settings for system defaults and core protection.
+- **`[Exit]`**: Exits the application.
 
-#### システムトレイメニュー (タスクトレイアイコン右クリック)
-- **`Open Settings`**: メインウィンドウを表示します（トレイアイコンの左クリックでも同様）。
-- **`Start with Windows`**: Windows 起動時の自動スタートアップ常駐の有効/無効を切り替えます。
-- **`Restart`**: アプリケーションを通常再起動します。
-- **`Restart as Administrator`**: 管理者権限（UAC 昇格）でアプリケーションを再起動します（※すでに管理者権限で動作している場合はメニューから自動的に非表示）。管理者として起動された場合、`SeIncreaseBasePriorityPrivilege` が自動有効化され、`Realtime` 優先度（Base Priority 16〜31）の適用が可能になります。
-- **`Exit`**: アプリケーションを終了します。
+#### System Tray Menu (Right-Click Taskbar Tray Icon)
+- **`Open Settings`**: Restores and displays the main window (identical to left-clicking the tray icon).
+- **`Start with Windows`**: Toggles automatic startup with Windows.
+- **`Restart`**: Restarts the application normally.
+- **`Restart as Administrator`**: Restarts the application with elevated administrator privileges (UAC). (*Automatically hidden if already running with admin privileges). When running as administrator, `SeIncreaseBasePriorityPrivilege` is automatically enabled, unlocking `Realtime` priority (Base Priority 16-31).
+- **`Exit`**: Exits the application.
 
-#### プロセステーブル (監視一覧)
+#### Process Table (Monitoring List)
 
-| 列 | 見出し | 概要・役割 | 操作仕様 |
+| Col | Header | Summary & Role | Operation Details |
 |:---:|:---|:---|:---|
-| 0 | **`!`** | 監視対象と一時除外（Bypass）の切り替え。チェックを入れると ATI の介入を停止します。| クリックでトグル切り替え |
-| 1 | **`Process Name`** | 監視対象として登録されたアプリケーション名（`.exe` は省略表示）。<br>`IgnoreSig:t` による複数スレッド特定時は、2行目以降に GDI ペンによる「└」L 字ツリー線を描画して親子関係を明示。 | ダブルクリックで個別設定を開く。<br>見出しクリックで昇順ソート |
-| 2 | **`Thread Priority`** | オーディオスレッドに適用する相対優先度。<br>複数スレッド展開時は各行（親row/子row）ごとに 2D Priority Matrix Picker から個別に優先度を選択可能（親・子の優先度は独立）。 | セルをクリックして新UI（2D Priority Matrix Picker）から選択 |
-| 3 | **`Process Priority`** | オーディオスレッドを保持するプロセス（PID）に適用する優先度クラス。 | セルをクリックして新UI（2D Priority Matrix Picker）から選択 |
-| 4 | **`❚❚`** | 検証用の一時停止機能。対象オーディオスレッドを一時停止させて音声を止め、真の再生スレッドであるかを確認します。<br>複数スレッド展開時は各行（TID）ごとに個別にサスペンド可能。<br>**（※アプリ停止の恐れがあるためミュート目的での使用は禁止）** | クリックで個別トグル切り替え |
-| 5 | **`Audio Core PID/TID`** | オーディオスレッドの検出状態、特定されたプロセスID (PID) およびスレッドID (TID) を表示。複数スレッド展開時は **Cycles Delta 降順** で各行に各 TID を表示。 | クリック操作：休眠時は探索リスタート、稼働中は Bypass 切り替え（ダブルクリック禁止） |
-| 6 | **`TIDs`** | 監視スレッド数。Chromiumブラウザ以外ではスレッド数（`1`）、探索中はアプリ内全スレッド数、休眠中は `0` を表示。 | ダブルクリックで個別設定を開く。 |
-| 7 | **`Chgs`** | オーディオスレッドを検出し優先度適用された回数。 | ダブルクリックで個別設定を開く。 |
-| 8 | **`Audio`** | オーディオ再生スレッドを専有させる CPU コア番号（例: `#1`）。複数スレッド展開時は各行のスレッドに割り当てられたコアを個別表示。 | ダブルクリックで個別設定を開く。 |
-| 9 | **`Excluded`** | 通常スレッドの退避先から除外されている CPU コアの一覧（例: `!#1`）。<br>**複数スレッド展開時は、親 PID が同一で退避設定が共通であるため、2 行目以降（subIndex > 0）には `same` と表示。** | ダブルクリックで個別設定を開く。 |
+| 0 | **`!`** | Toggles monitoring and temporary bypass. Checking this suspends ATI intervention. | Click to toggle |
+| 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multiple threads are detected via `IgnoreSig:t`, child rows display an L-shaped tree line (`└`) drawn via GDI to indicate parent-child hierarchy. | Double-click to open edit dialog.<br>Click header to sort ascending. |
+| 2 | **`Thread Priority`** | Relative thread priority applied to audio thread.<br>When multi-thread expansion is active, each row (parent/child) can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
+| 3 | **`Process Priority`** | Priority class applied to the process (PID) hosting the audio thread. | Click cell to select via 2D Priority Matrix Picker |
+| 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the genuine playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
+| 5 | **`Audio Core PID/TID`** | Displays detection state, isolated PID, and TID. When multi-thread expansion is active, each TID is displayed sorted in **descending Cycles Delta**. | Click operation: Restarts search when sleeping; toggles Bypass when running (double-click disabled). |
+| 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard apps, total app thread count during search, and `0` when sleeping. | Double-click to open edit dialog. |
+| 7 | **`Chgs`** | Count of times audio thread was detected and priorities were applied. | Double-click to open edit dialog. |
+| 8 | **`Audio`** | Dedicated audio CPU core number (e.g., `#1`). When multi-thread expansion is active, shows the core assigned to each thread. | Double-click to open edit dialog. |
+| 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>**In multi-thread expansion, since sibling threads share the same parent PID and eviction mask, rows 2 and beyond (subIndex > 0) display `same`.** | Double-click to open edit dialog. |
 
-- **`IgnoreSig:t` マルチオーディオスレッド展開仕様**:
-  - `INI` 内で `IgnoreSig:2` 等のスレッド数 `t`（自然数）を指定することで、上位 `t` 個のオーディオスレッドを自動特定・隔離します。
-  - テーブル上にはあたかも別プロセスのように **Cycles Delta 降順**（CPU活動量の多い順）で `t` 行が展開表示されます。
-  - 1 行目（最大負荷スレッド）の Excluded 列には実退避コア一覧が表示され、2 行目以降には `same` と表示されます。
-  - **10秒カウントダウン継続走査と同時 sleeping... 移行仕様**:
-    - 非 IgnoreSig のような待機インターバルを置かず、未確定スロットに対して 10 秒間毎ターン継続して走査を実行します。
-    - 現在探索中の未確定スロットには `Standby 10` 〜 `Standby 1` の残り秒数カウントダウンが表示され、後続の未確定スロットは `Standby 10` で待機します。
-    - 10秒以内に次スレッドが検出されなかった場合、2スレッド目以降の未確定スロットは**すべて同時に `sleeping...`** へ移行します。
-    - 次スレッドが検出された場合、直ちに当該スロットが `PID ... / TID ...` に確定し、続くスロットが **10 からカウントダウンを開始** します。
-    - 休眠状態の未確定行（Col 0 または Col 5）をクリックすると、確定済みのスレッドをそのまま維持したまま、10秒カウントダウン探索が直ちに再開されます。
-  - **フォールバック特定仕様**:
-    - 通常の優先度条件で目標スレッド数 `t` に満たない場合、自動的にスレッドの待機状態解析へフォールバックします。
-    - 音声遅延制御による微小待機を行うアクティブスレッドを検出し、Cycles Delta 降順で残りのスロットを確定・隔離します（例: 標準的な優先度を持たない Voicemeeter 等でも、1 位および 2 位以降のスレッドを捕捉）。
-    - 目標スレッド数がすべて通常条件で充足している場合は本フォールバック走査は実行されず、余計なオーバーヘッドを発生させません。
-  - 各行は個別に ❚❚（一時停止）が可能です。
-  - いずれの行から `[Edit]` またはダブルクリックで個別設定を開いて保存した場合も、同一プロセスの全展開行の設定が一括同期更新されます。
+- **`IgnoreSig:t` Multi-Audio Thread Expansion**:
+  - By configuring thread count `t` (natural number) such as `IgnoreSig:2` in `INI`, ATI identifies and isolates the top `t` audio threads.
+  - The table expands to display `t` rows sorted in **descending Cycles Delta** (CPU activity order) as if they were distinct entries.
+  - The 1st row displays the actual excluded core list in the `Excluded` column; rows 2 and subsequent show `same`.
+  - **10-Second Continuous Scan Countdown & Simultaneous `sleeping...` Transition**:
+    - Scans every turn for 10 seconds for pending unconfirmed slots without idle intervals.
+    - The pending slot currently being searched displays a countdown from `Standby 10` down to `Standby 1`, while subsequent pending slots wait at `Standby 10`.
+    - If no subsequent thread is detected within 10 seconds, all unconfirmed slots from the 2nd thread onwards transition **simultaneously to `sleeping...`**.
+    - When a subsequent thread is detected, that slot immediately locks to `PID ... / TID ...`, and the next slot **starts counting down from 10**.
+    - Clicking a sleeping row (Col 0 or Col 5) immediately restarts the 10-second countdown scan while preserving already-locked threads.
+  - **Fallback Identification Logic**:
+    - If target thread count `t` cannot be met under standard criteria (Priority 15 and Cycles Delta >= threshold [default 3M/s]), ATI automatically falls back to thread wait-state analysis.
+    - Active threads satisfying `WaitReason == DelayExecution` (value 4) and Cycles Delta >= threshold (3M/s) are detected and locked onto remaining slots in descending Cycles Delta (e.g., captures threads in apps like Voicemeeter that do not assign priority 15).
+    - If all target slots are satisfied under normal conditions, fallback scanning is skipped to avoid unnecessary overhead.
+  - Each expanded row can be suspended independently (`❚❚`).
+  - Editing and saving settings via `[Edit]` or double-clicking any sibling row updates all expanded rows of the process simultaneously.
 
-- **2D Priority Matrix Overlay Picker（立体優先度ピッカー）による Rank 指定**:
-  - `Thread Priority`（Col 2）または `Process Priority`（Col 3）セルをクリックすると、メインウィンドウ中央に重ねて 7×7 の 3D 立体ビジュアルマトリックス（新UI）がポップアップ表示されます。
-  - マウスホバーで各柱と HUD 情報（Base Priority、Rank #、Process Class、Thread Priority、計算式）がリアルタイムに連動します。
-  - 目的の柱をクリック（Rank 1〜49 指定）すると、プロセスの優先度クラス（`Process Priority`）とスレッドの相対優先度（`Thread Priority`）のペアが一括決定され、稼働中のプロセス・スレッドへ即時適用・INI永続保存されます。
+- **Rank Selection via 2D Priority Matrix Overlay Picker**:
+  - Clicking the `Thread Priority` (Col 2) or `Process Priority` (Col 3) cell pops up a 7x7 3D visual matrix overlaid on the center of the main window.
+  - Hovering over pillars updates HUD information in real-time (Base Priority, Rank #, Process Class, Thread Priority, formula).
+  - Clicking a pillar (Rank 1 to 49) commits both Process Class and Thread Priority, applying them immediately to the active process/threads and persisting to INI.
 
-- **Process Name 見出しクリックによる昇順ソート**:
-  - `Process Name` カラムの見出しクリックで昇順ソート確認ダイアログ（「SORT?」）を表示し、OKで昇順ソートされます。
+- **Ascending Sort by Clicking `Process Name` Header**:
+  - Clicking the `Process Name` header shows a confirmation prompt ("SORT?") and sorts the list alphabetically upon confirmation.
 
-#### 状態表示（Col 5）およびインジケーター一覧
+#### Status Displays (Col 5) and Indicators
 
-| 表示テキスト | インジケーター表示 | 状態の意味 | セルクリック時の挙動 |
+| Display Text | Indicator Dot | Meaning | Behavior on Cell Click |
 |:---|:---|:---|:---|
-| `Not running` | なし（未起動チェック `☐` / `☑`） | アプリが起動していない待機状態。 | チェックで起動前の事前 Bypass 設定が可能 |
-| `Searching...` | ● コーラルピンク | オーディオスレッドを探索中。 | Bypass 切り替え |
-| `Standby` / `Standby 10..1` | ● コーラルピンク | 常時監視スタンバイ状態。音声出力の発生を監視中。 | Bypass へ移行（! 列に ☑ を表示） |
-| `sleeping...` | ● 薄紫 / 赤 交互点滅 | 無音・無活動のため監視休眠中。 | 直ちに探索をリスタート |
-| `PID <pid> / TID <tid>` | ● 青緑 | オーディオスレッドが特定され、専用コアへ正常に隔離完了。 | Bypass へ移行（! 列に ☑ を表示） |
-| `PID <pid> / Searching...` | ● コーラルピンク | Chromium 音声プロセスを特定し、内部スレッドを探索中。 | Bypass へ移行（! 列に ☑ を表示） |
-| (Half-Isolated 発生時) | ● 鈍い黄色 / 青緑 交互点滅 | ドライバ等でCPUコアが固定され隔離できないスレッドがオーディオ専用コアに同居中（自動抑制中）。 | Bypass へ移行（! 列に ☑ を表示） |
+| `Not running` | None (Unchecked `☐` / `☑`) | Application is not running (standby). | Check to pre-configure Bypass before launch |
+| `Searching...` | ● Coral Pink | Searching for audio thread. | Toggles Bypass |
+| `Standby` / `Standby 10..1` | ● Coral Pink | Continuous monitoring standby. Awaiting audio output. | Transitions to Bypass (displays ☑ in ! col) |
+| `sleeping...` | ● Flashing Muted Purple / Red | Sleeping due to silence / inactivity. | Immediately restarts search |
+| `PID <pid> / TID <tid>` | ● Cyan / Teal | Audio thread identified and isolated onto audio core. | Transitions to Bypass (displays ☑ in ! col) |
+| `PID <pid> / Searching...` | ● Coral Pink | Chromium audio process identified; searching internal threads. | Transitions to Bypass (displays ☑ in ! col) |
+| (Half-Isolated state) | ● Flashing Dull Yellow / Teal | Thread unmigratable due to driver constraints co-existing on audio core (suppression active). | Transitions to Bypass (displays ☑ in ! col) |
 
-#### 優先度設定と Windows 基本優先度 (Base Priority)
+#### Priority Settings and Windows Base Priority
 
-一般アプリケーション（標準プロセス優先度クラス）において、各選択肢が対応する Windows の基本優先度（1〜15）と動作特性は以下の通りです。
+Under standard applications (Normal process priority class), each setting corresponds to Windows Base Priority (1-15) and characteristics as follows:
 
-| ATI 設定値 | Base Priority | 動作特性 |
+| ATI Setting | Base Priority | Characteristics |
 |:---|:---:|:---|
-| **`Idle (-15)`** | **1** | CPU の空き時間のみで動作（極小負荷・低ジッター）。 |
-| **`Lowest (-2)`** | **6** | 通常スレッドより低い優先度。同居スレッド検知（Half-Isolated）自動昇格時の基準値。 |
-| **`Below Normal (-1)`** | **7** | 通常スレッドよりやや低い優先度。 |
-| **`Normal (0)`** | **8** | OS の標準スレッドと同等の優先度。 |
-| **`Above Normal (+1)`** | **9** | 通常スレッドより一段高い優先度。 |
-| **`Highest (+2)`** | **10** | 通常スレッドより優先して実行。 |
-| **`Time Critical (+15)`** | **15** | 通常アプリケーションにおける最高位優先度。 |
+| **`Idle (-15)`** | **1** | Runs only during CPU idle time (ultra-low load, lowest jitter). |
+| **`Lowest (-2)`** | **6** | Below normal threads. Base value during Half-Isolated co-existing thread promotion. |
+| **`Below Normal (-1)`** | **7** | Slightly below normal threads. |
+| **`Normal (0)`** | **8** | Standard OS thread priority. |
+| **`Above Normal (+1)`** | **9** | One level above standard threads. |
+| **`Highest (+2)`** | **10** | Preferentially scheduled ahead of normal threads. |
+| **`Time Critical (+15)`** | **15** | Highest priority accessible to standard non-elevated applications. |
 
-- **Realtime 優先度 (Base Priority 16〜31) の解放**:
-  - 2D Priority Matrix Picker の Rank 43〜49（Realtime 優先度クラス）は、プロセスが管理者権限（`SeIncreaseBasePriorityPrivilege` 有効）で稼働している時のみ利用可能です。
-  - 管理者権限でない場合は、Windows カーネルおよび ATI により High priority（上限 Base 15）へサイレントでフォールバックされます。トレイメニューから **`Restart as Administrator`** で昇格再起動することで、Base Priority 16〜31 への引き上げが有効化されます。
-- **即時反映と永続化**:
-  メイン画面のセルから選択した優先度は、稼働中スレッドへ即座に適用され試聴比較できます。この変更は一時的なものであり、次回起動時以降も維持したい場合は個別設定画面（`[Edit]`）から保存を行います。
-- **隔離できない同居スレッド（Half-Isolated）の連動制御**:
-  グラフィックドライバ系など仕様上CPUコアが固定されて隔離できない同居スレッドを検知した場合、優先度が `Idle (-15)` であれば自動的に `Lowest (-2)` へ 1 段階昇格します。同居スレッド側はオーディオ優先度より 1 段階低い優先度へ自動抑制されます。
-
----
-
-### 2.2 プロセス選択ダイアログ (Process Picker Dialog)
-- メイン画面の `[Add]` から起動します。
-- 現在実行中のプロセスを一覧表示し、アルファベット順で選択できます。
-- 選択して `[Done]` を押すと、メイン画面の監視リストへ追加されます（初期値は全体デフォルト設定が適用されます）。
-
-### 2.3 システムトレイ（タスクバー通知領域）動作
-- ウィンドウ右上の「×」ボタン、または最小化でタスクバー通知領域（システムトレイ）に収納されます。
-- **トレイアイコンのクリック**: メイン画面を最前面に復帰表示します。
-- **右クリックメニュー**:
-  - `Open Settings`: 全体設定画面を開きます。
-  - `Start with Windows`: Windows 起動時の自動実行を切り替えます。
-  - `Restart`: アプリケーションを再起動します。
-  - `Exit`: アプリケーションを終了します。
+- **Unlocking Realtime Priority (Base Priority 16-31)**:
+  - Ranks 43-49 in the 2D Priority Matrix Picker (Realtime priority class) require the process to run with administrator privileges (`SeIncreaseBasePriorityPrivilege` enabled).
+  - When not running as Administrator, ATI and the Windows kernel silently fall back to High priority (clamped to Base Priority 15). Restarting via **`Restart as Administrator`** in the tray menu enables elevated Base Priority from 16 to 31.
+- **Instant Preview and Persistence**:
+  Priorities selected from table cells are immediately applied to active threads for instant listening comparison. To persist changes across launches, save via the per-process settings dialog (`[Edit]`).
+- **Half-Isolated Co-existing Thread Suppression (Graphics Drivers, etc.)**:
+  If an unmigratable thread (e.g., driver threads locked to specific CPU cores) is detected co-existing on the dedicated audio core, ATI automatically promotes `Idle (-15)` audio threads to `Lowest (-2)`. Co-existing threads are throttled to one level below the audio thread priority.
 
 ---
 
-### 2.4 全体設定ダイアログ (Global Settings Dialog)
-メイン画面の `[Settings]` またはトレイメニューから開きます。新規登録プロセスのデフォルト値設定と、システム全体の一般プロセスに対する「CPU Sets 専用コア保護」を管理します。
+### 2.2 Process Picker Dialog
+- Launched via `[Add]` from the main window.
+- Lists all currently running processes in alphabetical order.
+- Select a process and click `[Done]` to add it to the monitoring list (global default settings are applied initially).
 
-| 項目名 | 概要・役割 | 操作仕様 |
+### 2.3 System Tray Behavior
+- Clicking the `×` button or minimizing tucks the window into the system notification area (system tray).
+- **Left-Click Tray Icon**: Brings the main window to the foreground.
+- **Right-Click Menu**:
+  - `Open Settings`: Opens the main window.
+  - `Start with Windows`: Toggles automatic startup with Windows.
+  - `Restart`: Restarts the application.
+  - `Restart as Administrator`: Restarts with elevated UAC privileges (hidden when already elevated).
+  - `Exit`: Terminates the application.
+
+---
+
+### 2.4 Global Settings Dialog
+Opened via `[Settings]` on the main window or tray menu. Manages default values for newly added processes and system-wide CPU Sets core protection.
+
+| Item | Summary & Role | Operation Details |
 |:---|:---|:---|
-| **コア設定表** | 新規登録時に適用するデフォルトのオーディオ専用コア（行 0）および除外コア（行 1）を設定。 | チェックボックスで選択 |
-| **`Default Audio Core (Mask)`** | デフォルトのオーディオ専用コアを 16進数マスクで直接指定。 | 直接入力または表操作 |
-| **`Apply` (Audio Core 行)** | **【専用コア保護】** ATI 登録プロセス以外のすべての一般プロセスに対し、「オーディオ専用コアを使わない CPU Sets」を一括適用します。外部プロセスの割り込みから保護します。 | クリックでシステムへ一括適用 |
-| **`Excluded (Mask)`** | デフォルトの除外コアを 16進数マスクで直接指定。 | 直接入力または表操作 |
-| **`Apply` (Excluded 行)** | **【除外マスク適用】** ATI 登録プロセス以外のすべての一般プロセスに対し、指定の除外コアマスクを一括適用します。 | クリックでシステムへ一括適用 |
-| **`Audio Thread Priority`** | 新規登録プロセスに適用されるデフォルトの優先度。 | リストから選択 |
-| **`Polling Interval (ms)`** | 監視スレッドの巡回周期（`100` / `200` / `500` / `1000` ms）。 | 数値入力（有効値へ自動補正） |
-| **`Release Mask`** | 一般プロセスへ適用した保護マスクを一括解除し、OS 標準状態へ復元します。 | クリックで解除 |
-| **`OK` / `Cancel`** | 設定を保存（OK）または破棄（Cancel）して閉じます。 | クリック |
+| **Core Assignment Table** | Configures default dedicated audio core (Row 0) and excluded cores (Row 1). | Select via checkboxes |
+| **`Default Audio Core (Mask)`** | Hexadecimal mask for default audio core. | Direct input or table click |
+| **`Apply` (Audio Core Row)** | **[Dedicated Core Protection]** Applies "CPU Sets excluding audio core" to all non-ATI processes across the system, shielding audio cores from external interrupts. | Click to apply system-wide |
+| **`Excluded (Mask)`** | Hexadecimal mask for default excluded cores. | Direct input or table click |
+| **`Apply` (Excluded Row)** | **[Apply Excluded Mask]** Applies specified excluded core mask to all non-ATI processes. | Click to apply system-wide |
+| **`Audio Thread Priority`** | Default priority applied to newly added processes. | Select from dropdown |
+| **`Polling Interval (ms)`** | Polling cycle for monitoring thread (`100` / `200` / `500` / `1000` ms). | Number input (auto-corrected) |
+| **`Release Mask`** | Clears protection masks from general processes, restoring OS defaults. | Click to release |
+| **`OK` / `Cancel`** | Saves (OK) or discards (Cancel) settings and closes. | Click |
 
 ---
 
-### 2.5 個別設定ダイアログ (Thread Isolation Settings Dialog)
-メイン画面で対象プロセスの行をダブルクリック、または `[Edit]` ボタンで開きます。
+### 2.5 Thread Isolation Settings Dialog
+Opened by double-clicking a process row or clicking `[Edit]` on the main window.
 
-| 項目名 | 概要・役割 | 操作仕様 |
+| Item | Summary & Role | Operation Details |
 |:---|:---|:---|
-| **`Target Process`** | 編集対象の実行ファイル名（例: `msedge.exe`）。 | 表示のみ |
-| **コア設定表** | 当該プロセス固有のコア割り当てを設定。<br>- **行 0 (`Audio Core`)**: オーディオスレッドを固定する専用コア。<br>- **行 1 (`Excluded`)**: 通常スレッド群から除外する退避コア。<br>※相互排他（同一コアの重複防止）および最低 1 コア保護が自動で働きます。 | チェックボックスで選択 |
-| **`Audio Core (Mask)`** | オーディオ専用コアのビットマスク。カンマ区切り（`1, 2` 等）による複数指定も可能。 | 直接入力または表操作 |
-| **`Excluded (Mask)`** | 通常スレッド群から除外するコアのビットマスク。 | 直接入力または表操作 |
-| **`Audio Thread Priority`** | 当該プロセスのオーディオスレッドに適用する優先度。 | リストから選択 |
-| **`OK` / `Cancel`** | 設定を `ATI.ini` に保存（OK）または破棄（Cancel）して閉じます。 | クリック |
+| **`Target Process`** | Target executable name (e.g., `msedge.exe`). | Read-only |
+| **Core Assignment Table** | Sets process-specific core affinity.<br>- **Row 0 (`Audio Core`)**: Dedicated core pinned for audio playback thread.<br>- **Row 1 (`Excluded`)**: Eviction cores excluded from normal threads.<br>*Automatic mutual exclusion prevents overlapping cores and guarantees at least 1 core for normal threads.* | Select via checkboxes |
+| **`Audio Core (Mask)`** | Bitmask for dedicated audio core(s). Comma-separated multi-core specification supported (e.g., `1, 2`). | Direct input or table click |
+| **`Excluded (Mask)`** | Bitmask for cores excluded from normal thread placement. | Direct input or table click |
+| **`Audio Thread Priority`** | Priority applied to audio playback thread. | Select from dropdown |
+| **`OK` / `Cancel`** | Saves to `ATI.ini` (OK) or discards (Cancel) and closes. | Click |
 
 ---
 
-## 3. 動作仕様・判定ロジック
+## 3. Operational Logic
 
-### 3.1 効率的な常時監視
-- **低負荷ポーリング**: 監視対象プロセスのみを直接走査し、OS 全域のスナップショット取得を避けることで、監視処理自体の CPU 負荷を抑えています。
-- **休眠検知**: 音声再生が行われていない無音待機状態では自動的に休眠（`sleeping...`）へ移行し、CPU 消費を最小化します。
+### 3.1 Efficient Continuous Monitoring
+- **Low-Overhead Polling**: Directly scans only registered target processes without taking global OS-wide snapshots, minimizing monitoring CPU overhead.
+- **Sleep Detection**: Automatically transitions to sleep (`sleeping...`) during silent standby to eliminate unnecessary CPU cycles.
 
-### 3.2 コア隔離と通常スレッド退避
-- **オーディオスレッドの隔離**: 特定されたオーディオ再生スレッドに対し、指定された専用コア（`AudioCore`）へのアフィニティ（固定）と指定優先度を適用します。
-- **通常スレッドの退避**: アプリ内のそれ以外の全通常スレッドに対し、退避先コア群（`NormalCores`）を適用します。
-- **除外コア（Excluded）の保護**: 退避先から除外されたコアにはプロセスの実行権限を与えないことで、不要なスレッドの侵入を防ぎます。
+### 3.2 Core Isolation and Normal Thread Eviction
+- **Audio Thread Isolation**: Pins identified audio playback thread to designated audio core (`AudioCore`) with specified priority.
+- **Normal Thread Eviction**: Configures remaining non-audio threads within the process to run across eviction cores (`NormalCores`).
+- **Excluded Core Protection**: Revokes process affinity permissions on excluded cores, preventing non-audio threads from invading dedicated cores.
 
-### 3.3 アプリケーション種別に応じた自動判定
-- **Chromium 系ブラウザ (Chrome, Edge, Brave, Vivaldi 等)**:
-  ブラウザ全体のプロセス群から内部の専用音声サービスプロセス（Audio Service）を自動特定し、短時間で入れ替わるエフェメラルスレッドの中から真の音声送出スレッドを追従・隔離します。
-- **一般的なオーディオ・動画アプリ (foobar2000, mpv, Firefox 等)**:
-  スレッドの CPU 負荷動向や、WASAPI、ASIO、DirectSound 等の音声関連処理シグネチャを照合し、再生スレッドを特定します。
-- **独自構造アプリ (Voicemeeter 等)**:
-  標準的なシグネチャを持たないアプリ向けに、スレッドの活動頻度ランキングを連続監視して再生スレッドを特定する独自モードを備えています。
-- **通話音声 (Discord 等)**:
-  Discord などの音声通話スレッド固有のモジュールシグネチャを照合し、通話処理スレッドを特定・隔離します。
+### 3.3 Application-Specific Detection
+- **Chromium Browsers (Chrome, Edge, Brave, Vivaldi, etc.)**:
+  Identifies internal dedicated audio service processes across multi-process browser trees, tracking ephemeral audio output threads in real time.
+- **Standard Audio & Media Players (foobar2000, mpv, Firefox, etc.)**:
+  Correlates CPU load dynamics and audio module signatures (WASAPI, ASIO, DirectSound) to identify genuine playback threads.
+- **Custom Architecture Apps (Voicemeeter, etc.)**:
+  Continuously analyzes thread activity ranking and latency wait states to lock audio threads in applications lacking conventional signatures.
+- **Voice Communication (Discord, etc.)**:
+  Correlates specific module signatures for voice streaming threads to isolate call processing threads.
 
 ---
 
-## 4. 設定項目・有効値一覧 (ATI.ini)
+## 4. Configuration Reference (ATI.ini)
 
-設定は実行ファイルと同じフォルダの `ATI.ini` に保存されます。
+Configuration is saved in `ATI.ini` in the same directory as the executable.
 
-### 4.1 全体設定セクション `[Global]`
+### 4.1 Global Section `[Global]`
 
-| 設定キー名 | 設定内容・意味 | 有効値 | デフォルト値 |
+| Key | Description | Valid Range | Default |
 |:---|:---|:---|:---|
-| **`DefaultAudioCore`** | 新規プロセス登録時に初期設定される専用オーディオコア番号。 | 0 〜 (最大CPUコア数 - 1) | `5` |
-| **`DefaultAudioPriority`** | 新規プロセス登録時に初期設定されるスレッド優先度。 | `-15` (Idle) 〜 `+15` (Time Critical) | `-15` |
-| **`NormalCores`** | 通常スレッド群の退避先コアマスク（16進数）。 | 16進数ビットマスク (例: `0x1D`) | `0x1D` |
-| **`PollingIntervalMs`** | 通常監視時の巡回間隔（ミリ秒）。 | `100`, `200`, `500`, `1000` | `500` |
-| **`BoostPollingIntervalMs`** | スレッド探索・変動検知時の高速巡回間隔（ミリ秒）。 | `50`, `100`, `250` | `250` |
-| **`AlwaysOnTop`** | メイン画面の最前面表示設定。 | `0` (無効), `1` (有効) | `0` |
+| **`DefaultAudioCore`** | Default audio core assigned to newly registered processes. | `0` to (Max Cores - 1) | `5` |
+| **`DefaultAudioPriority`** | Default thread priority assigned to newly registered processes. | `-15` (Idle) to `+15` (Time Critical) | `-15` |
+| **`NormalCores`** | Hexadecimal mask of cores allocated to normal threads. | Hex bitmask (e.g., `0x1D`) | `0x1D` |
+| **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
+| **`BoostPollingIntervalMs`** | Fast polling interval during thread search or state transitions. | `50`, `100`, `250` | `250` |
+| **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
 
-### 4.2 プロセス別設定セクション `[Processes]`
+### 4.2 Process Section `[Processes]`
 
-登録されたプロセスごとに、実行ファイル名をキーとして以下のパラメータをカンマ区切り形式で保存します。
+Saved per registered process under the executable name as key, with comma-separated parameters:
 
-| パラメータ名 | 設定内容・意味 | 有効値 |
+| Parameter | Description | Valid Values |
 |:---|:---|:---|
-| **`AudioCore`** | オーディオスレッドを固定する専用コア番号。複数指定時はカンマ区切り（例: `AudioCore:11, 10`）。 | `0` 〜 (最大コア数 - 1)、複数コアカンマ区切り |
-| **`AudioPriority`** | オーディオスレッドに適用する優先度。複数指定時はカンマ区切り（例: `AudioPriority:-15, -15`）。 | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`、複数カンマ区切り |
-| **`NormalCores`** | 通常スレッド群を割り当てる退避コアマスク（16進数）。 | `0x` で始まる16進数マスク |
-| **`Bypass`** | 一時除外状態（1: 除外中、未指定: 監視有効）。 | `1` |
-| **`AppType`** | アプリ種別判定モード（1: 一般オーディオ、2: Chromium）。 | `1`, `2` |
-| **`IgnoreSig`** | シグネチャ非依存モード（モジュールシグネチャに依存せず、スレッドの優先度とCPU活動負荷からオーディオスレッドを自動特定）。`:t` の数値指定により上位 `t` 個のオーディオスレッドを特定・隔離（デフォルト: 1）。 | `IgnoreSig`, `IgnoreSig:t` (`t` はスレッド数) |
-| **`AudioPid` / `AudioTid`** | 終了時の隔離スレッド情報（次回起動時の高速復元用）。 | 数値 |
+| **`AudioCore`** | Core assigned to audio thread. Comma-separated for multiple cores (e.g., `AudioCore:11, 10`). | `0` to (Max Cores - 1), comma-separated |
+| **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
+| **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
+| **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
+| **`AppType`** | Application classification mode (`1`: Standard Audio, `2`: Chromium). | `1`, `2` |
+| **`IgnoreSig`** | Signature-independent mode. Identifies threads by ① Priority 15 with Cycles Delta >= 3M/s, or ② fallback to DelayExecution wait-reason with Cycles Delta >= 3M/s when priority 15 is absent. Specify `:t` to isolate top `t` threads (default: 1). | `IgnoreSig`, `IgnoreSig:t` (`t` is thread count) |
+| **`AudioPid` / `AudioTid`** | Cached PID/TID from previous session for fast recovery. | Numeric |
 
 ---
 
-## 5. 制約事項・注意事項
+## 5. Limitations & Notes
 
-1. **一時停止（`❚❚`）機能の取り扱い**:
-   - 本機能は「一時的に音声を停止させ、対象スレッドが真の再生スレッドであるかを確認する」ための検証機能です。
-   - スレッドを強制停止（Suspend）させるため、ミュート代わりに使用するとアプリ全体のデッドロックやクラッシュを引き起こす恐れがあります。検証目的以外での使用は避けてください。
-2. **一時除外（`!` / Bypass）時の挙動**:
-   - チェックを入れて Bypass に移行すると、ATI による該当プロセスの監視・調整は停止します。
-   - 直前までに適用されていたスレッドのアフィニティ（コア固定）や優先度は維持され、即座に OS 標準状態に戻るわけではありません。
-3. **多重起動防止と自己保護**:
-   - 既に起動している状態で再度起動された場合、既存の画面を最前面に表示して後発プロセスは自動終了します。
-   - ATI 自身の監視処理がオーディオ専用コアを圧迫しないよう、ATI 自身を自動的に通常コア群へ退避させて動作します。
+1. **Usage of Pause (`❚❚`) Feature**:
+   - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the genuine playback thread.
+   - Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
+2. **Behavior on Temporary Bypass (`!` / Bypass)**:
+   - Entering Bypass stops ATI monitoring and active affinity adjustments for that process.
+   - Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling.
+3. **Single-Instance Enforcement & Self-Protection**:
+   - Launching a second instance automatically brings the existing window to the foreground and terminates the new instance.
+   - To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
+4. **HighQoS Operation Guarantee for Monitored Processes**:
+   - When a monitored process is launched or detected, ATI immediately calls `SetProcessInformation(ProcessPowerThrottling)` on the process handle to disable EcoQoS and enforce HighQoS.
+   - This ensures all threads, including audio playback threads isolated onto dedicated cores, operate without OS-induced clock throttling or timer resolution degradation.

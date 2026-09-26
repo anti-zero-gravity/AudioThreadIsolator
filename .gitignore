@@ -58,5 +58,12 @@ measure.ps1
 # Trash folder
 trush/
 
+# Demo mockups and internal investigation notes
+demo/
+testspec.md
+type2_analysis.md
+type2仕様書.md
+voicemeeter_base_priority_analysis.md
+
 
 

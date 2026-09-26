@@ -1373,11 +1373,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
   ULONG64 maxDelta = 0;
 
   if (rule.ignoreSig) {
-    // === IgnoreSig モード: 計測前に HighQoS 先行適用 & TimeCritical (15) + Delta >= 3M 判定 ===
-    ApplyProcessHighQoS(hProcess);
-    for (const auto &ti : threadInfos) {
-      ApplyThreadHighQoS(ti.hThread);
-    }
+    // === IgnoreSig モード: TimeCritical (15) + Delta >= 3M 判定 ===
 
     ULONG64 deltaThreshold = CalculateDeltaThreshold(
         (rule.cyclesDelta > 0.0 ? rule.cyclesDelta : 3.0), 3.0, intervalMs);
@@ -2648,10 +2644,9 @@ bool ThreadIsolator::ScanAndIsolate() {
         m_nonChromiumMaskedPids.insert(pid);
       }
 
-      // IgnoreSig の場合、スレッド計測・走査前にそのPIDへ HighQoS を先行設定
-      if (rule.ignoreSig) {
-        ApplyProcessHighQoS(hProcess);
-      }
+      // 全登録プロセスに対して HighQoS (Power Throttling / EcoQoS 解除) を先行適用
+      // (親プロセスの HighQoS 状態はカーネルの自動継承機構により配下の全スレッドに波及)
+      ApplyProcessHighQoS(hProcess);
 
       std::unordered_set<DWORD> aliveTids;
       std::vector<LocalThreadInfo> threadInfos;
@@ -2691,9 +2686,6 @@ bool ThreadIsolator::ScanAndIsolate() {
         if (!hThread)
           continue;
 
-        if (rule.ignoreSig) {
-          ApplyThreadHighQoS(hThread);
-        }
 
         int priority = GetThreadPriority(hThread);
         DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
