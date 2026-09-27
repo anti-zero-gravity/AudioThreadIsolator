@@ -43,6 +43,7 @@ static bool g_startInTray = false;
 static bool g_alwaysOnTop = false;
 static bool s_pulseTick = false;
 static HANDLE g_hSingleInstanceMutex = nullptr;
+static UINT g_uTaskbarRestartMsg = 0;
 
 // ListView 列幅定義 (DPI 基準値: scale=1.0 時のピクセル幅)
 // Col: 0:!  1:ProcessName  2:Thread Priority  3:Process Priority  4:||  5:PID/TID  6:TIDs  7:Chgs  8:Audio  9:Excluded
@@ -1034,7 +1035,16 @@ static void InitTrayIcon(HWND hWnd) {
     if (!g_nid.hIcon) g_nid.hIcon = LoadIconA(nullptr, IDI_APPLICATION);
     strcpy_s(g_nid.szTip, "Audio Thread Isolator (ATI)");
 
-    Shell_NotifyIconA(NIM_ADD, &g_nid);
+    if (g_uTaskbarRestartMsg == 0) {
+        g_uTaskbarRestartMsg = RegisterWindowMessageA("TaskbarCreated");
+    }
+
+    BOOL res = Shell_NotifyIconA(NIM_ADD, &g_nid);
+    if (!res) {
+        LogDebug(("InitTrayIcon: Shell_NotifyIconA NIM_ADD failed, error=" + std::to_string(GetLastError())).c_str());
+    } else {
+        LogDebug("InitTrayIcon: Shell_NotifyIconA NIM_ADD succeeded");
+    }
 }
 
 static void RemoveTrayIcon() {
@@ -3082,6 +3092,12 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
 
 // --- メインダイアログ (ANSI) ---
 static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_uTaskbarRestartMsg != 0 && msg == g_uTaskbarRestartMsg) {
+        LogDebug("MainDlgProc: TaskbarCreated received, restoring tray icon");
+        InitTrayIcon(hDlg);
+        return TRUE;
+    }
+
     switch (msg) {
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
@@ -3248,7 +3264,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         if (ati::IsPriorityMatrixPickerOpen()) {
             ati::ClosePriorityMatrixPicker();
         }
-        if (wParam == SIZE_MINIMIZED) return TRUE;
+        if (wParam == SIZE_MINIMIZED) {
+            ShowWindow(hDlg, SW_HIDE);
+            return TRUE;
+        }
         int cx = LOWORD(lParam);
         int cy = HIWORD(lParam);
         if (cx <= 0 || cy <= 0) return TRUE;
@@ -4147,22 +4166,65 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         }
     }
 
-    // 単一インスタンス制御 (多重起動の物理的防止)
+    // 単一インスタンス制御 (多重起動の物理的防止: 先発終了 → 新規立ち上げ)
     g_hSingleInstanceMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
-        LogDebug("WinMain: Another instance is already running. Activating existing window and exiting.");
+        LogDebug("WinMain: Another instance detected. Terminating previous instance to launch anew.");
+
+        // 1. 既存ウィンドウの探索
         HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
+
+        DWORD prevPid = 0;
         if (hExisting) {
-            ShowWindow(hExisting, SW_SHOWNORMAL);
-            SetForegroundWindow(hExisting);
+            GetWindowThreadProcessId(hExisting, &prevPid);
+            // 正常クリーンアップ終了を要求
+            PostMessageA(hExisting, WM_COMMAND, ID_TRAY_EXIT, 0);
         }
+
+        // 2. ウィンドウで見つからない場合のプロセススキャン (ゾンビプロセス救済)
+        if (prevPid == 0) {
+            DWORD currentPid = GetCurrentProcessId();
+            HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if (hSnap != INVALID_HANDLE_VALUE) {
+                PROCESSENTRY32 pe;
+                pe.dwSize = sizeof(pe);
+                if (Process32First(hSnap, &pe)) {
+                    do {
+                        if (_stricmp(pe.szExeFile, "ATI.exe") == 0 && pe.th32ProcessID != currentPid) {
+                            prevPid = pe.th32ProcessID;
+                            break;
+                        }
+                    } while (Process32Next(hSnap, &pe));
+                }
+                CloseHandle(hSnap);
+            }
+        }
+
+        // 3. 先行プロセスの終了待機 & タイムアウト時の強制終了
+        if (prevPid != 0) {
+            HANDLE hPrevProc = OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, prevPid);
+            if (hPrevProc) {
+                DWORD waitRes = WaitForSingleObject(hPrevProc, 1000);
+                if (waitRes == WAIT_TIMEOUT) {
+                    LogDebug("WinMain: Previous instance unresponsive. Forcing termination.");
+                    TerminateProcess(hPrevProc, 0);
+                    WaitForSingleObject(hPrevProc, 500);
+                }
+                CloseHandle(hPrevProc);
+            }
+        }
+
+        // 4. 旧ミューテックスの解放・待機と所有権再取得
         if (g_hSingleInstanceMutex) {
             CloseHandle(g_hSingleInstanceMutex);
             g_hSingleInstanceMutex = nullptr;
         }
-        return 0;
+        Sleep(100);
+
+        g_hSingleInstanceMutex = CreateMutexA(nullptr, FALSE, "Global\\AudioThreadIsolator_SingleInstance");
+        LogDebug("WinMain: Previous instance terminated. Continuing startup as primary instance.");
     }
 
     if (lpCmdLine) {
