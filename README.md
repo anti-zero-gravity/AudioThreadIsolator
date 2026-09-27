@@ -96,7 +96,7 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 
 ### 3. Thread Priority & Sound Quality Philosophy
 - **Advantages of Low Priority Operation (Idle)**:
-  - Guided by the design philosophy that "Priority 1 (Idle) yields the highest sound fidelity by minimizing jitter and CPU contention," ATI sets `Idle (-15)` as the default audio thread priority.
+  - Guided by the design philosophy that "Priority 1 (Idle) yields the highest sound fidelity by minimizing jitter and CPU contention," ATI sets `Idle (-15)` as the default audio thread priority. Setting the processor quantum to ["Short / Variable / 1:1"](https://hackmd.io/LguBVS7FTMq63BWcG6yy-A#2-3-Quantum-Length-Table-and-Tuning-Quick-Reference-by-Use-Case) is strongly recommended.
 - **Flexible Per-Process Customization**:
   - Depending on your specific Windows system configuration and background load, audio dropouts may occur. In addition to global default settings, ATI allows independent per-process adjustment of both process priority and audio thread priority.
 - **Catering to Diverse Listening Preferences**:
