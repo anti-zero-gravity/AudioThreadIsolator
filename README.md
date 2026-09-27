@@ -71,6 +71,38 @@ For unknown applications, games, or engines without thread descriptions (Godot, 
 ### PID/TID Tracking Mechanism for Previously Detected Sessions
 - Once an audio playback thread (TID) or process (PID) is identified and isolated, ATI caches and maintains the entry within its active tracking table and INI configuration.
 - In addition to enabling near-instant isolation recovery upon subsequent launches, the engine maintains continuous tracking within the active process even after priority modifications (e.g., set to `Idle (-15)`), preventing detection oscillation.
+---
+
+## Usage & Recommended Setup
+
+### 1. Prerequisites (Designating Dedicated Audio CPU#)
+Under default settings, once a registered application is detected and monitored, ATI isolates and protects only real-time audio playback threads onto default CPU `#1`, while all other threads (UI rendering, decoding, etc.) are distributed and migrated to other CPU# cores by Windows scheduler policy.
+
+To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU# cores exclusively reserved for real-time audio processing** on multi-core / multi-threaded processors:
+
+1. **Migrating Device Interrupts (MSI)**:
+   - Use [MsiAffinityUtility-v9](https://github.com/anti-zero-gravity/MsiAffinityUtility-v9) to configure the interrupt affinity of all MSI-supported devices (including GPUs) away from your chosen audio CPU# cores (non-MSI devices remain unverified), and restart Windows immediately afterward.
+2. **Guidelines for CPU# Selection**:
+   - Choose a CPU# other than `#0` (and other than `#0` and `#1` when Hyper-Threading is enabled) for real-time audio threads to avoid contention with heavy OS and system interrupt workloads.
+3. **Onboard & Network Audio Considerations**:
+   - **Onboard HD-Audio**: We recommend designating audio CPU# cores or preparing a dedicated CPU# exclusively for the HD-Audio device.
+   - **Network Audio Streaming (NAA, etc.)**: When streaming audio data over LAN to devices such as a Network Audio Adapter (NAA), we recommend assigning a dedicated CPU# for the network interface controller.
+
+### 2. Initial Configuration in ATI
+- **DefaultAudioCore**:
+  - Specify the dedicated audio CPU# (comma-separated values supported for multiple cores).
+- **ExcludedCores**:
+  - Specify the CPU# mask permitted for all regular processes and background threads, excluding the dedicated audio CPU# (and any dedicated LAN CPU#).
+
+### 3. Thread Priority & Sound Quality Philosophy
+- **Advantages of Low Priority Operation (Idle)**:
+  - Guided by the design philosophy that "Priority 1 (Idle) yields the highest sound fidelity by minimizing jitter and CPU contention," ATI sets `Idle (-15)` as the default audio thread priority.
+- **Flexible Per-Process Customization**:
+  - Depending on your specific Windows system configuration and background load, audio dropouts may occur. In addition to global default settings, ATI allows independent per-process adjustment of both process priority and audio thread priority.
+- **Catering to Diverse Listening Preferences**:
+  - While ATI's core philosophy centers on "the lowest priority that guarantees dropout-free playback achieves the highest audio quality," the 2D Priority Matrix Picker also enables instant elevation up to `Realtime (31)`. This allows users to audition and compare subtle sound quality characteristics across the entire priority spectrum in real time.
+
+---
 
 ## Download
 
