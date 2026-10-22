@@ -179,6 +179,8 @@ private:
   // ── リファクタリング: 共通ヘルパーメソッド ──
   // Chromium 系 PID 追跡状態の一括クリア
   void ClearChromiumTrackingState(DWORD pid);
+  // audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF / Normal / 全TID +2)
+  void RestoreAudioDgProcessLocked(DWORD targetPid = 0);
   // Suspend 中オーディオスレッドの安全な Resume
   static void ResumeAudioThreadIfSuspended(ProcessRule &rule);
   // 表示用スレッドカウントの算出・更新 (戻り値: stateChanged)
@@ -236,6 +238,10 @@ private:
   std::unordered_map<DWORD, ChromiumAudioState> m_chromiumAudioStates;
   std::unordered_set<DWORD> m_chromiumEvictedPids;
 
+  // audiodg.exe (AppType: 0) 適用済み TID セットおよび前回適用優先度 (キー: PID)
+  std::unordered_map<DWORD, std::unordered_set<DWORD>> m_audioDgAppliedTids;
+  std::unordered_map<DWORD, int> m_audioDgLastPrio;
+
   // スレッド属性フラグ (キー: PID, 値: (キー: TID, 値: フラグ 1:timeclit救済))
   std::unordered_map<DWORD, std::unordered_map<DWORD, uint8_t>> m_threadFlags;
 
@@ -282,24 +288,22 @@ private:
   // スレッドスナップショット遅延用キャッシュ (キー: PID)
   std::unordered_map<DWORD, std::vector<DWORD>> m_cachedProcessTids;
   std::unordered_map<DWORD, int> m_lastProcessThreadCount;
-  std::vector<ULONG> m_cachedTargetCpuSetIds;
   DWORD_PTR m_activeUnlistedMask = 0;
-  std::unordered_set<DWORD> m_cpuSetsAppliedPids;
+  std::unordered_set<DWORD> m_unlistedMaskedPids;
   DWORD m_unlistedApplyCount = 0;
   bool m_hasUnlistedMaskInOs = false;
   bool m_debugPrivilegeEnabled = false;
   void EnableDebugPrivilegeOnce();
-  static bool BuildTargetCpuSetIds(DWORD_PTR targetMask, std::vector<ULONG> &outIds);
   std::unordered_set<std::string> BuildUnlistedWhitelist(bool includeExclusions = true) const;
-  void ClearCpuSetsForProcessNamesLocked(const std::unordered_set<std::string> &namesLower);
-  bool ApplyUnlistedCpuSetsLocked(int mode, DWORD_PTR targetMask);
+  void RestoreAffinityForProcessNamesLocked(const std::unordered_set<std::string> &namesLower);
+  bool ApplyUnlistedMaskLocked(int mode, DWORD_PTR targetMask);
 
 public:
-  // ヒューリスティック探索中 (500ms タイマー要求中) かどうか判定
-  bool ApplyUnlistedCpuSets(int mode, DWORD_PTR targetMask);
+  // Unlisted プロセス強制アフィニティ制御
+  bool ApplyUnlistedMask(int mode, DWORD_PTR targetMask);
   void StopUnlistedPollingMask();
-  bool ReleaseUnlistedCpuSets();
-  bool HasAppliedUnlistedCpuSets() const;
+  bool ReleaseUnlistedMask();
+  bool HasAppliedUnlistedMask() const;
   void UpdateUnlistedExclusions(const std::vector<std::string> &exclusions);
   DWORD GetUnlistedApplyCount() const;
   static bool IsAudioDgProcess(const std::string &name);

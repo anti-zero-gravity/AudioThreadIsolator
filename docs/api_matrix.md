@@ -10,15 +10,13 @@ This document provides a comprehensive technical reference of all Win32 and Nati
 | :--- | :--- | :--- |
 | **`CreateToolhelp32Snapshot`** | System-wide | `TH32CS_SNAPPROCESS`: Enumerates the process list (invoked once every INI polling interval × 10 when unlaunched target processes exist or when `UnlistedMask` is active; skipped at 0 invocations when all monitored targets are running and `UnlistedMask=0`). |
 | **`Process32First` / `Next`** | System-wide | Enumerates process executable names, PIDs, and thread counts only during snapshot acquisition. 0 invocations when all targets are running and `UnlistedMask=0`. |
-| **`GetSystemCpuSetInformation`** | System-wide | Queries logical processor to CPU Set ID mappings. Invoked once upon checking `Apply` in Settings or at startup and cached; 0 invocations during polling. |
-| **`SetProcessDefaultCpuSets`** | Process | Applies (or releases) CPU Sets for Unlisted processes using either the audio-core exclusion mask (Mode 1) or Excluded mask (Mode 2). During polling, issued differentially only to newly spawned Unlisted PIDs and increments the cumulative apply counter. |
 | **`GetExitCodeProcess`** | Process | Target PID liveness check (process termination detection). Completes in nanoseconds, replacing SNAPPROCESS. |
 | **`OpenProcess`** | Process | Opens target process manipulation handles (for querying information, modifying affinity, adjusting priority, and configuring HighQoS). |
 | **`CloseHandle`** | Common | Closes and releases opened process handles, thread handles, and snapshot handles. |
 | **`SetProcessInformation`** | Process | **[HighQoS Enforcement]** Sets `ProcessPowerThrottling` (4) to disable Windows Power Throttling (EcoQoS). Removes execution speed throttling and preserves high-resolution timer accuracy. Process-level HighQoS automatically inherits to all underlying threads via the Windows kernel. |
 | **`SetPriorityClass`** | Process | Configures target process priority class (Realtime, High, AboveNormal, Normal, BelowNormal, Idle). Automatically falls back to High if Realtime is denied without administrator privileges. |
 | **`GetProcessAffinityMask`** | Process | Retrieves the current execution core affinity mask of the target process. |
-| **`SetProcessAffinityMask`** | Process | Expands process execution core mask (normal cores + audio cores) or restricts it to normal cores. |
+| **`SetProcessAffinityMask`** | Process | Expands process execution core mask (normal cores + audio cores), restricts it to normal cores, applies Hard Affinity mask to Unlisted processes, or restores full-core mask on Unmask All. |
 | **`NtGetNextThread`** | Thread | Directly enumerates child thread handles from target PID process handle via kernel direct syscall. Avoids system-wide thread scanning by querying only the target PID. |
 | **`OpenThread`** | Thread | Opens target thread handles (for acquiring additional access rights and suspend control). |
 | **`QueryThreadCycleTime`** | Thread | Retrieves accumulated CPU cycles consumed by thread. Used for computing Cycles Delta per polling cycle, identifying parent dispatch controller thread (1st by descending total cycles) upon initial Chromium registration, routine monitoring, and sampling (k=1..3) evaluation. |

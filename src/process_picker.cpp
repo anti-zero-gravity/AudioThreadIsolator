@@ -188,12 +188,74 @@ static void PopulateRunningProcesses(HWND hList) {
         ListView_InsertItem(hList, &lvi);
 
         ListView_SetItemText(hList, index, 1, const_cast<LPSTR>(item.processName.c_str()));
-        ListView_SetItemText(hList, index, 2, const_cast<LPSTR>(item.exeFileName.c_str()));
         
         std::string prioStr = PriorityToString(item.currentPriorityClass);
-        ListView_SetItemText(hList, index, 3, const_cast<LPSTR>(prioStr.c_str()));
+        ListView_SetItemText(hList, index, 2, const_cast<LPSTR>(prioStr.c_str()));
 
         index++;
+    }
+}
+
+static void AdjustPickerColumns(HWND hList, float scale) {
+    if (!hList) return;
+    RECT rc;
+    GetClientRect(hList, &rc);
+    int listW = rc.right - rc.left;
+    if (listW <= 0) return;
+
+    int w0 = ScaleI(26, scale);
+    int w2 = ScaleI(72, scale);
+    int w1 = listW - w0 - w2;
+    if (w1 < ScaleI(80, scale)) {
+        w1 = ScaleI(80, scale);
+    }
+    ListView_SetColumnWidth(hList, 0, w0);
+    ListView_SetColumnWidth(hList, 1, w1);
+    ListView_SetColumnWidth(hList, 2, w2);
+}
+
+static void AdjustPickerLayout(HWND hDlg, float scale, int cx, int cy) {
+    if (cx <= 0 || cy <= 0) return;
+
+    HWND hTitle   = GetDlgItem(hDlg, IDC_STATIC_PICKER_TITLE);
+    HWND hList    = GetDlgItem(hDlg, IDC_LIST_RUNNING);
+    HWND hHint    = GetDlgItem(hDlg, IDC_STATIC_PICKER_HINT);
+    HWND hRefresh = GetDlgItem(hDlg, IDC_BTN_REFRESH);
+    HWND hDone    = GetDlgItem(hDlg, IDC_BTN_SELECT_DONE);
+    HWND hCancel  = GetDlgItem(hDlg, IDC_BTN_SELECT_CANCEL);
+
+    int marginX = ScaleI(10, scale);
+    int marginY = ScaleI(10, scale);
+    int titleH  = ScaleI(16, scale);
+    int hintH   = ScaleI(16, scale);
+    int btnW    = ScaleI(75, scale);
+    int btnH    = ScaleI(24, scale);
+    int gapY    = ScaleI(6, scale);
+
+    int contentW = cx - marginX * 2;
+    if (contentW < ScaleI(100, scale)) contentW = ScaleI(100, scale);
+
+    int titleY = marginY;
+    int listY  = titleY + titleH + gapY;
+    int btnY   = cy - marginY - btnH;
+    int hintY  = btnY - gapY - hintH;
+    int listH  = hintY - gapY - listY;
+
+    if (listH < ScaleI(60, scale)) listH = ScaleI(60, scale);
+
+    HDWP hdwp = BeginDeferWindowPos(6);
+    if (hdwp) {
+        if (hTitle)   hdwp = DeferWindowPos(hdwp, hTitle,   NULL, marginX, titleY, contentW, titleH, SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hList)    hdwp = DeferWindowPos(hdwp, hList,    NULL, marginX, listY,  contentW, listH,  SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hHint)    hdwp = DeferWindowPos(hdwp, hHint,    NULL, marginX, hintY,  contentW, hintH,  SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hRefresh) hdwp = DeferWindowPos(hdwp, hRefresh, NULL, marginX, btnY,   btnW,     btnH,   SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hCancel)  hdwp = DeferWindowPos(hdwp, hCancel,  NULL, cx - marginX - btnW, btnY, btnW,   btnH,   SWP_NOZORDER | SWP_NOACTIVATE);
+        if (hDone)    hdwp = DeferWindowPos(hdwp, hDone,    NULL, cx - marginX - btnW * 2 - ScaleI(6, scale), btnY, btnW, btnH, SWP_NOZORDER | SWP_NOACTIVATE);
+        EndDeferWindowPos(hdwp);
+    }
+
+    if (hList) {
+        AdjustPickerColumns(hList, scale);
     }
 }
 
@@ -248,40 +310,27 @@ static INT_PTR CALLBACK ProcessPickerDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
 
         lvc.iSubItem = 0;
         lvc.fmt = LVCFMT_CENTER;
-        lvc.cx = ScaleI(24, scale);
+        lvc.cx = ScaleI(26, scale);
         lvc.pszText = const_cast<LPSTR>("");
         ListView_InsertColumn(hList, 0, &lvc);
 
         lvc.iSubItem = 1;
         lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = ScaleI(118, scale);
+        lvc.cx = ScaleI(150, scale);
         lvc.pszText = const_cast<LPSTR>("Process Name");
         ListView_InsertColumn(hList, 1, &lvc);
 
         lvc.iSubItem = 2;
         lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = ScaleI(110, scale);
-        lvc.pszText = const_cast<LPSTR>("File Name");
+        lvc.cx = ScaleI(72, scale);
+        lvc.pszText = const_cast<LPSTR>("Priority");
         ListView_InsertColumn(hList, 2, &lvc);
 
-        lvc.iSubItem = 3;
-        lvc.fmt = LVCFMT_LEFT;
-        lvc.cx = ScaleI(68, scale);
-        lvc.pszText = const_cast<LPSTR>("Priority");
-        ListView_InsertColumn(hList, 3, &lvc);
-
-        for (int i = 1; i < 4; ++i) {
-            int initialW = ListView_GetColumnWidth(hList, i);
-            ListView_SetColumnWidth(hList, i, LVSCW_AUTOSIZE_USEHEADER);
-            int autoW = ListView_GetColumnWidth(hList, i);
-            if (autoW < initialW) {
-                ListView_SetColumnWidth(hList, i, initialW);
-            } else {
-                ListView_SetColumnWidth(hList, i, autoW + ScaleI(6, scale));
-            }
-        }
-
         PopulateRunningProcesses(hList);
+
+        RECT rcClient;
+        GetClientRect(hDlg, &rcClient);
+        AdjustPickerLayout(hDlg, scale, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top);
         return TRUE;
     }
 
@@ -377,11 +426,46 @@ static INT_PTR CALLBACK ProcessPickerDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         break;
     }
 
+    case WM_SIZE: {
+        if (wParam != SIZE_MINIMIZED) {
+            float scale = GetDpiScaleForWindow(hDlg);
+            int cx = LOWORD(lParam);
+            int cy = HIWORD(lParam);
+            AdjustPickerLayout(hDlg, scale, cx, cy);
+        }
+        return TRUE;
+    }
+
+    case WM_GETMINMAXINFO: {
+        LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
+        float scale = GetDpiScaleForWindow(hDlg);
+        lpMMI->ptMinTrackSize.x = ScaleI(260, scale);
+        lpMMI->ptMinTrackSize.y = ScaleI(240, scale);
+        return TRUE;
+    }
+
+    case WM_DPICHANGED: {
+        float scale = GetDpiScaleForWindow(hDlg);
+        RECT* prcNew = reinterpret_cast<RECT*>(lParam);
+        if (prcNew) {
+            SetWindowPos(hDlg, NULL, prcNew->left, prcNew->top,
+                         prcNew->right - prcNew->left,
+                         prcNew->bottom - prcNew->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        RECT rcClient;
+        GetClientRect(hDlg, &rcClient);
+        AdjustPickerLayout(hDlg, scale, rcClient.right - rcClient.left, rcClient.bottom - rcClient.top);
+        return TRUE;
+    }
+
     case WM_COMMAND: {
         WORD cmdId = LOWORD(wParam);
         if (cmdId == IDC_BTN_REFRESH) {
             HWND hList = GetDlgItem(hDlg, IDC_LIST_RUNNING);
             PopulateRunningProcesses(hList);
+            float scale = GetDpiScaleForWindow(hDlg);
+            AdjustPickerColumns(hList, scale);
             return TRUE;
         }
         else if (cmdId == IDC_BTN_SELECT_DONE) {

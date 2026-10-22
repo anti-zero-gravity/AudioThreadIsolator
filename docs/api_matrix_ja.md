@@ -10,15 +10,13 @@
 | :--- | :--- | :--- |
 | **`CreateToolhelp32Snapshot`** | OS全域 | `TH32CS_SNAPPROCESS`: プロセス一覧を取得（未起動プロセスが存在する場合、または `UnlistedMask` フラグ有効時は INI設定のポーリング時間×10 ごとに 1 回発行。全監視対象が起動中かつ `UnlistedMask=0` 時は 0 回スキップ）。 |
 | **`Process32First` / `Next`** | OS全域 | プロセススナップショット取得時のみ各プロセスの EXE 名、PID、スレッド数を列挙取得。全起動中かつ `UnlistedMask=0` 時は 0 回。 |
-| **`GetSystemCpuSetInformation`** | OS全域 | システムの論理プロセッサと CPU Set ID の対応を取得。Settings の排他チェック適用時・起動時に 1 回取得してキャッシュし、ポーリング時は 0 回。 |
-| **`SetProcessDefaultCpuSets`** | プロセス | Unlisted（未登録）プロセスに対し、専用コア除外マスク（種別 1）または Excluded マスク（種別 2）の CPU Sets を適用（または解除）。ポーリング時は新規出現した Unlisted PID にのみ差分発行し、累計適用回数を加算。 |
 | **`GetExitCodeProcess`** | プロセス | 対象 PID の死活確認（プロセス終了判定）。数ナノ秒で完了し SNAPPROCESS を代替。 |
 | **`OpenProcess`** | プロセス | 対象プロセスの操作ハンドル（情報取得・アフィニティ変更・優先度変更・HighQoS 設定用）をオープン。 |
 | **`CloseHandle`** | 共通 | オープンしたプロセスハンドル、スレッドハンドル、スナップショットハンドルをクローズ解放。 |
 | **`SetProcessInformation`** | プロセス | **【HighQoS 保証】** `ProcessPowerThrottling` (4) を設定し、Power Throttling（EcoQoS）を強制解除。実行速度制限の解除および高精度タイマーを維持。親プロセスの HighQoS はカーネルの自動継承により配下全スレッドへ波及。 |
 | **`SetPriorityClass`** | プロセス | 対象プロセスの優先度クラス（Realtime, High, AboveNormal, Normal, BelowNormal, Idle）を設定。非管理者時に Realtime が拒否された場合は自動で High にフォールバック。 |
 | **`GetProcessAffinityMask`** | プロセス | 対象プロセスの現在の実行許可コアマスクを取得。 |
-| **`SetProcessAffinityMask`** | プロセス | 対象プロセスの実行許可コアマスクを拡張（通常コア ＋ オーディオコア）または通常コアへ制限。 |
+| **`SetProcessAffinityMask`** | プロセス | 対象プロセスの実行許可コアマスクを拡張（通常コア ＋ オーディオコア）または通常コアへ制限。さらに Unlisted（未登録）プロセスへの専用コア除外マスク一括/差分適用、および Unmask All による全コア復元に使用。 |
 | **`NtGetNextThread`** | スレッド | 対象 PID のプロセスハンドルから、属するスレッドハンドルをカーネル直結で順次取得。OS 全域走査を行わず特定 PID のみ直接列挙。 |
 | **`OpenThread`** | スレッド | 対象スレッドの操作ハンドル（追加権限の取得・サスペンド制御用）をオープン。 |
 | **`QueryThreadCycleTime`** | スレッド | スレッドが消費した CPU サイクル数の累積値を取得。毎ポーリング周期の Cycles Delta 算出、Chromium 初回登録時の親呼出制御スレッド（Cycles 降順 1 位）特定、定常監視、およびサンプリング（k=1..3）判定に使用。 |

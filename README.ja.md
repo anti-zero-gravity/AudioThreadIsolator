@@ -31,8 +31,8 @@
 - **管理者権限起動によるリアルタイム優先度（Base 16〜31）と制御範囲の拡大**:
   - タスクトレイアイコンの右クリックメニュー「`Restart as Administrator`」からワンクリックで管理者権限へ昇格再起動。
   - OS 特権（`SeIncreaseBasePriorityPrivilege` および `SeDebugPrivilege`）を自動有効化し、通常起動では制限される Windows カーネルのリアルタイム優先度クラス（Base Priority 16〜31）が 2D Priority Matrix Picker から選択・即時適用可能（※管理者権限でない場合は High priority にサイレントでフォールバック）。
-  - **起動モードによる設定範囲の違い**: 管理者モードではシステムサービスや昇格プロセスへのアクセスが可能になり、Unlisted マスク（CPU Sets）を適用できるプロセス数が増えるほか、権限不足によりスレッドを捕捉できずに `sleeping...` へ移行してしまうプロセス（`audiodg.exe` や管理者権限動作のゲーム等）が減少し、コア隔離が可能になります。
-- **監視対象外（Unlisted）プロセスの自動 CPU Sets 退避と個別除外**:
+  - **起動モードによる設定範囲の違い**: 管理者モードではシステムサービスや昇格プロセスへのアクセスが可能になり、Unlisted マスク（強制アフィニティ）を適用できるプロセス数が増えるほか、権限不足によりスレッドを捕捉できずに `sleeping...` へ移行してしまうプロセス（`audiodg.exe` や管理者権限動作のゲーム等）が減少し、コア隔離が可能になります。
+- **監視対象外（Unlisted）プロセスの自動アフィニティ退避と個別除外**:
   - Global Settings の排他チェックボックス（`Default Audio Core` 除外 / `Excluded` マスク適用）を ON にすると、ATI 未登録の全プロセスへ `SetProcessDefaultCpuSets` を一括適用し、以降に新規起動するプロセスへも `INI×10` 周期で自動追従適用（メイン画面凡例先頭に `● <累計数> Unmonitored Processes Masked` を表示）。
   - `[Add]`（`Select Process`）画面の先頭 `!` カラムでチェックしたプロセスは、ポーリングマスク対象から個別に除外可能（`UnlistedExclusions`）。
   - チェックを外すとポーリング適用のみ停止し、緑に点灯した `Unmask All` ボタンから明示的に全プロセスのマスクを一括解除可能。
@@ -102,7 +102,7 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
 - **ExcludedCores**:
   - （LAN用含む）オーディオスレッド用 CPU# 以外のすべてのプロセスとスレッドに許可する CPU# を設定します。
 - **Unlisted プロセスへのマスク自動適用（`Apply` 排他チェック / `Unmask All`）**:
-  - Global Settings 右側の `Apply` チェックボックス（上段: Default Audio Core 除外、下段: Excluded マスク適用）にチェックを入れると、監視リスト外の全プロセスへ CPU Sets マスクを適用し、新プロセス起動時も自動追従します。
+  - Global Settings 右側の `Apply` チェックボックス（上段: Default Audio Core 除外、下段: Excluded マスク適用）にチェックを入れると、監視リスト外の全プロセスへ強制アフィニティマスクを適用し、新プロセス起動時も自動追従します。
   - 監視リストには入れないがマスク対象からも外したいプロセスがある場合は、`[Add]`（`Select Process`）の先頭にある赤い **`!` カラム**にチェックを入れて `[Done]` を押すことで個別に除外できます。
   - 詳細な UI・設定仕様については [機能仕様書 (docs/spec_ja.md)](docs/spec_ja.md) を参照してください。
 

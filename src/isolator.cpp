@@ -75,33 +75,13 @@ static void ApplyProcessHighQoS(HANDLE hProcess) {
   }
 }
 
-typedef BOOL(WINAPI *PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *, ULONG);
-
-static PFN_SetProcessDefaultCpuSets GetSetProcessDefaultCpuSetsFn() {
-  static PFN_SetProcessDefaultCpuSets s_pfn = nullptr;
-  static bool s_resolved = false;
-  if (!s_resolved) {
-    s_resolved = true;
-    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-    if (hK32) {
-      s_pfn = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
-          GetProcAddress(hK32, "SetProcessDefaultCpuSets"));
-    }
-  }
-  return s_pfn;
-}
-
-static bool SetProcessCpuSetsByPid(DWORD pid, const ULONG *ids, ULONG count) {
-  auto pfn = GetSetProcessDefaultCpuSetsFn();
-  if (!pfn)
+static bool SetProcessAffinityByPid(DWORD pid, DWORD_PTR mask) {
+  if (pid <= 4 || mask == 0)
     return false;
-  HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pid);
-  if (!hProcess) {
-    hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
-  }
+  HANDLE hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
   if (!hProcess)
     return false;
-  BOOL ok = pfn(hProcess, ids, count);
+  BOOL ok = SetProcessAffinityMask(hProcess, mask);
   CloseHandle(hProcess);
   return ok != FALSE;
 }
@@ -860,6 +840,8 @@ void ThreadIsolator::Initialize(const GlobalConfig &config) {
   m_chromiumThreadTracks.clear();
   m_chromiumAudioStates.clear();
   m_chromiumEvictedPids.clear();
+  m_audioDgAppliedTids.clear();
+  m_audioDgLastPrio.clear();
 }
 
 void ThreadIsolator::UpdateConfig(const GlobalConfig &config) {
@@ -882,7 +864,7 @@ void ThreadIsolator::AddRule(const ProcessRule &rule) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_config.rules.push_back(rule);
   if (m_config.unlistedMaskMode != 0 || m_hasUnlistedMaskInOs) {
-    ClearCpuSetsForProcessNamesLocked({ToLowerA(rule.processName)});
+    RestoreAffinityForProcessNamesLocked({ToLowerA(rule.processName)});
   }
   m_appliedThreads.clear();
 }
@@ -892,6 +874,9 @@ void ThreadIsolator::RemoveRule(size_t index) {
   if (index < m_config.rules.size()) {
     auto &rule = m_config.rules[index];
     ResumeAudioThreadIfSuspended(rule);
+    if (IsAudioDgProcess(rule.processName)) {
+      RestoreAudioDgProcessLocked(rule.activePid);
+    }
     m_config.rules.erase(m_config.rules.begin() + index);
   }
 }
@@ -948,6 +933,9 @@ void ThreadIsolator::ToggleProcessBypass(size_t index) {
     rule.wasHalfAutoPromoted = false;
     if (rule.isBypassed) {
       ResumeAudioThreadIfSuspended(rule);
+      if (IsAudioDgProcess(rule.processName)) {
+        RestoreAudioDgProcessLocked(rule.activePid);
+      }
       rule.isAudioIsolated = false;
       rule.hasIntruderThreads = false;
       rule.detectedThreadName = "Bypassed";
@@ -1008,6 +996,9 @@ void ThreadIsolator::RestartSearch(size_t index) {
     m_chromiumThreadTracks.erase(rule.audioServicePid);
   }
   m_samplingStates.erase(rule.activePid);
+  m_trackedAudioThreads.erase(rule.activePid);
+  m_audioDgAppliedTids.erase(rule.activePid);
+  m_audioDgLastPrio.erase(rule.activePid);
 }
 
 void ThreadIsolator::ResumeMultiSearch(size_t index) {
@@ -1104,6 +1095,9 @@ void ThreadIsolator::ResumeAllSuspendedThreads() {
   std::lock_guard<std::mutex> lock(m_mutex);
   for (auto &rule : m_config.rules) {
     ResumeAudioThreadIfSuspended(rule);
+    if (IsAudioDgProcess(rule.processName) && !rule.isBypassed) {
+      RestoreAudioDgProcessLocked(rule.activePid);
+    }
   }
 }
 
@@ -1287,6 +1281,112 @@ void ThreadIsolator::ClearChromiumTrackingState(DWORD pid) {
   m_chromiumScannedPids.erase(pid);
 }
 
+// audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF / Normal / 全TID +2)
+void ThreadIsolator::RestoreAudioDgProcessLocked(DWORD targetPid) {
+  EnableDebugPrivilegeOnce();
+  std::vector<DWORD> pids;
+  if (targetPid != 0) {
+    pids.push_back(targetPid);
+  }
+  for (const auto &kv : m_audioDgAppliedTids) {
+    if (kv.first != 0 &&
+        std::find(pids.begin(), pids.end(), kv.first) == pids.end()) {
+      pids.push_back(kv.first);
+    }
+  }
+  if (pids.empty()) {
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+      PROCESSENTRY32 pe = {sizeof(pe)};
+      if (Process32First(hSnap, &pe)) {
+        do {
+          if (IsAudioDgProcess(pe.szExeFile)) {
+            pids.push_back(pe.th32ProcessID);
+          }
+        } while (Process32Next(hSnap, &pe));
+      }
+      CloseHandle(hSnap);
+    }
+  }
+
+  DWORD_PTR fullMask = GetFullCoreMask(CpuTopology::GetSystemCoreCount());
+  EnsureNtLoaded();
+
+  for (DWORD pid : pids) {
+    if (pid <= 4)
+      continue;
+    HANDLE hProc = OpenProcess(
+        PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!hProc) {
+      hProc = OpenProcess(
+          PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+          pid);
+    }
+    if (!hProc) {
+      hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+    }
+    if (hProc) {
+      if (fullMask != 0) {
+        SetProcessAffinityMask(hProc, fullMask);
+      }
+      SetPriorityClass(hProc, NORMAL_PRIORITY_CLASS);
+      CloseHandle(hProc);
+    }
+
+    std::vector<THREADENTRY32> threads;
+    if (s_pfnNtGetNextThread) {
+      HANDLE hQProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+      if (hQProc) {
+        HANDLE hCur = NULL, hNext = NULL;
+        while (s_pfnNtGetNextThread(hQProc, hCur, THREAD_QUERY_INFORMATION, 0,
+                                    0, &hNext) == 0) {
+          if (hCur)
+            CloseHandle(hCur);
+          hCur = hNext;
+          DWORD exitCode = 0;
+          if (GetExitCodeThread(hCur, &exitCode) && exitCode == STILL_ACTIVE) {
+            DWORD tid = GetThreadId(hCur);
+            if (tid != 0) {
+              THREADENTRY32 te = {0};
+              te.dwSize = sizeof(te);
+              te.th32OwnerProcessID = pid;
+              te.th32ThreadID = tid;
+              threads.push_back(te);
+            }
+          }
+        }
+        if (hCur)
+          CloseHandle(hCur);
+        CloseHandle(hQProc);
+      }
+    }
+    if (threads.empty()) {
+      QueryProcessThreadsContextSwitches(pid, &threads);
+    }
+
+    for (const auto &te : threads) {
+      DWORD tid = te.th32ThreadID;
+      HANDLE hTh = OpenThread(
+          THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, tid);
+      if (!hTh) {
+        hTh = OpenThread(
+            THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE,
+            tid);
+      }
+      if (!hTh) {
+        hTh = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+      }
+      if (hTh) {
+        SetThreadPriority(hTh, THREAD_PRIORITY_HIGHEST); // +2
+        CloseHandle(hTh);
+      }
+    }
+  }
+
+  m_audioDgAppliedTids.clear();
+  m_audioDgLastPrio.clear();
+}
+
 // 候補 3: Suspend 中オーディオスレッドの安全な Resume
 void ThreadIsolator::ResumeAudioThreadIfSuspended(ProcessRule &rule) {
   for (DWORD sTid : rule.suspendedAudioTids) {
@@ -1312,9 +1412,9 @@ void ThreadIsolator::ResumeAudioThreadIfSuspended(ProcessRule &rule) {
 bool ThreadIsolator::UpdateDisplayThreadCount(ProcessRule &rule,
                                               int totalThreadCount) {
   int displayThreadCount = 0;
-  if (rule.appType == 2) {
-    // Chromium 系ブラウザ (AppType: 2): 確定後も全 flag=0 スレッドを常時監視するため、
-    // 子プロセス全体の総スレッド数 (10本以上) を常時反映
+  if (rule.appType == 2 || IsAudioDgProcess(rule.processName)) {
+    // Chromium 系ブラウザ (AppType: 2) および audiodg.exe (AppType: 0):
+    // 確定後もプロセス全体の総スレッド数を常時反映
     displayThreadCount = totalThreadCount;
   } else if (rule.isAudioIsolated) {
     displayThreadCount = 1;
@@ -1411,23 +1511,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
   DWORD candTid = 0;
   ULONG64 maxDelta = 0;
 
-  if (IsAudioDgProcess(rule.processName)) {
-    // === audiodg.exe ハードコードモード: ContextSwitches (コンテキストスイッチ数) 最大のスレッドを捕捉 ===
-    auto ctxSwitches = QueryProcessThreadsContextSwitches(pid);
-    ULONG maxCtx = 0;
-    for (const auto &ti : threadInfos) {
-      auto cIt = ctxSwitches.find(ti.tid);
-      ULONG ctx = (cIt != ctxSwitches.end()) ? cIt->second : 0;
-      if (ctx > maxCtx || (candTid == 0 && ctx == maxCtx)) {
-        maxCtx = ctx;
-        candTid = ti.tid;
-      }
-    }
-    if (candTid != 0) {
-      rule.activeAudioTids = {candTid};
-      maxDelta = maxCtx;
-    }
-  } else if (rule.ignoreSig) {
+  if (rule.ignoreSig) {
     // === IgnoreSig モード: TimeCritical (15) + Delta >= 3M 判定 ===
 
     ULONG64 deltaThreshold = CalculateDeltaThreshold(
@@ -1713,14 +1797,14 @@ bool ThreadIsolator::ScanAndIsolate() {
   const auto &currentPidThreadCounts = s_cachedCurrentPidThreadCounts;
 
   if (shouldScanProcesses && m_config.unlistedMaskMode != 0 &&
-      !m_cachedTargetCpuSetIds.empty() && GetSetProcessDefaultCpuSetsFn()) {
+      m_activeUnlistedMask != 0) {
     std::unordered_set<DWORD> allSnapPids;
     for (const auto &kv : runningProcesses) {
       for (DWORD p : kv.second) {
         allSnapPids.insert(p);
       }
     }
-    EraseDeadPidSet(m_cpuSetsAppliedPids, allSnapPids);
+    EraseDeadPidSet(m_unlistedMaskedPids, allSnapPids);
 
     auto whitelist = BuildUnlistedWhitelist(true);
     DWORD myPid = GetCurrentProcessId();
@@ -1728,12 +1812,10 @@ bool ThreadIsolator::ScanAndIsolate() {
       if (whitelist.count(kv.first) > 0)
         continue;
       for (DWORD pid : kv.second) {
-        if (pid <= 4 || pid == myPid || m_cpuSetsAppliedPids.count(pid) > 0)
+        if (pid <= 4 || pid == myPid || m_unlistedMaskedPids.count(pid) > 0)
           continue;
-        m_cpuSetsAppliedPids.insert(pid);
-        if (SetProcessCpuSetsByPid(
-                pid, m_cachedTargetCpuSetIds.data(),
-                static_cast<ULONG>(m_cachedTargetCpuSetIds.size()))) {
+        m_unlistedMaskedPids.insert(pid);
+        if (SetProcessAffinityByPid(pid, m_activeUnlistedMask)) {
           m_unlistedApplyCount++;
           stateChanged = true;
         }
@@ -1823,6 +1905,15 @@ bool ThreadIsolator::ScanAndIsolate() {
     bool needSave = false;
 
     for (auto &rule : m_config.rules) {
+      if (IsAudioDgProcess(rule.processName)) {
+        if (rule.lastAudioPid != 0 || rule.lastAudioTid != 0 || !rule.lastAudioTids.empty()) {
+          rule.lastAudioPid = 0;
+          rule.lastAudioTid = 0;
+          rule.lastAudioTids.clear();
+          needSave = true;
+        }
+        continue;
+      }
       if (rule.lastAudioPid != 0 && (!rule.lastAudioTids.empty() || rule.lastAudioTid != 0)) {
         if (rule.lastAudioTids.empty() && rule.lastAudioTid != 0) {
           rule.lastAudioTids.push_back(rule.lastAudioTid);
@@ -1938,6 +2029,8 @@ bool ThreadIsolator::ScanAndIsolate() {
   EraseDeadPidKeys(m_prevThreadCpuTimes, allActivePids);
   EraseDeadPidKeys(m_cachedProcessTids, allActivePids);
   EraseDeadPidKeys(m_lastProcessThreadCount, allActivePids);
+  EraseDeadPidKeys(m_audioDgAppliedTids, allActivePids);
+  EraseDeadPidKeys(m_audioDgLastPrio, allActivePids);
 
   // 2. 各登録ルールのプロセスを検査・アフィニティ制御
   for (auto &rule : m_config.rules) {
@@ -1949,6 +2042,8 @@ bool ThreadIsolator::ScanAndIsolate() {
         ResumeAudioThreadIfSuspended(rule);
         if (rule.activePid != 0) {
           m_samplingStates.erase(rule.activePid);
+          m_audioDgAppliedTids.erase(rule.activePid);
+          m_audioDgLastPrio.erase(rule.activePid);
         }
         rule.isRunning = false;
         rule.activePid = 0;
@@ -1974,6 +2069,9 @@ bool ThreadIsolator::ScanAndIsolate() {
     // 監視除外・ペンディング (チェックON時)
     // はスレッド走査・アフィニティ制御・優先度制御を完全スキップ
     if (rule.isBypassed) {
+      if (IsAudioDgProcess(rule.processName) && !m_audioDgAppliedTids.empty()) {
+        RestoreAudioDgProcessLocked(rule.activePid);
+      }
       if (rule.detectedThreadName != "Bypassed") {
         rule.detectedThreadName = "Bypassed";
         stateChanged = true;
@@ -1994,6 +2092,8 @@ bool ThreadIsolator::ScanAndIsolate() {
         m_trackedAudioThreads.erase(pid);
         m_prevThreadCpuTimes.erase(pid);
         m_samplingStates.erase(pid);
+        m_audioDgAppliedTids.erase(pid);
+        m_audioDgLastPrio.erase(pid);
       }
       continue;
     }
@@ -2060,6 +2160,147 @@ bool ThreadIsolator::ScanAndIsolate() {
       normalMask = MakeDefaultNormalMask(coreCount, rule.audioCore);
     }
     DWORD_PTR parentMask = audioMask | baseNormal;
+
+    // ── audiodg.exe 専用パス (AppType: 0): PID 全体に audioMask・優先度クラス・HighQoS を適用し、
+    // 全 TID (およびポーリングごとの新規 TID) にスレッド優先度を適用 ──
+    if (IsAudioDgProcess(rule.processName)) {
+      DWORD latestIsolatedPid = 0;
+      int latestPidThreadCount = 0;
+      for (DWORD pid : it->second) {
+        auto ptIt = processThreads.find(pid);
+        int pidThreadCount = (ptIt != processThreads.end())
+                                 ? static_cast<int>(ptIt->second.size())
+                                 : 0;
+        latestPidThreadCount = pidThreadCount;
+
+        HANDLE hProc = OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        if (!hProc) {
+          hProc = OpenProcess(
+              PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+              pid);
+        }
+
+        if (hProc) {
+          // 1. HighQoS 適用
+          ApplyProcessHighQoS(hProc);
+
+          // 2. PID に audioMask を適用
+          DWORD_PTR currentProcMask = 0, sysMask = 0;
+          if (GetProcessAffinityMask(hProc, &currentProcMask, &sysMask)) {
+            if (currentProcMask != audioMask) {
+              if (SetProcessAffinityMask(hProc, audioMask)) {
+                stateChanged = true;
+              }
+            }
+          } else {
+            SetProcessAffinityMask(hProc, audioMask);
+          }
+
+          // 3. PID にプロセス優先度クラスを適用
+          if (rule.processPriorityClass != 0) {
+            DWORD curPrioClass = GetPriorityClass(hProc);
+            if (curPrioClass != 0 && curPrioClass != rule.processPriorityClass) {
+              if (SetPriorityClass(hProc, rule.processPriorityClass)) {
+                stateChanged = true;
+              } else if (rule.processPriorityClass == REALTIME_PRIORITY_CLASS) {
+                if (SetPriorityClass(hProc, HIGH_PRIORITY_CLASS)) {
+                  stateChanged = true;
+                }
+              }
+            }
+          }
+
+          CloseHandle(hProc);
+
+          // 4. 全 TID の監視 & 新規 TID へのスレッド優先度適用
+          int targetAudioPrio = (!rule.audioPriorities.empty())
+                                    ? rule.audioPriorities[0]
+                                    : rule.audioPriority;
+          auto &appliedTids = m_audioDgAppliedTids[pid];
+          bool isInitialPid = appliedTids.empty();
+          bool prioChanged =
+              (m_audioDgLastPrio.find(pid) == m_audioDgLastPrio.end() ||
+               m_audioDgLastPrio[pid] != targetAudioPrio);
+
+          if (ptIt != processThreads.end()) {
+            std::unordered_set<DWORD> aliveTids;
+            for (const auto &te : ptIt->second) {
+              aliveTids.insert(te.th32ThreadID);
+            }
+            EraseDeadPidSet(appliedTids, aliveTids);
+
+            for (const auto &te : ptIt->second) {
+              DWORD tid = te.th32ThreadID;
+              bool isNewTid = (appliedTids.find(tid) == appliedTids.end());
+              if (isNewTid || prioChanged) {
+                HANDLE hTh = OpenThread(
+                    THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+                    tid);
+                if (!hTh) {
+                  hTh = OpenThread(
+                      THREAD_SET_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION,
+                      FALSE, tid);
+                }
+                if (!hTh) {
+                  hTh = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
+                }
+                if (hTh) {
+                  SetThreadPriority(hTh, targetAudioPrio);
+                  CloseHandle(hTh);
+                }
+                if (isNewTid) {
+                  appliedTids.insert(tid);
+                  if (!isInitialPid) {
+                    rule.applyCount++;
+                    stateChanged = true;
+                  }
+                }
+              }
+            }
+          }
+
+          if (isInitialPid) {
+            rule.applyCount++;
+            stateChanged = true;
+          }
+          m_audioDgLastPrio[pid] = targetAudioPrio;
+          latestIsolatedPid = pid;
+        }
+      }
+      totalThreadCount = latestPidThreadCount;
+
+      if (latestIsolatedPid != 0) {
+        std::string label = "PID " + std::to_string(latestIsolatedPid) + " / -";
+        if (!rule.isAudioIsolated || rule.activePid != latestIsolatedPid ||
+            rule.detectedThreadName != label) {
+          rule.isAudioIsolated = true;
+          rule.activePid = latestIsolatedPid;
+          rule.activeAudioTid = 0;
+          rule.activeAudioTids.clear();
+          rule.detectedThreadName = label;
+          rule.searchPhase = 0;
+          rule.searchTurns = 0;
+          stateChanged = true;
+        }
+      } else {
+        if (rule.isAudioIsolated || rule.detectedThreadName != "Searching...") {
+          rule.detectedThreadName = "Searching...";
+          rule.isAudioIsolated = false;
+          rule.activeAudioTid = 0;
+          rule.activeAudioTids.clear();
+          rule.searchPhase = 1;
+          rule.searchTurns = 0;
+          stateChanged = true;
+        }
+      }
+
+      if (UpdateDisplayThreadCount(rule, totalThreadCount))
+        stateChanged = true;
+      if (stateChanged)
+        LogRuleStateChange(rule);
+      continue;
+    }
 
     // ── Chromium 専用パス: Audio Service のみスレッド走査、他は AffinityMask
     // のみ ──
@@ -3261,9 +3502,12 @@ ThreadIsolator::BuildUnlistedWhitelist(bool includeExclusions) const {
   return whitelist;
 }
 
-void ThreadIsolator::ClearCpuSetsForProcessNamesLocked(
+void ThreadIsolator::RestoreAffinityForProcessNamesLocked(
     const std::unordered_set<std::string> &namesLower) {
-  if (namesLower.empty() || !GetSetProcessDefaultCpuSetsFn())
+  if (namesLower.empty())
+    return;
+  DWORD_PTR fullMask = GetFullCoreMask(CpuTopology::GetSystemCoreCount());
+  if (fullMask == 0)
     return;
   HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
   if (hSnap == INVALID_HANDLE_VALUE)
@@ -3272,8 +3516,8 @@ void ThreadIsolator::ClearCpuSetsForProcessNamesLocked(
   if (Process32First(hSnap, &pe)) {
     do {
       if (namesLower.count(ToLowerA(pe.szExeFile)) > 0) {
-        m_cpuSetsAppliedPids.erase(pe.th32ProcessID);
-        SetProcessCpuSetsByPid(pe.th32ProcessID, nullptr, 0);
+        m_unlistedMaskedPids.erase(pe.th32ProcessID);
+        SetProcessAffinityByPid(pe.th32ProcessID, fullMask);
       }
     } while (Process32Next(hSnap, &pe));
   }
@@ -3299,55 +3543,10 @@ void ThreadIsolator::EnableDebugPrivilegeOnce() {
   }
 }
 
-bool ThreadIsolator::BuildTargetCpuSetIds(DWORD_PTR targetMask,
-                                          std::vector<ULONG> &outIds) {
-  outIds.clear();
-  if (targetMask == 0)
-    return false;
-
-  typedef BOOL(WINAPI * PFN_GetSystemCpuSetInformation)(
-      void *, ULONG, PULONG, HANDLE, ULONG);
-  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-  if (!hK32)
-    return false;
-  auto pfnGetInfo = reinterpret_cast<PFN_GetSystemCpuSetInformation>(
-      GetProcAddress(hK32, "GetSystemCpuSetInformation"));
-  if (!pfnGetInfo)
-    return false;
-
-  ULONG bufSize = 0;
-  pfnGetInfo(nullptr, 0, &bufSize, GetCurrentProcess(), 0);
-  if (bufSize == 0)
-    return false;
-
-  std::vector<BYTE> buf(bufSize);
-  if (!pfnGetInfo(buf.data(), bufSize, &bufSize, GetCurrentProcess(), 0))
-    return false;
-
-  ULONG offset = 0;
-  while (offset + sizeof(DWORD) * 2 <= bufSize) {
-    const auto *pInfo = reinterpret_cast<const ATI_CPU_SET_INFO_INTERNAL *>(
-        buf.data() + offset);
-    if (pInfo->Size == 0)
-      break;
-    if (pInfo->Type == 0) {
-      BYTE logicalIdx = pInfo->CpuSet.LogicalProcessorIndex;
-      if (logicalIdx < 64 && ((targetMask & (1ULL << logicalIdx)) != 0)) {
-        outIds.push_back(pInfo->CpuSet.Id);
-      }
-    }
-    offset += pInfo->Size;
-  }
-  return !outIds.empty();
-}
-
-bool ThreadIsolator::ApplyUnlistedCpuSetsLocked(int mode,
-                                                DWORD_PTR targetMask) {
+bool ThreadIsolator::ApplyUnlistedMaskLocked(int mode,
+                                             DWORD_PTR targetMask) {
   EnableDebugPrivilegeOnce();
-
-  std::vector<ULONG> targetIds;
-  if (!BuildTargetCpuSetIds(targetMask, targetIds) ||
-      !GetSetProcessDefaultCpuSetsFn())
+  if (targetMask == 0)
     return false;
 
   HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -3356,8 +3555,7 @@ bool ThreadIsolator::ApplyUnlistedCpuSetsLocked(int mode,
 
   m_config.unlistedMaskMode = mode;
   m_activeUnlistedMask = targetMask;
-  m_cachedTargetCpuSetIds = targetIds;
-  m_cpuSetsAppliedPids.clear();
+  m_unlistedMaskedPids.clear();
   m_hasUnlistedMaskInOs = true;
 
   auto whitelist = BuildUnlistedWhitelist(true);
@@ -3370,10 +3568,8 @@ bool ThreadIsolator::ApplyUnlistedCpuSetsLocked(int mode,
       if (whitelist.count(ToLowerA(pe.szExeFile)) > 0)
         continue;
 
-      m_cpuSetsAppliedPids.insert(pe.th32ProcessID);
-      if (SetProcessCpuSetsByPid(
-              pe.th32ProcessID, m_cachedTargetCpuSetIds.data(),
-              static_cast<ULONG>(m_cachedTargetCpuSetIds.size()))) {
+      m_unlistedMaskedPids.insert(pe.th32ProcessID);
+      if (SetProcessAffinityByPid(pe.th32ProcessID, targetMask)) {
         m_unlistedApplyCount++;
       }
     } while (Process32Next(hSnap, &pe));
@@ -3382,9 +3578,9 @@ bool ThreadIsolator::ApplyUnlistedCpuSetsLocked(int mode,
   return true;
 }
 
-bool ThreadIsolator::ApplyUnlistedCpuSets(int mode, DWORD_PTR targetMask) {
+bool ThreadIsolator::ApplyUnlistedMask(int mode, DWORD_PTR targetMask) {
   std::lock_guard<std::mutex> lock(m_mutex);
-  return ApplyUnlistedCpuSetsLocked(mode, targetMask);
+  return ApplyUnlistedMaskLocked(mode, targetMask);
 }
 
 void ThreadIsolator::StopUnlistedPollingMask() {
@@ -3392,17 +3588,17 @@ void ThreadIsolator::StopUnlistedPollingMask() {
   m_config.unlistedMaskMode = 0;
 }
 
-bool ThreadIsolator::ReleaseUnlistedCpuSets() {
+bool ThreadIsolator::ReleaseUnlistedMask() {
   std::lock_guard<std::mutex> lock(m_mutex);
   EnableDebugPrivilegeOnce();
 
   m_config.unlistedMaskMode = 0;
   m_activeUnlistedMask = 0;
-  m_cachedTargetCpuSetIds.clear();
-  m_cpuSetsAppliedPids.clear();
+  m_unlistedMaskedPids.clear();
   m_hasUnlistedMaskInOs = false;
 
-  if (!GetSetProcessDefaultCpuSetsFn())
+  DWORD_PTR fullMask = GetFullCoreMask(CpuTopology::GetSystemCoreCount());
+  if (fullMask == 0)
     return false;
 
   auto whitelist = BuildUnlistedWhitelist(false);
@@ -3419,14 +3615,14 @@ bool ThreadIsolator::ReleaseUnlistedCpuSets() {
       if (whitelist.count(ToLowerA(pe.szExeFile)) > 0)
         continue;
 
-      SetProcessCpuSetsByPid(pe.th32ProcessID, nullptr, 0);
+      SetProcessAffinityByPid(pe.th32ProcessID, fullMask);
     } while (Process32Next(hSnap, &pe));
   }
   CloseHandle(hSnap);
   return true;
 }
 
-bool ThreadIsolator::HasAppliedUnlistedCpuSets() const {
+bool ThreadIsolator::HasAppliedUnlistedMask() const {
   std::lock_guard<std::mutex> lock(m_mutex);
   return m_hasUnlistedMaskInOs;
 }
@@ -3444,7 +3640,7 @@ void ThreadIsolator::UpdateUnlistedExclusions(
       exclLower.insert(ToLowerA(ex));
     }
   }
-  ClearCpuSetsForProcessNamesLocked(exclLower);
+  RestoreAffinityForProcessNamesLocked(exclLower);
 }
 
 DWORD ThreadIsolator::GetUnlistedApplyCount() const {

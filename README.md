@@ -31,11 +31,11 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
 - **Realtime Priority (Base 16–31) & Expanded Control Scope via Administrator Launch**:
   - Elevate seamlessly via the taskbar system tray context menu (`Restart as Administrator`).
   - Automatically enables `SeIncreaseBasePriorityPrivilege` and `SeDebugPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
-  - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted CPU Sets masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
-- **Automatic CPU Sets Eviction & Per-Process Exclusion for Unlisted Processes**:
+  - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted Hard Affinity masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
+- **Automatic Hard Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
   - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessDefaultCpuSets` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
   - Processes checked in the leading red `!` column of `Select Process` (`[Add]`) are individually excluded from unlisted polling mask targets (`UnlistedExclusions`).
-  - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default CPU Sets across all non-monitored processes.
+  - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default full-core affinity across all non-monitored processes.
 
 ---
 
@@ -102,7 +102,7 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 - **ExcludedCores**:
   - Specify the CPU# mask permitted for all regular processes and background threads, excluding the dedicated audio CPU# (and any dedicated LAN CPU#).
 - **Automatic Unlisted Process Masking (`Apply` Checkboxes / `Unmask All`)**:
-  - Checking either `Apply` checkbox in Global Settings applies CPU Sets protection to all unlisted processes and automatically tracks newly launched processes.
+  - Checking either `Apply` checkbox in Global Settings applies Hard Affinity protection to all unlisted processes and automatically tracks newly launched processes.
   - To exclude specific non-monitored processes from unlisted polling masks, open `[Add]` (`Select Process`), check the leading red **`!` column**, and click `[Done]`.
   - For full UI and configuration details, see the [User Manual & Specification (docs/spec.md)](docs/spec.md).
 

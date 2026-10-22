@@ -699,7 +699,7 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         WritePrivateProfileStringA("Global", "WindowHeight", std::to_string(wH).c_str(), iniPath.c_str());
     }
 
-    WritePrivateProfileSectionA("Processes", "\0", iniPath.c_str());
+    std::vector<char> sectionBuf;
     for (const auto& rule : config.rules) {
         DWORD_PTR rMask = rule.audioAffinityMask 
             ? rule.audioAffinityMask 
@@ -780,10 +780,15 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         if (rule.isBypassed) {
             val += ", Bypass:1";
         }
-        WritePrivateProfileStringA(
-            "Processes", rule.processName.c_str(), val.c_str(), iniPath.c_str()
-        );
+        std::string entry = rule.processName + "=" + val;
+        sectionBuf.insert(sectionBuf.end(), entry.begin(), entry.end());
+        sectionBuf.push_back('\0');
     }
+    if (sectionBuf.empty()) {
+        sectionBuf.push_back('\0');
+    }
+    sectionBuf.push_back('\0');
+    WritePrivateProfileSectionA("Processes", sectionBuf.data(), iniPath.c_str());
 }
 
 // --- ListView ヘルパー (メイン監視画面: 固定9列) ---
@@ -1281,17 +1286,17 @@ static void EnableDebugPrivilege() {
     }
 }
 
-static bool ApplyConfiguredUnlistedCpuSets(const ati::GlobalConfig& cfg) {
+static bool ApplyConfiguredUnlistedMask(const ati::GlobalConfig& cfg) {
     if (cfg.unlistedMaskMode == 1) {
         int coreCount = ati::CpuTopology::GetSystemCoreCount();
         DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
         DWORD_PTR excludeMask = fullMask & ~cfg.defaultAudioAffinityMask;
-        if (excludeMask != 0 && g_isolator.ApplyUnlistedCpuSets(1, excludeMask)) {
+        if (excludeMask != 0 && g_isolator.ApplyUnlistedMask(1, excludeMask)) {
             s_bUnlistedMaskApplied = TRUE;
             return true;
         }
     } else if (cfg.unlistedMaskMode == 2) {
-        if (cfg.normalAffinityMask != 0 && g_isolator.ApplyUnlistedCpuSets(2, cfg.normalAffinityMask)) {
+        if (cfg.normalAffinityMask != 0 && g_isolator.ApplyUnlistedMask(2, cfg.normalAffinityMask)) {
             s_bUnlistedMaskApplied = TRUE;
             return true;
         }
@@ -1464,7 +1469,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             };
             subclassCheckbox(IDC_BTN_APPLY_EXCLUDE_CORE, s_tmpConfig.unlistedMaskMode == 1);
             subclassCheckbox(IDC_BTN_APPLY_NORMAL_MASK, s_tmpConfig.unlistedMaskMode == 2);
-            s_bUnlistedMaskApplied = g_isolator.HasAppliedUnlistedCpuSets() ? TRUE : FALSE;
+            s_bUnlistedMaskApplied = g_isolator.HasAppliedUnlistedMask() ? TRUE : FALSE;
             EnableWindow(hBtnRel, (s_tmpConfig.unlistedMaskMode == 0) && s_bUnlistedMaskApplied);
         }
 
@@ -1742,13 +1747,13 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                     MessageBoxA(hDlg,
                                 (targetMode == 1) ? "Invalid target mask (cannot exclude all cores)."
                                                   : "Invalid normal affinity mask.",
-                                "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+                                "ATI Unlisted Mask", MB_OK | MB_ICONWARNING);
                 } else {
                     if (hChkOther) {
                         SendMessageA(hChkOther, BM_SETCHECK, BST_UNCHECKED, 0);
                         InvalidateRect(hChkOther, nullptr, TRUE);
                     }
-                    if (g_isolator.ApplyUnlistedCpuSets(targetMode, targetMask)) {
+                    if (g_isolator.ApplyUnlistedMask(targetMode, targetMask)) {
                         s_tmpConfig.unlistedMaskMode = targetMode;
                         s_bUnlistedMaskApplied = TRUE;
                         SaveConfig(g_isolator.GetConfig(), g_iniPath);
@@ -1774,7 +1779,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
             if (hChkSelf) InvalidateRect(hChkSelf, nullptr, TRUE);
             return TRUE;
         } else if (cmdId == IDC_BTN_RELEASE_MASK) {
-            if (g_isolator.ReleaseUnlistedCpuSets()) {
+            if (g_isolator.ReleaseUnlistedMask()) {
                 s_tmpConfig.unlistedMaskMode = 0;
                 s_bUnlistedMaskApplied = FALSE;
                 SaveConfig(g_isolator.GetConfig(), g_iniPath);
@@ -1824,7 +1829,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 SetProcessAffinityMask(GetCurrentProcess(), s_tmpConfig.normalAffinityMask);
             }
 
-            ApplyConfiguredUnlistedCpuSets(s_tmpConfig);
+            ApplyConfiguredUnlistedMask(s_tmpConfig);
             SetTimer(g_hMainDlg, TIMER_POLLING_ID, s_tmpConfig.pollingIntervalMs, nullptr);
             if (g_hMainDlg) InvalidateRect(g_hMainDlg, nullptr, FALSE);
             HWND hList = GetDlgItem(g_hMainDlg, IDC_LIST_PROCESSES);
@@ -2504,6 +2509,33 @@ static bool EnableRealtimePrivilege() {
     return (err == ERROR_SUCCESS);
 }
 
+static bool s_skipDestroyCleanup = false;
+
+static void SaveWindowMetricsAndConfig(HWND hDlg) {
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    float scale = GetDpiScaleForWindow(hDlg);
+    if (scale <= 0.0f) scale = 1.0f;
+    if (hList) {
+        g_colWidths.clear();
+        for (int i = 0; i < kColCount; ++i) {
+            int colW = ListView_GetColumnWidth(hList, i);
+            int baseW = static_cast<int>(std::round(colW / scale));
+            if (baseW < 10) baseW = kColDefaultWidths[i];
+            g_colWidths.push_back(baseW);
+        }
+    }
+    RECT rcDlg;
+    if (GetWindowRect(hDlg, &rcDlg)) {
+        int curH = rcDlg.bottom - rcDlg.top;
+        g_windowHeight = static_cast<int>(std::round(curH / scale));
+    }
+
+    ati::GlobalConfig curCfg = g_isolator.GetConfig();
+    curCfg.columnWidths = g_colWidths;
+    curCfg.windowHeight = g_windowHeight;
+    SaveConfig(curCfg, g_iniPath);
+}
+
 // --- アプリケーション再起動ヘルパー ---
 static void RestartApplication(HWND hDlg) {
     char exePath[MAX_PATH] = { 0 };
@@ -2511,6 +2543,8 @@ static void RestartApplication(HWND hDlg) {
     KillTimer(hDlg, TIMER_POLLING_ID);
     RemoveTrayIcon();
     g_isolator.ResumeAllSuspendedThreads();
+    SaveWindowMetricsAndConfig(hDlg);
+    s_skipDestroyCleanup = true;
     bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
     const char* params = wasInTray ? "--tray" : nullptr;
     if (g_hSingleInstanceMutex) {
@@ -2528,11 +2562,15 @@ static void RestartAsAdmin(HWND hDlg) {
     bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
     const char* params = wasInTray ? "--tray" : nullptr;
 
+    // 新プロセス起動前に設定を保存し、起動後の INI 読み書き競合を防止
+    SaveWindowMetricsAndConfig(hDlg);
+
     HINSTANCE hInst = ShellExecuteA(hDlg, "runas", exePath, params, nullptr, wasInTray ? SW_HIDE : SW_SHOW);
     if (reinterpret_cast<INT_PTR>(hInst) > 32) {
         KillTimer(hDlg, TIMER_POLLING_ID);
         RemoveTrayIcon();
         g_isolator.ResumeAllSuspendedThreads();
+        s_skipDestroyCleanup = true;
         if (g_hSingleInstanceMutex) {
             CloseHandle(g_hSingleInstanceMutex);
             g_hSingleInstanceMutex = nullptr;
@@ -3017,7 +3055,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         LogDebug("WM_INITDIALOG: Self isolation applied");
 
         g_isolator.Initialize(config);
-        ApplyConfiguredUnlistedCpuSets(config);
+        ApplyConfiguredUnlistedMask(config);
         LogDebug("WM_INITDIALOG: isolator Initialize done");
 
         RefreshListView(hList, config.rules);
@@ -3423,7 +3461,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         else if (cmdId == IDC_BTN_EXIT || cmdId == ID_TRAY_EXIT) {
             KillTimer(hDlg, TIMER_POLLING_ID);
             RemoveTrayIcon();
-            g_isolator.ResumeAllSuspendedThreads();
             DestroyWindow(hDlg);
             return TRUE;
         }
@@ -3965,31 +4002,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_DESTROY: {
         KillTimer(hDlg, TIMER_POLLING_ID);
         RemoveTrayIcon();
-        g_isolator.ResumeAllSuspendedThreads();
-
-        // 終了時に現在のカラム幅およびウィンドウ高さを論理ピクセル換算で退避
-        HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
-        float scale = GetDpiScaleForWindow(hDlg);
-        if (scale <= 0.0f) scale = 1.0f;
-        if (hList) {
-            g_colWidths.clear();
-            for (int i = 0; i < kColCount; ++i) {
-                int colW = ListView_GetColumnWidth(hList, i);
-                int baseW = static_cast<int>(std::round(colW / scale));
-                if (baseW < 10) baseW = kColDefaultWidths[i];
-                g_colWidths.push_back(baseW);
-            }
+        if (!s_skipDestroyCleanup) {
+            g_isolator.ResumeAllSuspendedThreads();
+            SaveWindowMetricsAndConfig(hDlg);
         }
-        RECT rcDlg;
-        if (GetWindowRect(hDlg, &rcDlg)) {
-            int curH = rcDlg.bottom - rcDlg.top;
-            g_windowHeight = static_cast<int>(std::round(curH / scale));
-        }
-
-        ati::GlobalConfig curCfg = g_isolator.GetConfig();
-        curCfg.columnWidths = g_colWidths;
-        curCfg.windowHeight = g_windowHeight;
-        SaveConfig(curCfg, g_iniPath);
 
         if (s_hMainFont) {
             DeleteObject(s_hMainFont);

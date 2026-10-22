@@ -1,81 +1,54 @@
 # Audio Thread Isolator (ATI) v1.0.5 - Specification & User Manual (spec.md)
 
-*Note: This document is the end-user manual for distribution. Detailed internal architectural specifications and algorithmic logic are documented in [arc.md](file:///c:/Users/YK-PC/.gemini/antigravity-ide/scratch/ATI/arc.md).*
-
 ## 1. Application Overview
 
 - **Name**: Audio Thread Isolator (ATI)
-- **Type**: Windows Native Resident Utility (C++17 / Pure Win32 API / Comctl32 / GDI+)
-- **Binary Architecture**: **Completely Standalone Single .exe File (No folders required)**
-  - All resources required for the 7x7 Priority Matrix Overlay Picker (HitMap binary, base background, and all 49 rank 3D composite images; total 51 assets) are fully embedded within the executable as `RCDATA`. Works out of the box with `ATI.exe` alone without needing an external `ui_parts/` folder.
+- **Type**: Windows Resident Utility
 - **Purpose**:
-  Automatically identifies the audio playback thread from running audio and multimedia processes, isolating it onto designated audio CPU core(s) while evicting all other non-audio threads to separate excluded cores. By preventing high-load threads from sharing cores with audio threads, micro-jitter (isochronous timing fluctuation from queuing latency) is minimized.
+  Automatically identifies the audio playback thread from running audio and multimedia processes, isolating it onto designated audio CPU core(s) while evicting all other non-audio threads to separate excluded cores. By preventing high-load threads from sharing cores with audio threads, the waiting time between a thread being queued in the ready queue and actually being executed is eliminated, minimizing micro-jitter in thread processing timing.
 - **Automatic HighQoS (Power Throttling OFF) Enforcement**:
-  For all processes registered for monitoring, ATI automatically disables Windows Power Throttling (EcoQoS) upon detection, enforcing HighQoS (maximum execution speed and timer resolution preservation). By applying this at the process level, Windows kernel inheritance ensures all threads (both existing and newly spawned) run at full clock speed without power-saving latency or throttling.
+  For all processes registered for monitoring, ATI automatically disables Windows Power Throttling (EcoQoS) upon detection, enforcing HighQoS (maximum execution speed and timer resolution preservation). This ensures all threads run at full clock speed without power-saving latency or audio dropouts.
 
 ---
 
 ## 2. UI Structure and Operations
 
 ### 2.1 Main Window
-- **Overview**: The primary monitoring and quick-control interface for registered processes (bypass, suspend, priority adjustment).
-- **High-DPI & Resolution Adaptive**: Automatically adjusts layout and font size smoothly without distortion during resolution or scaling changes (e.g., dual-mode monitors, 5K 200%).
-- **Separation of Concerns**: Daily monitoring and instant tuning are handled on the main screen, while core affinity configuration is managed via the per-process settings dialog (double-click row or `[Edit]`).
+- **Overview**: The primary monitoring and quick-control interface for registered processes (bypass, suspend, priority adjustment). Automatically adapts layout and font scaling across resolution or DPI changes.
 
 #### Control Buttons (Right Panel)
 - **`Always on Top`**: Pins the main window to always stay in the foreground.
-- **`[Edit]`**: Opens the settings dialog for the selected process (or double-click row).
-- **`[Add]`**: Opens a dialog (`Select Process`) to pick and add running processes to the monitoring list. Checking the leading `!` column in this dialog also designates processes (`UnlistedExclusions`) to be excluded when masking all unlisted (unmonitored) processes.
+- **`[Edit]`**: Opens the Thread Isolation Settings dialog (Section 2.5) for the selected process (or double-click row).
+- **`[Add]`**: Opens the Process Picker dialog (Section 2.2).
 - **`[Remove]`**: Removes the selected process from the monitoring list.
-- **`[Settings]`**: Opens global settings for system defaults and core protection.
+- **`[Settings]`**: Opens the Global Settings dialog (Section 2.4).
 - **`[Exit]`**: Exits the application.
-
-#### System Tray Menu (Right-Click Taskbar Tray Icon)
-- **`Open Settings`**: Restores and displays the main window (identical to left-clicking the tray icon).
-- **`Start with Windows`**: Toggles automatic startup with Windows.
-- **`Restart`**: Restarts the application normally.
-- **`Restart as Administrator`**: Restarts the application with elevated administrator privileges (UAC). (*Automatically hidden if already running with admin privileges). When running as administrator, `SeIncreaseBasePriorityPrivilege` is automatically enabled, unlocking `Realtime` priority (Base Priority 16-31).
-- **`Exit`**: Exits the application.
 
 #### Process Table (Monitoring List)
 
 | Col | Header | Summary & Role | Operation Details |
 |:---:|:---|:---|:---|
 | 0 | **`!`** | Toggles monitoring and temporary bypass. Checking this suspends ATI intervention. | Click to toggle |
-| 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multiple threads are detected via `IgnoreSig:t`, child rows display an L-shaped tree line (`└`) drawn via GDI to indicate parent-child hierarchy. | Double-click to open edit dialog.<br>Click header to sort ascending. |
-| 2 | **`Thread Priority`** | Relative thread priority applied to audio thread.<br>When multi-thread expansion is active, each row (parent/child) can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
+| 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multiple threads are detected via `IgnoreSig:t`, child rows display an L-shaped tree line (`└`) to indicate parent-child hierarchy. | Double-click to open edit dialog.<br>Click header to sort ascending ("SORT?" prompt). |
+| 2 | **`Thread Priority`** | Relative thread priority applied to audio thread.<br>When multi-thread expansion is active, each row can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
 | 3 | **`Process Priority`** | Priority class applied to the process (PID) hosting the audio thread. | Click cell to select via 2D Priority Matrix Picker |
 | 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the genuine playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
-| 5 | **`Audio Core PID/TID`** | Displays detection state, isolated PID, and TID. When multi-thread expansion is active, each TID is displayed sorted in **descending Cycles Delta**. | Click operation: Restarts search when sleeping; toggles Bypass when running (double-click disabled). |
-| 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard apps, total app thread count during search, and `0` when sleeping. | Double-click to open edit dialog. |
+| 5 | **`Audio Core PID/TID`** | Displays detection state, isolated PID, and TID. | Click operation: Restarts search when sleeping; toggles Bypass when running. |
+| 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard confirmed apps, total process thread count during search or for Chromium / `audiodg.exe`, and `0` when sleeping. | Double-click to open edit dialog. |
 | 7 | **`Chgs`** | Count of times audio thread was detected and priorities were applied. | Double-click to open edit dialog. |
 | 8 | **`Audio`** | Dedicated audio CPU core number (e.g., `#1`). When multi-thread expansion is active, shows the core assigned to each thread. | Double-click to open edit dialog. |
-| 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>**In multi-thread expansion, since sibling threads share the same parent PID and eviction mask, rows 2 and beyond (subIndex > 0) display `same`.** | Double-click to open edit dialog. |
+| 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>In multi-thread expansion, since sibling threads share the same parent process and eviction mask, rows 2 and beyond display `same`. | Double-click to open edit dialog. |
 
 - **`IgnoreSig:t` Multi-Audio Thread Expansion**:
-  - By configuring thread count `t` (natural number) such as `IgnoreSig:2` in `INI`, ATI identifies and isolates the top `t` audio threads.
-  - The table expands to display `t` rows sorted in **descending Cycles Delta** (CPU activity order) as if they were distinct entries.
-  - The 1st row displays the actual excluded core list in the `Excluded` column; rows 2 and subsequent show `same`.
-  - **10-Second Continuous Scan Countdown & Simultaneous `sleeping...` Transition**:
-    - Scans every turn for 10 seconds for pending unconfirmed slots without idle intervals.
-    - The pending slot currently being searched displays a countdown from `Standby 10` down to `Standby 1`, while subsequent pending slots wait at `Standby 10`.
-    - If no subsequent thread is detected within 10 seconds, all unconfirmed slots from the 2nd thread onwards transition **simultaneously to `sleeping...`**.
-    - When a subsequent thread is detected, that slot immediately locks to `PID ... / TID ...`, and the next slot **starts counting down from 10**.
-    - Clicking a sleeping row (Col 0 or Col 5) immediately restarts the 10-second countdown scan while preserving already-locked threads.
-  - **Fallback Identification Logic**:
-    - If target thread count `t` cannot be met under standard criteria (Priority 15 and Cycles Delta >= threshold [default 3M/s]), ATI automatically falls back to thread wait-state analysis.
-    - Active threads satisfying `WaitReason == DelayExecution` (value 4) and Cycles Delta >= threshold (3M/s) are detected and locked onto remaining slots in descending Cycles Delta (e.g., captures threads in apps like Voicemeeter that do not assign priority 15).
-    - If all target slots are satisfied under normal conditions, fallback scanning is skipped to avoid unnecessary overhead.
-  - Each expanded row can be suspended independently (`❚❚`).
+  - By configuring thread count `t` (natural number) such as `IgnoreSig:2` in `ATI.ini`, ATI identifies and isolates the top `t` highest-activity audio threads—including in apps without standard audio signatures (such as Voicemeeter)—and expands them into `t` rows.
+  - **10-Second Scan Countdown & Simultaneous `sleeping...` Transition**:
+    - Continuously scans for pending unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on the active scanning slot (while subsequent slots wait at `Standby 10`).
+    - If no subsequent thread is detected within 10 seconds, all unconfirmed slots transition simultaneously to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-locked threads.
   - Editing and saving settings via `[Edit]` or double-clicking any sibling row updates all expanded rows of the process simultaneously.
 
-- **Rank Selection via 2D Priority Matrix Overlay Picker**:
-  - Clicking the `Thread Priority` (Col 2) or `Process Priority` (Col 3) cell pops up a 7x7 3D visual matrix overlaid on the center of the main window.
-  - Hovering over pillars updates HUD information in real-time (Base Priority, Rank #, Process Class, Thread Priority, formula).
-  - Clicking a pillar (Rank 1 to 49) commits both Process Class and Thread Priority, applying them immediately to the active process/threads and saving directly to `ATI.ini`.
-
-- **Ascending Sort by Clicking `Process Name` Header**:
-  - Clicking the `Process Name` header shows a confirmation prompt ("SORT?") and sorts the list alphabetically upon confirmation.
+- **Rank Selection via 2D Priority Matrix Picker**:
+  - Clicking the `Thread Priority` (Col 2) or `Process Priority` (Col 3) cell pops up a 7x7 3D visual matrix.
+  - Hovering over pillars displays rank details (Base Priority, Rank #, Process Class, Thread Priority), and clicking a pillar (Rank 1 to 49) immediately applies both Process Class and Thread Priority to the active process/threads and saves them to `ATI.ini`.
 
 #### Status Displays (Col 5) and Indicators
 
@@ -85,16 +58,16 @@
 | `Searching...` | ● Coral Pink | Searching for audio thread. | Toggles Bypass |
 | `Standby` / `Standby 10..1` | ● Coral Pink | Continuous monitoring standby. Awaiting audio output. | Transitions to Bypass (displays ☑ in ! col) |
 | `sleeping...` | ● Flashing Muted Purple / Red | Sleeping due to silence / inactivity. | Immediately restarts search |
-| `PID <pid> / TID <tid>` | ● Cyan / Teal | Audio thread identified and isolated onto audio core. | Transitions to Bypass (displays ☑ in ! col) |
+| `PID <pid> / TID <tid>` | ● Cyan / Teal | Audio thread identified and isolated onto audio core (displayed as `PID <pid> / -` for `audiodg.exe`). | Transitions to Bypass (displays ☑ in ! col) |
 | `PID <pid> / Searching...` | ● Coral Pink | Chromium audio process identified; searching internal threads. | Transitions to Bypass (displays ☑ in ! col) |
-| (Half-Isolated state) | ● Flashing Dull Yellow / Teal | Thread unmigratable due to driver constraints co-existing on audio core (suppression active). | Transitions to Bypass (displays ☑ in ! col) |
+| (Half-Isolated state) | ● Flashing Dull Yellow / Teal | Thread unmigratable due to driver constraints co-existing on audio core. Promotes `Idle (-15)` audio threads to `Lowest (-2)` and throttles co-existing threads one level below. | Transitions to Bypass (displays ☑ in ! col) |
 
 - **Leading Counter in Bottom Legend Bar**:
-  - Only while an `Apply` checkbox for Unlisted process protection is checked in Global Settings, the leftmost position of the main window legend bar displays **`● <count> Unmonitored Processes Masked`** with a gray dot (`●`), showing the cumulative number of non-monitored processes masked since startup (hidden when unchecked).
+  - Only while an `Apply` checkbox for Unlisted process protection is checked in Global Settings (Section 2.4), the leftmost position of the main window legend bar displays **`● <count> Unmonitored Processes Masked`**, showing the cumulative number of non-monitored processes masked since startup (hidden when unchecked).
 
 #### Priority Settings and Windows Base Priority
 
-Under standard applications (Normal process priority class), each setting corresponds to Windows Base Priority (1-15) and characteristics as follows:
+Under standard applications (Normal process priority class), each thread priority setting corresponds to Windows Base Priority (1–15) as follows:
 
 | ATI Setting | Base Priority | Characteristics |
 |:---|:---:|:---|
@@ -106,87 +79,58 @@ Under standard applications (Normal process priority class), each setting corres
 | **`Highest (+2)`** | **10** | Preferentially scheduled ahead of normal threads. |
 | **`Time Critical (+15)`** | **15** | Highest priority accessible to standard non-elevated applications. |
 
-- **Unlocking Realtime Priority (Base Priority 16-31)**:
-  - Ranks 43-49 in the 2D Priority Matrix Picker (Realtime priority class) require the process to run with administrator privileges (`SeIncreaseBasePriorityPrivilege` enabled).
-  - When not running as Administrator, ATI and the Windows kernel silently fall back to High priority (clamped to Base Priority 15). Restarting via **`Restart as Administrator`** in the tray menu enables elevated Base Priority from 16 to 31.
-- **Instant Application and Settings Saving**:
-  Priorities selected via the 2D Priority Matrix Picker are immediately applied to active processes and threads, and automatically saved to `ATI.ini`. Settings can also be adjusted manually via the per-process edit dialog (`[Edit]`).
-- **Half-Isolated Co-existing Thread Suppression (Graphics Drivers, etc.)**:
-  If an unmigratable thread (e.g., driver threads locked to specific CPU cores) is detected co-existing on the dedicated audio core, ATI automatically promotes `Idle (-15)` audio threads to `Lowest (-2)`. Co-existing threads are throttled to one level below the audio thread priority.
+- **Realtime Priority (Base Priority 16–31)**:
+  - Ranks 43–49 in the 2D Priority Matrix Picker (Realtime priority class) are available only when ATI is running as Administrator (automatically falls back to High priority class / max Base 15 in standard user mode).
 
 ---
 
 ### 2.2 Process Picker Dialog
-- Launched via `[Add]` from the main window.
-- Lists all currently running processes in alphabetical order.
-- Select a process and click `[Done]` to add it to the monitoring list (global default settings are applied initially).
-- Checking the leading red **`!` column (Column 0)** registers the process in `UnlistedExclusions`, excluding it from Unlisted polling mask (`SetProcessDefaultCpuSets`) targets (hovering over Column 0 displays an explanatory note at the bottom).
+- Launched via `[Add]` on the main window. Select running processes from the alphabetical list and click `[Done]` to add them to the monitoring list (initialized with global default settings).
+- Checking the leading red **`!` column** registers the process in `UnlistedExclusions`, excluding it from Unlisted process masking targets (hovering over the `!` column displays an explanatory note at the bottom).
 
 ### 2.3 System Tray Behavior
 - Clicking the `×` button or minimizing tucks the window into the system notification area (system tray).
-- **Left-Click Tray Icon**: Brings the main window to the foreground.
+- **Left-Click Tray Icon**: Restores and brings the main window to the foreground.
 - **Right-Click Menu**:
-  - `Open Settings`: Opens the main window.
-  - `Start with Windows`: Toggles automatic startup with Windows.
-  - `Restart`: Restarts the application.
-  - `Restart as Administrator`: Restarts with elevated UAC privileges (hidden when already elevated).
-  - `Exit`: Terminates the application.
+  - **`Open Settings`**: Restores and displays the main window.
+  - **`Start with Windows`**: Toggles automatic startup with Windows.
+  - **`Restart`**: Restarts the application normally.
+  - **`Restart as Administrator`**: Restarts with elevated UAC privileges (automatically hidden if already running as Administrator).
+  - **`Exit`**: Exits the application.
 
 ---
 
 ### 2.4 Global Settings Dialog
-Opened via `[Settings]` on the main window or tray menu. Manages default values for newly added processes and system-wide CPU Sets core protection.
+Opened via `[Settings]` on the main window. Manages default values for newly added processes and system-wide dedicated core protection masks.
 
 | Item | Summary & Role | Operation Details |
 |:---|:---|:---|
-| **Core Assignment Table** | Configures default dedicated audio core (Row 0) and excluded cores (Row 1). | Select via checkboxes |
-| **`Default Audio Core (Mask)`** | Hexadecimal mask for default audio core. | Direct input or table click |
-| **`Apply` (Audio Core Row)** | **[Dedicated Core Protection (Exclusive Checkbox)]** Applies "CPU Sets excluding audio core" to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned Unlisted PIDs at `INI×10` polling intervals. Unchecking stops polling for new processes while keeping existing masks. | Check to enable (mutually exclusive with Excluded row) / uncheck to stop polling |
-| **`Excluded (Mask)`** | Hexadecimal mask for default excluded cores. | Direct input or table click |
-| **`Apply` (Excluded Row)** | **[Apply Excluded Mask (Exclusive Checkbox)]** Applies specified excluded core mask to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned Unlisted PIDs at `INI×10` polling intervals. Unchecking stops polling for new processes while keeping existing masks. | Check to enable (mutually exclusive with Audio Core row) / uncheck to stop polling |
+| **Core Assignment Table** | Configures default dedicated audio core (Row 0: `Audio Core`) and excluded cores (Row 1: `Excluded`) with automatic mutual exclusion and minimum 1-core protection. | Select via checkboxes |
+| **`Default Audio Core (Mask)`** / **`Excluded (Mask)`** | Specifies default audio core(s) and excluded cores via bitmask (or comma-separated core numbers). | Direct input or table click |
+| **`Apply` (Audio Core Row)** | **[Dedicated Core Protection (Exclusive Checkbox)]** Applies an affinity mask excluding the audio core to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned processes at `INI×10` polling intervals. | Check to enable (mutually exclusive with Excluded row) / uncheck to stop polling |
+| **`Apply` (Excluded Row)** | **[Apply Excluded Mask (Exclusive Checkbox)]** Applies the specified excluded core mask to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned processes at `INI×10` polling intervals. | Check to enable (mutually exclusive with Audio Core row) / uncheck to stop polling |
 | **`Audio Thread Priority`** | Default priority applied to newly added processes. | Select from dropdown |
 | **`Polling Interval (ms)`** | Polling cycle for monitoring thread (`100` / `200` / `500` / `1000` ms). | Number input (auto-corrected) |
-| **`Unmask All`** | Becomes active (green) only when both `Apply` checkboxes are unchecked while masks are applied; explicitly clears protection masks from all non-monitored processes and restores OS defaults. | Click to unmask |
+| **`Unmask All`** | Becomes active (green) only when both `Apply` checkboxes are unchecked while masks are applied; explicitly clears protection masks from all non-monitored processes and restores all-core OS defaults. | Click to unmask |
 | **`OK` / `Cancel`** | Saves (OK) or discards (Cancel) settings and closes. | Click |
 
 ---
 
 ### 2.5 Thread Isolation Settings Dialog
-Opened by double-clicking a process row or clicking `[Edit]` on the main window.
-
-| Item | Summary & Role | Operation Details |
-|:---|:---|:---|
-| **`Target Process`** | Target executable name (e.g., `msedge.exe`). | Read-only |
-| **Core Assignment Table** | Sets process-specific core affinity.<br>- **Row 0 (`Audio Core`)**: Dedicated core pinned for audio playback thread.<br>- **Row 1 (`Excluded`)**: Eviction cores excluded from normal threads.<br>*Automatic mutual exclusion prevents overlapping cores and guarantees at least 1 core for normal threads.* | Select via checkboxes |
-| **`Audio Core (Mask)`** | Bitmask for dedicated audio core(s). Comma-separated multi-core specification supported (e.g., `1, 2`). | Direct input or table click |
-| **`Excluded (Mask)`** | Bitmask for cores excluded from normal thread placement. | Direct input or table click |
-| **`Audio Thread Priority`** | Priority applied to audio playback thread. | Select from dropdown |
-| **`OK` / `Cancel`** | Saves to `ATI.ini` (OK) or discards (Cancel) and closes. | Click |
+Opened by double-clicking a process row or clicking `[Edit]` on the main window. Uses the same Core Assignment Table, mask inputs, and thread priority selector as Global Settings (Section 2.4) to configure process-specific settings for the selected `Target Process` and save them to `ATI.ini` upon clicking `OK` (comma-separated multi-core assignment such as `1, 2` is also supported for `Audio Core`).
 
 ---
 
-## 3. Operational Logic
+## 3. Application-Specific Detection Behavior
 
-### 3.1 Efficient Continuous Monitoring
-- **Low-Overhead Polling**: Directly scans only registered target processes without taking global OS-wide snapshots, minimizing monitoring CPU overhead.
-- **Sleep Detection**: Automatically transitions to sleep (`sleeping...`) during silent standby to eliminate unnecessary CPU cycles.
-
-### 3.2 Core Isolation and Normal Thread Eviction
-- **Audio Thread Isolation**: Pins identified audio playback thread to designated audio core (`AudioCore`) with specified priority.
-- **Normal Thread Eviction**: Configures remaining non-audio threads within the process to run across eviction cores (`NormalCores`).
-- **Excluded Core Protection**: Revokes process affinity permissions on excluded cores, preventing non-audio threads from invading dedicated cores.
-
-### 3.3 Application-Specific Detection
 - **Chromium Browsers (Chrome, Edge, Brave, Vivaldi, etc.)**:
-  Identifies internal dedicated audio service processes across multi-process browser trees, tracking ephemeral audio output threads in real time.
-- **Standard Audio & Media Players (foobar2000, mpv, Firefox, etc.)**:
-  Correlates CPU load dynamics and audio module signatures (WASAPI, ASIO, DirectSound) to identify genuine playback threads.
+  Automatically identifies the internal dedicated audio service process across multi-process browser trees, tracking and isolating active audio output threads in real time.
+- **Standard Audio, Media & Voice Apps (foobar2000, mpv, Firefox, Discord, etc.)**:
+  Identifies playback and voice streaming threads from CPU activity and audio processing characteristics, automatically transitioning to sleep (`sleeping...`) during silent standby.
 - **Custom Architecture Apps (Voicemeeter, etc.)**:
-  Continuously analyzes thread activity ranking and latency wait states to lock audio threads in applications lacking conventional signatures.
-- **Voice Communication (Discord, etc.)**:
-  Correlates specific module signatures for voice streaming threads to isolate call processing threads.
+  Identifies playback threads from continuous thread activity and periodic audio wait states in applications lacking conventional signatures.
 - **Windows Audio Engine (`audiodg.exe`)**:
-  Because the Windows Audio Device Graph Isolation process (`audiodg.exe`) does not run at `TimeCritical (15)` priority and operates via event-driven waits (`WaitReason: UserRequest(6)`) with low/zero `CyclesDelta`, it does not match standard 4KB call stack signatures or `IgnoreSig` conditions (`TimeCritical(15)` or `DelayExecution(4)` with `CyclesDelta >= 3M/s`). When the target process is `audiodg.exe`, ATI preserves `AppType:0` in `ATI.ini` and directly captures and isolates the thread with the **highest context switch count** (`ContextSwitches` via `NtQuerySystemInformation`) by hardcoded rule.
+  In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
 
 ---
 
@@ -204,8 +148,8 @@ Configuration is saved in `ATI.ini` in the same directory as the executable.
 | **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
 | **`BoostPollingIntervalMs`** | Fast polling interval during thread search or state transitions. | `50`, `100`, `250` | `250` |
 | **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
-| **`UnlistedMask`** | Automatic CPU Sets protection mode for Unlisted processes. When enabled (`1` or `2`), newly spawned Unlisted PIDs are masked at `INI×10` intervals and cumulative count (`● <count> Unmonitored Processes Masked`) is shown at the head of the main window legend. | `0` (OFF), `1` (Exclude Audio Core), `2` (Apply Excluded Mask) | `0` |
-| **`UnlistedExclusions`** | Comma-separated list of executable names checked in Column 0 (`!`) of `Select Process` to exclude from Unlisted polling mask targets. | Comma-separated exe names | Empty |
+| **`UnlistedMask`** | Automatic affinity protection mode for Unlisted processes. | `0` (OFF), `1` (Exclude Audio Core), `2` (Apply Excluded Mask) | `0` |
+| **`UnlistedExclusions`** | Comma-separated list of executable names checked in the `!` column of `Select Process` to exclude from Unlisted mask targets. | Comma-separated exe names | Empty |
 
 ### 4.2 Process Section `[Processes]`
 
@@ -217,8 +161,8 @@ Saved per registered process under the executable name as key, with comma-separa
 | **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
-| **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated hardcoded detection, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW). | `0`, `1`, `2`, `3` |
-| **`IgnoreSig`** | Signature-independent mode. Identifies threads by ① Priority 15 with Cycles Delta >= 3M/s, or ② fallback to DelayExecution wait-reason with Cycles Delta >= 3M/s when priority 15 is absent. Specify `:t` to isolate top `t` threads (default: 1). | `IgnoreSig`, `IgnoreSig:t` (`t` is thread count) |
+| **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW). | `0`, `1`, `2`, `3` |
+| **`IgnoreSig`** | Signature-independent mode. Specify `:t` to isolate top `t` audio threads (default: 1). | `IgnoreSig`, `IgnoreSig:t` (`t` is thread count) |
 | **`AudioPid` / `AudioTid`** | Cached PID/TID from previous session for fast recovery. | Numeric |
 
 ---
@@ -226,18 +170,20 @@ Saved per registered process under the executable name as key, with comma-separa
 ## 5. Limitations & Notes
 
 1. **Usage of Pause (`❚❚`) Feature**:
-   - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the genuine playback thread.
-   - Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
+   - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the genuine playback thread. Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
 2. **Behavior on Temporary Bypass (`!` / Bypass)**:
-   - Entering Bypass stops ATI monitoring and active affinity adjustments for that process.
-   - Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling.
+   - Entering Bypass stops ATI monitoring and active affinity adjustments for that process. Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling (as an exception, `audiodg.exe` automatically restores to standard settings upon Bypass, rule removal, or application exit).
 3. **Single-Instance Enforcement & Self-Protection**:
-   - Launching a second instance automatically brings the existing window to the foreground and terminates the new instance.
-   - To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
-4. **HighQoS Operation Guarantee for Monitored Processes**:
-   - When a monitored process is launched or detected, ATI immediately calls `SetProcessInformation(ProcessPowerThrottling)` on the process handle to disable EcoQoS and enforce HighQoS.
-   - This ensures all threads, including audio playback threads isolated onto dedicated cores, operate without OS-induced clock throttling or timer resolution degradation.
-5. **Control Scope by Launch Mode (Standard vs. Administrator)**:
-   - Launching ATI as Administrator (e.g., via **`Restart as Administrator`** in the tray menu) not only unlocks `Realtime` priority (Base 16–31), but also enables `SeDebugPrivilege` from startup, expanding the range of controllable processes.
-   - **Broader Unlisted Mask Coverage**: System services and elevated processes that are skipped in standard user mode due to OS access restrictions become eligible for CPU Sets masking, increasing the number of masked processes.
-   - **Fewer Processes Falling into `sleeping...`**: Processes whose threads cannot be inspected in standard user mode due to insufficient permissions (such as `audiodg.exe` running under `LOCAL SERVICE` or elevated games/apps) can be properly detected and isolated instead of falling into `sleeping...`.
+   - Launching a second instance automatically terminates the previous instance and starts anew. To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
+4. **Control Scope by Launch Mode (Standard vs. Administrator)**:
+   - Launching ATI as Administrator (e.g., via **`Restart as Administrator`** in the tray menu) unlocks `Realtime` priority (Base 16–31) and expands the range of controllable processes.
+   - **Broader Unlisted Mask Coverage**: System services and elevated processes that are skipped in standard user mode due to OS access restrictions become eligible for affinity masking.
+   - **Fewer Processes Falling into `sleeping...`**: Processes whose threads cannot be inspected in standard user mode due to insufficient permissions (such as `audiodg.exe` or elevated games/apps) can be properly detected and isolated instead of falling into `sleeping...`.
+5. **Unmaskable Processes (Windows Protected Processes)**:
+   Due to Windows kernel protection mechanisms (such as PPL: Protected Process Light), the following system processes deny external affinity modification even under Administrator privileges and are automatically skipped:
+   - **Kernel & Virtual Memory Management**: `System` (PID 4), `Registry`, `Secure System`, `Memory Compression`
+   - **Core Subsystems**: `smss.exe`, `csrss.exe`, `wininit.exe`, `winlogon.exe`
+   - **Security & Authentication Subsystems**: `lsass.exe`, `services.exe`, `SecurityHealthService.exe`
+   - **Antimalware**: `MsMpEng.exe` (Microsoft Defender), `NisSrv.exe`
+   - **Graphics, Font, & Driver Isolation Hosts**: `dwm.exe`, `fontdrvhost.exe`, `WUDFHost.exe`
+   - **Protected System `svchost.exe` Instances**: Protected instances hosting security/system events (e.g., RPCSS, DcomLaunch, BrokerInfrastructure)
