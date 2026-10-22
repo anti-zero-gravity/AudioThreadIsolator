@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v1.0.4 - Specification & User Manual (spec.md)
+# Audio Thread Isolator (ATI) v1.0.5 - Specification & User Manual (spec.md)
 
 *Note: This document is the end-user manual for distribution. Detailed internal architectural specifications and algorithmic logic are documented in [arc.md](file:///c:/Users/YK-PC/.gemini/antigravity-ide/scratch/ATI/arc.md).*
 

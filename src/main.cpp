@@ -2925,7 +2925,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.4");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.5");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -4024,7 +4024,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         LogDebug("WinMain: Another instance detected. Terminating previous instance to launch anew.");
 
         // 1. 既存ウィンドウの探索
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.5");
+        if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
 

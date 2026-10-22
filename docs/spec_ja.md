@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v1.0.4 - 仕様書・ユーザー説明書 (spec_ja.md)
+# Audio Thread Isolator (ATI) v1.0.5 - 仕様書・ユーザー説明書 (spec_ja.md)
 
 ※ 本書は配布されたユーザー向けの説明書です。コード設計上の詳細仕様・アルゴリズム内部ロジックは [arc.md](file:///c:/Users/YK-PC/.gemini/antigravity-ide/scratch/ATI/arc.md) に記録されています。
 
