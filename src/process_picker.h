@@ -20,7 +20,8 @@ struct PickedProcess {
 bool ShowProcessPickerDialog(
     HWND hParent, 
     HINSTANCE hInstance, 
-    std::vector<PickedProcess>& outSelected
+    std::vector<PickedProcess>& outSelected,
+    std::vector<std::string>& inoutExcludedExeNames
 );
 
 } // namespace ati

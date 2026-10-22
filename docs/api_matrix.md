@@ -8,8 +8,10 @@ This document provides a comprehensive technical reference of all Win32 and Nati
 
 | API Name | Scope | Purpose, Data Acquired, and Action Performed |
 | :--- | :--- | :--- |
-| **`CreateToolhelp32Snapshot`** | System-wide | `TH32CS_SNAPPROCESS`: Enumerates the process list (invoked once every INI polling interval × 10 only when unlaunched target processes exist; skipped at 0 invocations when all monitored targets are running). |
-| **`Process32First` / `Next`** | System-wide | Enumerates process executable names, PIDs, and thread counts only during snapshot acquisition. 0 invocations when all targets are running. |
+| **`CreateToolhelp32Snapshot`** | System-wide | `TH32CS_SNAPPROCESS`: Enumerates the process list (invoked once every INI polling interval × 10 when unlaunched target processes exist or when `UnlistedMask` is active; skipped at 0 invocations when all monitored targets are running and `UnlistedMask=0`). |
+| **`Process32First` / `Next`** | System-wide | Enumerates process executable names, PIDs, and thread counts only during snapshot acquisition. 0 invocations when all targets are running and `UnlistedMask=0`. |
+| **`GetSystemCpuSetInformation`** | System-wide | Queries logical processor to CPU Set ID mappings. Invoked once upon checking `Apply` in Settings or at startup and cached; 0 invocations during polling. |
+| **`SetProcessDefaultCpuSets`** | Process | Applies (or releases) CPU Sets for Unlisted processes using either the audio-core exclusion mask (Mode 1) or Excluded mask (Mode 2). During polling, issued differentially only to newly spawned Unlisted PIDs and increments the cumulative apply counter. |
 | **`GetExitCodeProcess`** | Process | Target PID liveness check (process termination detection). Completes in nanoseconds, replacing SNAPPROCESS. |
 | **`OpenProcess`** | Process | Opens target process manipulation handles (for querying information, modifying affinity, adjusting priority, and configuring HighQoS). |
 | **`CloseHandle`** | Common | Closes and releases opened process handles, thread handles, and snapshot handles. |
@@ -49,8 +51,10 @@ This document provides a comprehensive technical reference of all Win32 and Nati
 
 | API Name | Unlaunched Target Exists | All Running (incl. Bypassed) | Chromium Standby (`Standby`) | Chromium Sampling (`Searching`) | Chromium Playing (`WASAPI`) | Non-Chromium Searching (`Scanning`) | Non-Chromium Isolated (`Isolated`) | Single Call Cost |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`CreateToolhelp32Snapshot` (Process)** | Once every INI polling time × 10 | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | Minimal |
-| **`Process32First` / `Next`** | Only during snapshot | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | **0 (Skipped)** | Minimal |
+| **`CreateToolhelp32Snapshot` (Process)** | Once every INI polling time × 10 | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | **0 (Skipped)** *(Once per INI×10 when UnlistedMask active)* | Minimal |
+| **`Process32First` / `Next`** | Only during snapshot | **0 (Skipped)** *(Only during snapshot)* | **0 (Skipped)** *(Only during snapshot)* | **0 (Skipped)** *(Only during snapshot)* | **0 (Skipped)** *(Only during snapshot)* | **0 (Skipped)** *(Only during snapshot)* | **0 (Skipped)** *(Only during snapshot)* | Minimal |
+| **`GetSystemCpuSetInformation`** | 0 (Cached on Apply) | 0 (Cached on Apply) | 0 (Cached on Apply) | 0 (Cached on Apply) | 0 (Cached on Apply) | 0 (Cached on Apply) | 0 (Cached on Apply) | Minimal |
+| **`SetProcessDefaultCpuSets` (Unlisted)** | Newly spawned Unlisted PIDs only | 0 *(New Unlisted PIDs only on snapshot)* | 0 *(New Unlisted PIDs only on snapshot)* | 0 *(New Unlisted PIDs only on snapshot)* | 0 *(New Unlisted PIDs only on snapshot)* | 0 *(New Unlisted PIDs only on snapshot)* | 0 *(New Unlisted PIDs only on snapshot)* | Low |
 | **`GetExitCodeProcess` (Liveness)** | 0 | Monitored process count / sec | Monitored process count / sec | Monitored process count / sec | Monitored process count / sec | Monitored process count / sec | Monitored process count / sec | Infinitesimal (several ns) |
 | **`SetProcessInformation` (HighQoS)** | 0 | Running process count / sec | AudioService process count / sec (1) | AudioService process count / sec (1) | AudioService process count / sec (1) | Running process count / sec | Running process count / sec | Minimal |
 | **`NtGetNextThread`** | 0 | 0 (When bypassed) | AudioService threads / sec (~14) | AudioService threads / sec (~14) | AudioService threads / sec (~14) | Target PID threads / sec (tens) | Target PID threads / sec (tens) | Minimal (Direct kernel) |

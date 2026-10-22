@@ -238,6 +238,60 @@ static std::unordered_map<DWORD, ULONG> QueryProcessThreadsWaitReason(DWORD targ
   return result;
 }
 
+static std::unordered_map<DWORD, ULONG>
+QueryProcessThreadsContextSwitches(DWORD targetPid,
+                                   std::vector<THREADENTRY32> *outEntries = nullptr) {
+  std::unordered_map<DWORD, ULONG> result;
+  EnsureNtLoaded();
+  if (!s_pfnNtQuerySystemInformation)
+    return result;
+
+  ULONG bufferSize = 512 * 1024;
+  std::vector<BYTE> buffer(bufferSize);
+  ULONG returnLength = 0;
+
+  NTSTATUS status = s_pfnNtQuerySystemInformation(
+      5 /* SystemProcessInformation */, buffer.data(), bufferSize, &returnLength);
+  while (status == 0xC0000004 /* STATUS_INFO_LENGTH_MISMATCH */) {
+    bufferSize = returnLength + (64 * 1024);
+    buffer.resize(bufferSize);
+    status = s_pfnNtQuerySystemInformation(5, buffer.data(), bufferSize,
+                                           &returnLength);
+  }
+
+  if (status != 0)
+    return result;
+
+  BYTE *pCurrent = buffer.data();
+  while (pCurrent) {
+    SYSTEM_PROCESS_INFORMATION_RAW *pProc =
+        reinterpret_cast<SYSTEM_PROCESS_INFORMATION_RAW *>(pCurrent);
+    DWORD pid = static_cast<DWORD>(
+        reinterpret_cast<ULONG_PTR>(pProc->UniqueProcessId));
+    if (pid == targetPid) {
+      for (ULONG i = 0; i < pProc->NumberOfThreads; ++i) {
+        const auto &th = pProc->Threads[i];
+        DWORD tid = static_cast<DWORD>(
+            reinterpret_cast<ULONG_PTR>(th.ClientId.UniqueThread));
+        result[tid] = th.ContextSwitches;
+        if (outEntries && tid != 0) {
+          THREADENTRY32 te = {0};
+          te.dwSize = sizeof(te);
+          te.th32OwnerProcessID = targetPid;
+          te.th32ThreadID = tid;
+          te.tpBasePri = th.BasePriority;
+          outEntries->push_back(te);
+        }
+      }
+      break;
+    }
+    if (pProc->NextEntryOffset == 0)
+      break;
+    pCurrent += pProc->NextEntryOffset;
+  }
+  return result;
+}
+
 static void *QueryThreadStartAddress(HANDLE hThread) {
   EnsureNtLoaded();
   if (!s_pfnNtQueryInformationThread)
@@ -845,6 +899,34 @@ GlobalConfig ThreadIsolator::GetConfig() {
 void ThreadIsolator::AddRule(const ProcessRule &rule) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_config.rules.push_back(rule);
+  if (m_config.unlistedMaskMode != 0 || m_hasUnlistedMaskInOs) {
+    typedef BOOL(WINAPI * PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *, ULONG);
+    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+    auto pfnSetCpuSets = hK32 ? reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+                                    GetProcAddress(hK32, "SetProcessDefaultCpuSets"))
+                              : nullptr;
+    if (pfnSetCpuSets) {
+      HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+      if (hSnap != INVALID_HANDLE_VALUE) {
+        std::string targetLower = ToLowerA(rule.processName);
+        PROCESSENTRY32 pe = {sizeof(pe)};
+        if (Process32First(hSnap, &pe)) {
+          do {
+            if (ToLowerA(pe.szExeFile) == targetLower) {
+              m_cpuSetsAppliedPids.erase(pe.th32ProcessID);
+              HANDLE hP = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
+              if (!hP) hP = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+              if (hP) {
+                pfnSetCpuSets(hP, nullptr, 0);
+                CloseHandle(hP);
+              }
+            }
+          } while (Process32Next(hSnap, &pe));
+        }
+        CloseHandle(hSnap);
+      }
+    }
+  }
   m_appliedThreads.clear();
 }
 
@@ -1372,7 +1454,24 @@ bool ThreadIsolator::TryIdentifyAudioThread(
   DWORD candTid = 0;
   ULONG64 maxDelta = 0;
 
-  if (rule.ignoreSig) {
+  if (_stricmp(rule.processName.c_str(), "audiodg.exe") == 0 ||
+      _stricmp(rule.processName.c_str(), "audiodg") == 0) {
+    // === audiodg.exe ハードコードモード: ContextSwitches (コンテキストスイッチ数) 最大のスレッドを捕捉 ===
+    auto ctxSwitches = QueryProcessThreadsContextSwitches(pid);
+    ULONG maxCtx = 0;
+    for (const auto &ti : threadInfos) {
+      auto cIt = ctxSwitches.find(ti.tid);
+      ULONG ctx = (cIt != ctxSwitches.end()) ? cIt->second : 0;
+      if (ctx > maxCtx || (candTid == 0 && ctx == maxCtx)) {
+        maxCtx = ctx;
+        candTid = ti.tid;
+      }
+    }
+    if (candTid != 0) {
+      rule.activeAudioTids = {candTid};
+      maxDelta = maxCtx;
+    }
+  } else if (rule.ignoreSig) {
     // === IgnoreSig モード: TimeCritical (15) + Delta >= 3M 判定 ===
 
     ULONG64 deltaThreshold = CalculateDeltaThreshold(
@@ -1567,8 +1666,10 @@ bool ThreadIsolator::TryIdentifyAudioThread(
 
 bool ThreadIsolator::ScanAndIsolate() {
   std::lock_guard<std::mutex> lock(m_mutex);
-  if (m_config.rules.empty())
+  if (m_config.rules.empty() && m_config.unlistedMaskMode == 0)
     return false;
+
+  EnableDebugPrivilegeOnce();
 
   bool stateChanged = false;
   int coreCount = GetSystemCoreCount();
@@ -1597,7 +1698,7 @@ bool ThreadIsolator::ScanAndIsolate() {
   if (s_cachedRunningProcesses.empty()) {
     shouldScanProcesses = true;
     s_processScanCountdown = 10;
-  } else if (hasUnstartedApp) {
+  } else if (hasUnstartedApp || m_config.unlistedMaskMode != 0) {
     s_processScanCountdown--;
     if (s_processScanCountdown <= 0) {
       shouldScanProcesses = true;
@@ -1655,6 +1756,68 @@ bool ThreadIsolator::ScanAndIsolate() {
   const auto &runningProcesses = s_cachedRunningProcesses;
   const auto &currentPidThreadCounts = s_cachedCurrentPidThreadCounts;
 
+  if (shouldScanProcesses && m_config.unlistedMaskMode != 0 &&
+      !m_cachedTargetCpuSetIds.empty()) {
+    typedef BOOL(WINAPI * PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *, ULONG);
+    static PFN_SetProcessDefaultCpuSets s_pfnSetCpuSets = nullptr;
+    if (!s_pfnSetCpuSets) {
+      HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+      if (hK32) {
+        s_pfnSetCpuSets = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+            GetProcAddress(hK32, "SetProcessDefaultCpuSets"));
+      }
+    }
+    if (s_pfnSetCpuSets) {
+      std::unordered_set<DWORD> allSnapPids;
+      for (const auto &kv : runningProcesses) {
+        for (DWORD p : kv.second) {
+          allSnapPids.insert(p);
+        }
+      }
+      EraseDeadPidSet(m_cpuSetsAppliedPids, allSnapPids);
+
+      std::unordered_set<std::string> whitelist;
+      whitelist.insert("ati.exe");
+      whitelist.insert("system");
+      whitelist.insert("system idle process");
+      for (const auto &r : m_config.rules) {
+        whitelist.insert(ToLowerA(r.processName));
+      }
+      for (const auto &ex : m_config.unlistedExclusions) {
+        whitelist.insert(ToLowerA(ex));
+      }
+
+      DWORD myPid = GetCurrentProcessId();
+      for (const auto &kv : runningProcesses) {
+        if (whitelist.count(kv.first) > 0)
+          continue;
+        for (DWORD pid : kv.second) {
+          if (pid <= 4 || pid == myPid)
+            continue;
+          if (m_cpuSetsAppliedPids.count(pid) > 0)
+            continue;
+          m_cpuSetsAppliedPids.insert(pid);
+
+          HANDLE hProc = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pid);
+          if (!hProc) {
+            hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
+          }
+          if (hProc) {
+            if (s_pfnSetCpuSets(hProc, m_cachedTargetCpuSetIds.data(),
+                                static_cast<ULONG>(m_cachedTargetCpuSetIds.size()))) {
+              m_unlistedApplyCount++;
+              stateChanged = true;
+            }
+            CloseHandle(hProc);
+          }
+        }
+      }
+    }
+  }
+
+  if (m_config.rules.empty())
+    return stateChanged;
+
   // 登録ルールのうち現在実行中かつ監視有効 (!isBypassed) の対象 PID を抽出
   std::unordered_set<DWORD> activeTargetPids;
   for (const auto &r : m_config.rules) {
@@ -1686,35 +1849,37 @@ bool ThreadIsolator::ScanAndIsolate() {
     if (s_pfnNtGetNextThread) {
       for (DWORD pid : activeTargetPids) {
         HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-        if (!hProc)
-          continue;
+        if (hProc) {
+          HANDLE hCurThread = NULL;
+          HANDLE hNextThread = NULL;
+          while (s_pfnNtGetNextThread(hProc, hCurThread, THREAD_QUERY_INFORMATION,
+                                      0, 0, &hNextThread) == 0) {
+            if (hCurThread) {
+              CloseHandle(hCurThread);
+            }
+            hCurThread = hNextThread;
 
-        HANDLE hCurThread = NULL;
-        HANDLE hNextThread = NULL;
-        while (s_pfnNtGetNextThread(hProc, hCurThread, THREAD_QUERY_INFORMATION,
-                                    0, 0, &hNextThread) == 0) {
+            DWORD exitCode = 0;
+            if (GetExitCodeThread(hCurThread, &exitCode) &&
+                exitCode == STILL_ACTIVE) {
+              DWORD tid = GetThreadId(hCurThread);
+              if (tid != 0) {
+                THREADENTRY32 te = {0};
+                te.dwSize = sizeof(te);
+                te.th32OwnerProcessID = pid;
+                te.th32ThreadID = tid;
+                processThreads[pid].push_back(te);
+              }
+            }
+          }
           if (hCurThread) {
             CloseHandle(hCurThread);
           }
-          hCurThread = hNextThread;
-
-          DWORD exitCode = 0;
-          if (GetExitCodeThread(hCurThread, &exitCode) &&
-              exitCode == STILL_ACTIVE) {
-            DWORD tid = GetThreadId(hCurThread);
-            if (tid != 0) {
-              THREADENTRY32 te = {0};
-              te.dwSize = sizeof(te);
-              te.th32OwnerProcessID = pid;
-              te.th32ThreadID = tid;
-              processThreads[pid].push_back(te);
-            }
-          }
+          CloseHandle(hProc);
         }
-        if (hCurThread) {
-          CloseHandle(hCurThread);
+        if (processThreads[pid].empty()) {
+          QueryProcessThreadsContextSwitches(pid, &processThreads[pid]);
         }
-        CloseHandle(hProc);
       }
     }
   }
@@ -1907,9 +2072,13 @@ bool ThreadIsolator::ScanAndIsolate() {
       continue;
     }
 
-    // モード 0: 初回自動判定 (0: 未判定, 1: 非Chromium, 2: Chromium系, 3:
+    // モード 0: 初回自動判定 (0: 未判定/audiodg.exe固定, 1: 非Chromium, 2: Chromium系, 3:
     // DAW型高負荷)
-    if (rule.appType == 0) {
+    bool isAudioDg = (_stricmp(rule.processName.c_str(), "audiodg.exe") == 0 ||
+                      _stricmp(rule.processName.c_str(), "audiodg") == 0);
+    if (isAudioDg) {
+      rule.appType = 0;
+    } else if (rule.appType == 0) {
       HANDLE hFirstProc = OpenProcess(
           PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, it->second[0]);
       if (hFirstProc) {
@@ -2612,6 +2781,11 @@ bool ThreadIsolator::ScanAndIsolate() {
           PROCESS_SET_INFORMATION | PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
           FALSE, pid);
       if (!hProcess) {
+        hProcess = OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION,
+            FALSE, pid);
+      }
+      if (!hProcess) {
         char errBuf[128];
         snprintf(errBuf, sizeof(errBuf), "OpenProcess FAILED: pid=%lu, err=%lu",
                  pid, GetLastError());
@@ -3121,6 +3295,286 @@ bool ThreadIsolator::ScanAndIsolate() {
 }
 
 std::string ThreadIsolator::GetHeuristicsStatusText() const { return ""; }
+
+#pragma pack(push, 8)
+struct ATI_CPU_SET_INFO_INTERNAL {
+  DWORD Size;
+  DWORD Type;
+  union {
+    struct {
+      DWORD Id;
+      WORD Group;
+      BYTE LogicalProcessorIndex;
+      BYTE CoreIndex;
+      BYTE LastLevelCacheIndex;
+      BYTE EfficiencyClass;
+      BYTE AllFlags;
+      BYTE Reserved;
+      BYTE SchedulingClass;
+      DWORD64 AllocationTag;
+    } CpuSet;
+  };
+};
+#pragma pack(pop)
+
+void ThreadIsolator::EnableDebugPrivilegeOnce() {
+  if (m_debugPrivilegeEnabled)
+    return;
+  HANDLE hToken = nullptr;
+  if (OpenProcessToken(GetCurrentProcess(),
+                       TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+    TOKEN_PRIVILEGES tp = {0};
+    LUID luid = {0};
+    if (LookupPrivilegeValueA(nullptr, "SeDebugPrivilege", &luid)) {
+      tp.PrivilegeCount = 1;
+      tp.Privileges[0].Luid = luid;
+      tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+      AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+      m_debugPrivilegeEnabled = true;
+    }
+    CloseHandle(hToken);
+  }
+}
+
+bool ThreadIsolator::BuildTargetCpuSetIds(DWORD_PTR targetMask,
+                                          std::vector<ULONG> &outIds) {
+  outIds.clear();
+  if (targetMask == 0)
+    return false;
+
+  typedef BOOL(WINAPI * PFN_GetSystemCpuSetInformation)(
+      void *, ULONG, PULONG, HANDLE, ULONG);
+  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+  if (!hK32)
+    return false;
+  auto pfnGetInfo = reinterpret_cast<PFN_GetSystemCpuSetInformation>(
+      GetProcAddress(hK32, "GetSystemCpuSetInformation"));
+  if (!pfnGetInfo)
+    return false;
+
+  ULONG bufSize = 0;
+  pfnGetInfo(nullptr, 0, &bufSize, GetCurrentProcess(), 0);
+  if (bufSize == 0)
+    return false;
+
+  std::vector<BYTE> buf(bufSize);
+  if (!pfnGetInfo(buf.data(), bufSize, &bufSize, GetCurrentProcess(), 0))
+    return false;
+
+  ULONG offset = 0;
+  while (offset + sizeof(DWORD) * 2 <= bufSize) {
+    const auto *pInfo = reinterpret_cast<const ATI_CPU_SET_INFO_INTERNAL *>(
+        buf.data() + offset);
+    if (pInfo->Size == 0)
+      break;
+    if (pInfo->Type == 0) {
+      BYTE logicalIdx = pInfo->CpuSet.LogicalProcessorIndex;
+      if (logicalIdx < 64 && ((targetMask & (1ULL << logicalIdx)) != 0)) {
+        outIds.push_back(pInfo->CpuSet.Id);
+      }
+    }
+    offset += pInfo->Size;
+  }
+  return !outIds.empty();
+}
+
+bool ThreadIsolator::ApplyUnlistedCpuSetsLocked(int mode,
+                                                DWORD_PTR targetMask) {
+  EnableDebugPrivilegeOnce();
+
+  std::vector<ULONG> targetIds;
+  if (!BuildTargetCpuSetIds(targetMask, targetIds))
+    return false;
+
+  typedef BOOL(WINAPI * PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *,
+                                                      ULONG);
+  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+  if (!hK32)
+    return false;
+  auto pfnSetCpuSets = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+      GetProcAddress(hK32, "SetProcessDefaultCpuSets"));
+  if (!pfnSetCpuSets)
+    return false;
+
+  HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnap == INVALID_HANDLE_VALUE)
+    return false;
+
+  m_config.unlistedMaskMode = mode;
+  m_activeUnlistedMask = targetMask;
+  m_cachedTargetCpuSetIds = targetIds;
+  m_cpuSetsAppliedPids.clear();
+  m_hasUnlistedMaskInOs = true;
+
+  std::unordered_set<std::string> whitelist;
+  whitelist.insert("ati.exe");
+  whitelist.insert("system");
+  whitelist.insert("system idle process");
+  for (const auto &r : m_config.rules) {
+    whitelist.insert(ToLowerA(r.processName));
+  }
+  for (const auto &ex : m_config.unlistedExclusions) {
+    whitelist.insert(ToLowerA(ex));
+  }
+
+  DWORD myPid = GetCurrentProcessId();
+  PROCESSENTRY32 pe = {sizeof(pe)};
+  if (Process32First(hSnap, &pe)) {
+    do {
+      if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid)
+        continue;
+      std::string exeLower = ToLowerA(pe.szExeFile);
+      if (whitelist.count(exeLower) > 0)
+        continue;
+
+      m_cpuSetsAppliedPids.insert(pe.th32ProcessID);
+
+      HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE,
+                                    pe.th32ProcessID);
+      if (!hProcess) {
+        hProcess =
+            OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+      }
+      if (!hProcess)
+        continue;
+
+      if (pfnSetCpuSets(hProcess, m_cachedTargetCpuSetIds.data(),
+                        static_cast<ULONG>(m_cachedTargetCpuSetIds.size()))) {
+        m_unlistedApplyCount++;
+      }
+      CloseHandle(hProcess);
+    } while (Process32Next(hSnap, &pe));
+  }
+  CloseHandle(hSnap);
+  return true;
+}
+
+bool ThreadIsolator::ApplyUnlistedCpuSets(int mode, DWORD_PTR targetMask) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return ApplyUnlistedCpuSetsLocked(mode, targetMask);
+}
+
+void ThreadIsolator::StopUnlistedPollingMask() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_config.unlistedMaskMode = 0;
+}
+
+bool ThreadIsolator::ReleaseUnlistedCpuSets() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  EnableDebugPrivilegeOnce();
+
+  m_config.unlistedMaskMode = 0;
+  m_activeUnlistedMask = 0;
+  m_cachedTargetCpuSetIds.clear();
+  m_cpuSetsAppliedPids.clear();
+  m_hasUnlistedMaskInOs = false;
+
+  typedef BOOL(WINAPI * PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *,
+                                                      ULONG);
+  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+  if (!hK32)
+    return false;
+  auto pfnSetCpuSets = reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+      GetProcAddress(hK32, "SetProcessDefaultCpuSets"));
+  if (!pfnSetCpuSets)
+    return false;
+
+  std::unordered_set<std::string> whitelist;
+  whitelist.insert("ati.exe");
+  whitelist.insert("system");
+  whitelist.insert("system idle process");
+  for (const auto &r : m_config.rules) {
+    whitelist.insert(ToLowerA(r.processName));
+  }
+
+  HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnap == INVALID_HANDLE_VALUE)
+    return false;
+
+  DWORD myPid = GetCurrentProcessId();
+  PROCESSENTRY32 pe = {sizeof(pe)};
+  if (Process32First(hSnap, &pe)) {
+    do {
+      if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid)
+        continue;
+      std::string exeLower = ToLowerA(pe.szExeFile);
+      if (whitelist.count(exeLower) > 0)
+        continue;
+
+      HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE,
+                                    pe.th32ProcessID);
+      if (!hProcess) {
+        hProcess =
+            OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+      }
+      if (!hProcess)
+        continue;
+
+      pfnSetCpuSets(hProcess, nullptr, 0);
+      CloseHandle(hProcess);
+    } while (Process32Next(hSnap, &pe));
+  }
+  CloseHandle(hSnap);
+  return true;
+}
+
+bool ThreadIsolator::HasAppliedUnlistedCpuSets() const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_hasUnlistedMaskInOs;
+}
+
+void ThreadIsolator::UpdateUnlistedExclusions(
+    const std::vector<std::string> &exclusions) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_config.unlistedExclusions = exclusions;
+  if (!m_hasUnlistedMaskInOs && m_config.unlistedMaskMode == 0)
+    return;
+
+  std::unordered_set<std::string> exclLower;
+  for (const auto &ex : exclusions) {
+    if (!ex.empty()) {
+      exclLower.insert(ToLowerA(ex));
+    }
+  }
+  if (exclLower.empty())
+    return;
+
+  typedef BOOL(WINAPI * PFN_SetProcessDefaultCpuSets)(HANDLE, const ULONG *,
+                                                      ULONG);
+  HMODULE hK32 = GetModuleHandleA("kernel32.dll");
+  auto pfnSetCpuSets = hK32 ? reinterpret_cast<PFN_SetProcessDefaultCpuSets>(
+                                  GetProcAddress(hK32, "SetProcessDefaultCpuSets"))
+                            : nullptr;
+  if (!pfnSetCpuSets)
+    return;
+
+  HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+  if (hSnap != INVALID_HANDLE_VALUE) {
+    PROCESSENTRY32 pe = {sizeof(pe)};
+    if (Process32First(hSnap, &pe)) {
+      do {
+        if (exclLower.count(ToLowerA(pe.szExeFile)) > 0) {
+          m_cpuSetsAppliedPids.erase(pe.th32ProcessID);
+          HANDLE hP = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE,
+                                  pe.th32ProcessID);
+          if (!hP) {
+            hP = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
+          }
+          if (hP) {
+            pfnSetCpuSets(hP, nullptr, 0);
+            CloseHandle(hP);
+          }
+        }
+      } while (Process32Next(hSnap, &pe));
+    }
+    CloseHandle(hSnap);
+  }
+}
+
+DWORD ThreadIsolator::GetUnlistedApplyCount() const {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  return m_unlistedApplyCount;
+}
 
 bool ThreadIsolator::IsHeuristicsActive() const {
   std::lock_guard<std::mutex> lock(m_mutex);

@@ -8,8 +8,10 @@
 
 | API 名 | 対象種別 | 目的・何が得られるか / 何を行うか |
 | :--- | :--- | :--- |
-| **`CreateToolhelp32Snapshot`** | OS全域 | `TH32CS_SNAPPROCESS`: プロセス一覧を取得（未起動プロセスが存在する場合のみ、INI設定のポーリング時間×10 ごとに 1 回発行。全監視対象が起動中は 0 回スキップ）。 |
-| **`Process32First` / `Next`** | OS全域 | プロセススナップショット取得時のみ各プロセスの EXE 名、PID、スレッド数を列挙取得。全起動中は 0 回。 |
+| **`CreateToolhelp32Snapshot`** | OS全域 | `TH32CS_SNAPPROCESS`: プロセス一覧を取得（未起動プロセスが存在する場合、または `UnlistedMask` フラグ有効時は INI設定のポーリング時間×10 ごとに 1 回発行。全監視対象が起動中かつ `UnlistedMask=0` 時は 0 回スキップ）。 |
+| **`Process32First` / `Next`** | OS全域 | プロセススナップショット取得時のみ各プロセスの EXE 名、PID、スレッド数を列挙取得。全起動中かつ `UnlistedMask=0` 時は 0 回。 |
+| **`GetSystemCpuSetInformation`** | OS全域 | システムの論理プロセッサと CPU Set ID の対応を取得。Settings の排他チェック適用時・起動時に 1 回取得してキャッシュし、ポーリング時は 0 回。 |
+| **`SetProcessDefaultCpuSets`** | プロセス | Unlisted（未登録）プロセスに対し、専用コア除外マスク（種別 1）または Excluded マスク（種別 2）の CPU Sets を適用（または解除）。ポーリング時は新規出現した Unlisted PID にのみ差分発行し、累計適用回数を加算。 |
 | **`GetExitCodeProcess`** | プロセス | 対象 PID の死活確認（プロセス終了判定）。数ナノ秒で完了し SNAPPROCESS を代替。 |
 | **`OpenProcess`** | プロセス | 対象プロセスの操作ハンドル（情報取得・アフィニティ変更・優先度変更・HighQoS 設定用）をオープン。 |
 | **`CloseHandle`** | 共通 | オープンしたプロセスハンドル、スレッドハンドル、スナップショットハンドルをクローズ解放。 |
@@ -49,8 +51,10 @@
 
 | API 名 | 未起動あり | 全起動中 (ペンディング含む) | Chromium待機 (`Standby`) | Chromiumサンプリング (`Searching`) | Chromium再生 (`WASAPI`) | 非Chromium探索 (`Scanning`) | 非Chromium隔離 (`Isolated`) | 単発コスト |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **`CreateToolhelp32Snapshot` (Process)** | INIポーリング時間×10毎に1回 | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | 極小 |
-| **`Process32First` / `Next`** | スナップ時のみ | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | **0 回 (スキップ)** | 極小 |
+| **`CreateToolhelp32Snapshot` (Process)** | INIポーリング時間×10毎に1回 | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | **0 回 (スキップ)** *(UnlistedMask有効時はINI×10毎に1回)* | 極小 |
+| **`Process32First` / `Next`** | スナップ時のみ | **0 回 (スキップ)** *(スナップ時のみ)* | **0 回 (スキップ)** *(スナップ時のみ)* | **0 回 (スキップ)** *(スナップ時のみ)* | **0 回 (スキップ)** *(スナップ時のみ)* | **0 回 (スキップ)** *(スナップ時のみ)* | **0 回 (スキップ)** *(スナップ時のみ)* | 極小 |
+| **`GetSystemCpuSetInformation`** | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 0 回 (Apply時キャッシュ) | 極小 |
+| **`SetProcessDefaultCpuSets` (Unlisted退避)** | 新規Unlisted PID分のみ | 0 回 *(スナップ時は新規PID分のみ)* | 0 回 *(スナップ時は新規PID分のみ)* | 0 回 *(スナップ時は新規PID分のみ)* | 0 回 *(スナップ時は新規PID分のみ)* | 0 回 *(スナップ時は新規PID分のみ)* | 0 回 *(スナップ時は新規PID分のみ)* | 小 |
 | **`GetExitCodeProcess` (死活確認)** | 0 回 | 毎秒 登録プロセス数分 | 毎秒 登録プロセス数分 | 毎秒 登録プロセス数分 | 毎秒 登録プロセス数分 | 毎秒 登録プロセス数分 | 毎秒 登録プロセス数分 | 極微 (数ns) |
 | **`SetProcessInformation` (HighQoS)** | 0 回 | 毎秒 稼働プロセス数分 | 毎秒 AudioService分 (1回) | 毎秒 AudioService分 (1回) | 毎秒 AudioService分 (1回) | 毎秒 稼働プロセス数分 | 毎秒 稼働プロセス数分 | 極小 |
 | **`NtGetNextThread`** | 0 回 | 0 回 (Bypass時) | 毎秒 AudioService分 (約14本) | 毎秒 AudioService分 (約14本) | 毎秒 AudioService分 (約14本) | 毎秒 対象PID分 (数十本) | 毎秒 対象PID分 (数十本) | 極小 (カーネル直結) |

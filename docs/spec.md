@@ -89,6 +89,9 @@
 | `PID <pid> / Searching...` | ● Coral Pink | Chromium audio process identified; searching internal threads. | Transitions to Bypass (displays ☑ in ! col) |
 | (Half-Isolated state) | ● Flashing Dull Yellow / Teal | Thread unmigratable due to driver constraints co-existing on audio core (suppression active). | Transitions to Bypass (displays ☑ in ! col) |
 
+- **Leading Counter in Bottom Legend Bar**:
+  - Only while an `Apply` checkbox for Unlisted process protection is checked in Global Settings, the leftmost position of the main window legend bar displays **`● <count> Unmonitored Processes Masked`** with a gray dot (`●`), showing the cumulative number of non-monitored processes masked since startup (hidden when unchecked).
+
 #### Priority Settings and Windows Base Priority
 
 Under standard applications (Normal process priority class), each setting corresponds to Windows Base Priority (1-15) and characteristics as follows:
@@ -117,6 +120,7 @@ Under standard applications (Normal process priority class), each setting corres
 - Launched via `[Add]` from the main window.
 - Lists all currently running processes in alphabetical order.
 - Select a process and click `[Done]` to add it to the monitoring list (global default settings are applied initially).
+- Checking the leading red **`!` column (Column 0)** registers the process in `UnlistedExclusions`, excluding it from Unlisted polling mask (`SetProcessDefaultCpuSets`) targets (hovering over Column 0 displays an explanatory note at the bottom).
 
 ### 2.3 System Tray Behavior
 - Clicking the `×` button or minimizing tucks the window into the system notification area (system tray).
@@ -137,12 +141,12 @@ Opened via `[Settings]` on the main window or tray menu. Manages default values 
 |:---|:---|:---|
 | **Core Assignment Table** | Configures default dedicated audio core (Row 0) and excluded cores (Row 1). | Select via checkboxes |
 | **`Default Audio Core (Mask)`** | Hexadecimal mask for default audio core. | Direct input or table click |
-| **`Apply` (Audio Core Row)** | **[Dedicated Core Protection]** Applies "CPU Sets excluding audio core" to all non-ATI processes across the system, shielding audio cores from external interrupts. | Click to apply system-wide |
+| **`Apply` (Audio Core Row)** | **[Dedicated Core Protection (Exclusive Checkbox)]** Applies "CPU Sets excluding audio core" to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned Unlisted PIDs at `INI×10` polling intervals. Unchecking stops polling for new processes while keeping existing masks. | Check to enable (mutually exclusive with Excluded row) / uncheck to stop polling |
 | **`Excluded (Mask)`** | Hexadecimal mask for default excluded cores. | Direct input or table click |
-| **`Apply` (Excluded Row)** | **[Apply Excluded Mask]** Applies specified excluded core mask to all non-ATI processes. | Click to apply system-wide |
+| **`Apply` (Excluded Row)** | **[Apply Excluded Mask (Exclusive Checkbox)]** Applies specified excluded core mask to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned Unlisted PIDs at `INI×10` polling intervals. Unchecking stops polling for new processes while keeping existing masks. | Check to enable (mutually exclusive with Audio Core row) / uncheck to stop polling |
 | **`Audio Thread Priority`** | Default priority applied to newly added processes. | Select from dropdown |
 | **`Polling Interval (ms)`** | Polling cycle for monitoring thread (`100` / `200` / `500` / `1000` ms). | Number input (auto-corrected) |
-| **`Release Mask`** | Clears protection masks from general processes, restoring OS defaults. | Click to release |
+| **`Unmask All`** | Becomes active (green) only when both `Apply` checkboxes are unchecked while masks are applied; explicitly clears protection masks from all non-monitored processes and restores OS defaults. | Click to unmask |
 | **`OK` / `Cancel`** | Saves (OK) or discards (Cancel) settings and closes. | Click |
 
 ---
@@ -181,6 +185,8 @@ Opened by double-clicking a process row or clicking `[Edit]` on the main window.
   Continuously analyzes thread activity ranking and latency wait states to lock audio threads in applications lacking conventional signatures.
 - **Voice Communication (Discord, etc.)**:
   Correlates specific module signatures for voice streaming threads to isolate call processing threads.
+- **Windows Audio Engine (`audiodg.exe`)**:
+  Because the Windows Audio Device Graph Isolation process (`audiodg.exe`) does not run at `TimeCritical (15)` priority and operates via event-driven waits (`WaitReason: UserRequest(6)`) with low/zero `CyclesDelta`, it does not match standard 4KB call stack signatures or `IgnoreSig` conditions (`TimeCritical(15)` or `DelayExecution(4)` with `CyclesDelta >= 3M/s`). When the target process is `audiodg.exe`, ATI preserves `AppType:0` in `ATI.ini` and directly captures and isolates the thread with the **highest context switch count** (`ContextSwitches` via `NtQuerySystemInformation`) by hardcoded rule.
 
 ---
 
@@ -198,6 +204,8 @@ Configuration is saved in `ATI.ini` in the same directory as the executable.
 | **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
 | **`BoostPollingIntervalMs`** | Fast polling interval during thread search or state transitions. | `50`, `100`, `250` | `250` |
 | **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
+| **`UnlistedMask`** | Automatic CPU Sets protection mode for Unlisted processes. When enabled (`1` or `2`), newly spawned Unlisted PIDs are masked at `INI×10` intervals and cumulative count (`● <count> Unmonitored Processes Masked`) is shown at the head of the main window legend. | `0` (OFF), `1` (Exclude Audio Core), `2` (Apply Excluded Mask) | `0` |
+| **`UnlistedExclusions`** | Comma-separated list of executable names checked in Column 0 (`!`) of `Select Process` to exclude from Unlisted polling mask targets. | Comma-separated exe names | Empty |
 
 ### 4.2 Process Section `[Processes]`
 
@@ -209,7 +217,7 @@ Saved per registered process under the executable name as key, with comma-separa
 | **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
-| **`AppType`** | Application classification mode (`1`: Standard Audio, `2`: Chromium). | `1`, `2` |
+| **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated hardcoded detection, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW). | `0`, `1`, `2`, `3` |
 | **`IgnoreSig`** | Signature-independent mode. Identifies threads by ① Priority 15 with Cycles Delta >= 3M/s, or ② fallback to DelayExecution wait-reason with Cycles Delta >= 3M/s when priority 15 is absent. Specify `:t` to isolate top `t` threads (default: 1). | `IgnoreSig`, `IgnoreSig:t` (`t` is thread count) |
 | **`AudioPid` / `AudioTid`** | Cached PID/TID from previous session for fast recovery. | Numeric |
 
@@ -229,3 +237,7 @@ Saved per registered process under the executable name as key, with comma-separa
 4. **HighQoS Operation Guarantee for Monitored Processes**:
    - When a monitored process is launched or detected, ATI immediately calls `SetProcessInformation(ProcessPowerThrottling)` on the process handle to disable EcoQoS and enforce HighQoS.
    - This ensures all threads, including audio playback threads isolated onto dedicated cores, operate without OS-induced clock throttling or timer resolution degradation.
+5. **Control Scope by Launch Mode (Standard vs. Administrator)**:
+   - Launching ATI as Administrator (e.g., via **`Restart as Administrator`** in the tray menu) not only unlocks `Realtime` priority (Base 16–31), but also enables `SeDebugPrivilege` from startup, expanding the range of controllable processes.
+   - **Broader Unlisted Mask Coverage**: System services and elevated processes that are skipped in standard user mode due to OS access restrictions become eligible for CPU Sets masking, increasing the number of masked processes.
+   - **Fewer Processes Falling into `sleeping...`**: Processes whose threads cannot be inspected in standard user mode due to insufficient permissions (such as `audiodg.exe` running under `LOCAL SERVICE` or elevated games/apps) can be properly detected and isolated instead of falling into `sleeping...`.

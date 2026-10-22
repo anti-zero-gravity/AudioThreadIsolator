@@ -28,9 +28,14 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
 - **System Tray Integration**:
   - Seamlessly minimize or close (`×`) to the system notification area (system tray).
   - Supports auto-start on Windows boot via registry integration.
-- **Realtime Priority (Base 16–31) Support via Administrator Launch**:
+- **Realtime Priority (Base 16–31) & Expanded Control Scope via Administrator Launch**:
   - Elevate seamlessly via the taskbar system tray context menu (`Restart as Administrator`).
-  - Automatically enables `SeIncreaseBasePriorityPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
+  - Automatically enables `SeIncreaseBasePriorityPrivilege` and `SeDebugPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
+  - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted CPU Sets masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
+- **Automatic CPU Sets Eviction & Per-Process Exclusion for Unlisted Processes**:
+  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessDefaultCpuSets` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
+  - Processes checked in the leading red `!` column of `Select Process` (`[Add]`) are individually excluded from unlisted polling mask targets (`UnlistedExclusions`).
+  - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default CPU Sets across all non-monitored processes.
 
 ---
 
@@ -68,6 +73,9 @@ For unknown applications, games, or engines without thread descriptions (Godot, 
   - Normal threads (main engine, rendering, input) that successfully migrate retain their original OS/application priority completely untouched (preventing unintended priority degradation).
   - When such an unmigratable thread co-exists on the dedicated audio core (Half-Isolated), the audio thread is automatically elevated if set to `Idle (-15)` (`-15` ➔ `-2` Lowest), while the co-existing driver thread is throttled to one tier below (`-15`), maintaining audio thread scheduling priority and preventing dropouts.
 
+### 4. Windows Audio Engine (`audiodg.exe`) Dedicated Detection
+- When the Windows Audio Device Graph Isolation process (`audiodg.exe`, stored with `AppType:0` in `ATI.ini`) is registered for monitoring, ATI bypasses 4KB call stack scanning and `CyclesDelta` thresholds, directly identifying and isolating the thread with the **highest context switch count** (`ContextSwitches` via `NtQuerySystemInformation`). *(Note: Because `audiodg.exe` runs under `LOCAL SERVICE`, ATI must be launched as Administrator to apply affinity and priority settings to it.)*
+
 ### PID/TID Tracking Mechanism for Previously Detected Sessions
 - Once an audio playback thread (TID) or process (PID) is identified and isolated, ATI caches and maintains the entry within its active tracking table and INI configuration.
 - In addition to enabling near-instant isolation recovery upon subsequent launches, the engine maintains continuous tracking within the active process even after priority modifications (e.g., set to `Idle (-15)`), preventing detection oscillation.
@@ -93,6 +101,10 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
   - Specify the dedicated audio CPU# (comma-separated values supported for multiple cores).
 - **ExcludedCores**:
   - Specify the CPU# mask permitted for all regular processes and background threads, excluding the dedicated audio CPU# (and any dedicated LAN CPU#).
+- **Automatic Unlisted Process Masking (`Apply` Checkboxes / `Unmask All`)**:
+  - Checking either `Apply` checkbox in Global Settings applies CPU Sets protection to all unlisted processes and automatically tracks newly launched processes.
+  - To exclude specific non-monitored processes from unlisted polling masks, open `[Add]` (`Select Process`), check the leading red **`!` column**, and click `[Done]`.
+  - For full UI and configuration details, see the [User Manual & Specification (docs/spec.md)](docs/spec.md).
 
 ### 3. Thread Priority & Sound Quality Philosophy
 - **Advantages of Low Priority Operation (Idle)**:

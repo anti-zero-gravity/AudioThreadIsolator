@@ -119,6 +119,8 @@ struct GlobalConfig {
       columnWidths; // 各カラム幅 (論理ピクセル, 空の場合はデフォルト)
   int windowHeight =
       0; // ウィンドウ全体の高さ (論理ピクセル, 0 の場合は自動計算)
+  int unlistedMaskMode = 0;
+  std::vector<std::string> unlistedExclusions;
   std::vector<ProcessRule> rules; // 監視プロセス一覧
 };
 
@@ -280,9 +282,24 @@ private:
   // スレッドスナップショット遅延用キャッシュ (キー: PID)
   std::unordered_map<DWORD, std::vector<DWORD>> m_cachedProcessTids;
   std::unordered_map<DWORD, int> m_lastProcessThreadCount;
+  std::vector<ULONG> m_cachedTargetCpuSetIds;
+  DWORD_PTR m_activeUnlistedMask = 0;
+  std::unordered_set<DWORD> m_cpuSetsAppliedPids;
+  DWORD m_unlistedApplyCount = 0;
+  bool m_hasUnlistedMaskInOs = false;
+  bool m_debugPrivilegeEnabled = false;
+  void EnableDebugPrivilegeOnce();
+  static bool BuildTargetCpuSetIds(DWORD_PTR targetMask, std::vector<ULONG> &outIds);
+  bool ApplyUnlistedCpuSetsLocked(int mode, DWORD_PTR targetMask);
 
 public:
   // ヒューリスティック探索中 (500ms タイマー要求中) かどうか判定
+  bool ApplyUnlistedCpuSets(int mode, DWORD_PTR targetMask);
+  void StopUnlistedPollingMask();
+  bool ReleaseUnlistedCpuSets();
+  bool HasAppliedUnlistedCpuSets() const;
+  void UpdateUnlistedExclusions(const std::vector<std::string> &exclusions);
+  DWORD GetUnlistedApplyCount() const;
   bool IsHeuristicsActive() const;
   // 250ms 高速検証タイマー要求中かどうか判定
   bool IsFastPollingRequired() const;
