@@ -243,6 +243,21 @@ static DWORD_PTR ParseCoreListToMask(const std::string& str, int& outFirstCore) 
     return mask;
 }
 
+static void SetDlgItemHexMask(HWND hDlg, int ctrlId, DWORD_PTR mask) {
+    char hexBuf[32] = { 0 };
+    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(mask));
+    SetDlgItemTextA(hDlg, ctrlId, hexBuf);
+}
+
+static DWORD_PTR ReadDlgItemCoreMask(HWND hDlg, int ctrlId, int* outFirstCore = nullptr) {
+    char buf[128] = { 0 };
+    GetDlgItemTextA(hDlg, ctrlId, buf, sizeof(buf));
+    int fc = 0;
+    DWORD_PTR mask = ParseCoreListToMask(buf, fc);
+    if (outFirstCore) *outFirstCore = fc;
+    return mask;
+}
+
 static std::string FormatMaskToCoreLabels(DWORD_PTR mask, const std::vector<ati::CoreInfo>& cores) {
     if (mask == 0) return "-";
     std::vector<ati::CoreInfo> matched;
@@ -690,9 +705,7 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
             ? rule.audioAffinityMask 
             : ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
         std::string val;
-        bool isAudioDg = (_stricmp(rule.processName.c_str(), "audiodg.exe") == 0 ||
-                          _stricmp(rule.processName.c_str(), "audiodg") == 0);
-        if (isAudioDg) {
+        if (ati::ThreadIsolator::IsAudioDgProcess(rule.processName)) {
             val += "AppType:0";
         } else if (rule.appType != 0) {
             val += "AppType:" + std::to_string(rule.appType);
@@ -1249,42 +1262,6 @@ static inline void ResizeDialogControlWidth(HWND hDlg, int ctrlId, int cx, int m
     }
 }
 
-// --- CPU Sets 構造体・API 型定義 (Windows 10/11) ---
-#pragma pack(push, 8)
-typedef struct _ATI_SYSTEM_CPU_SET_INFORMATION {
-    DWORD Size;
-    DWORD Type; // 0 = CpuSetInformation
-    union {
-        struct {
-            DWORD Id;
-            WORD  Group;
-            BYTE  LogicalProcessorIndex;
-            BYTE  CoreIndex;
-            BYTE  LastLevelCacheIndex;
-            BYTE  EfficiencyClass;
-            BYTE  AllFlags;
-            BYTE  Reserved;
-            BYTE  SchedulingClass;
-            DWORD64 AllocationTag;
-        } CpuSet;
-    };
-} ATI_SYSTEM_CPU_SET_INFORMATION;
-#pragma pack(pop)
-
-typedef BOOL (WINAPI *PFN_GetSystemCpuSetInformation)(
-    void* Information,
-    ULONG BufferLength,
-    PULONG ReturnedLength,
-    HANDLE Process,
-    ULONG Flags
-);
-
-typedef BOOL (WINAPI *PFN_SetProcessDefaultCpuSets)(
-    HANDLE Process,
-    const ULONG *CpuSetIds,
-    ULONG CpuSetIdCount
-);
-
 // 揮発性メモリフラグ (起動時のみ保持、終了で消滅)
 static BOOL s_bUnlistedMaskApplied = FALSE;
 
@@ -1304,177 +1281,22 @@ static void EnableDebugPrivilege() {
     }
 }
 
-// リスト外プロセスへの CPU Sets 適用処理
-static bool ApplyCpuSetsToUnlistedProcesses(HWND hParent, DWORD_PTR targetMask) {
-    EnableDebugPrivilege();
-
-    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-    if (!hK32) return false;
-    auto pfnGetSystemCpuSetInformation = (PFN_GetSystemCpuSetInformation)GetProcAddress(hK32, "GetSystemCpuSetInformation");
-    auto pfnSetProcessDefaultCpuSets = (PFN_SetProcessDefaultCpuSets)GetProcAddress(hK32, "SetProcessDefaultCpuSets");
-    if (!pfnGetSystemCpuSetInformation || !pfnSetProcessDefaultCpuSets) {
-        MessageBoxA(hParent, "CPU Sets API is not supported on this Windows version.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
-        return false;
-    }
-
-    ULONG bufSize = 0;
-    pfnGetSystemCpuSetInformation(nullptr, 0, &bufSize, GetCurrentProcess(), 0);
-    if (bufSize == 0) {
-        MessageBoxA(hParent, "Failed to query system CPU Sets information.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
-        return false;
-    }
-
-    std::vector<BYTE> buf(bufSize);
-    if (!pfnGetSystemCpuSetInformation(buf.data(), bufSize, &bufSize, GetCurrentProcess(), 0)) {
-        MessageBoxA(hParent, "Failed to retrieve system CPU Sets.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
-        return false;
-    }
-
-    std::vector<ULONG> targetCpuSetIds;
-    ULONG offset = 0;
-    while (offset + sizeof(DWORD) * 2 <= bufSize) {
-        auto* pInfo = reinterpret_cast<const ATI_SYSTEM_CPU_SET_INFORMATION*>(buf.data() + offset);
-        if (pInfo->Size == 0) break;
-        if (pInfo->Type == 0) { // CpuSetInformation
-            BYTE logicalIdx = pInfo->CpuSet.LogicalProcessorIndex;
-            if (logicalIdx < 64 && ((targetMask & (1ULL << logicalIdx)) != 0)) {
-                targetCpuSetIds.push_back(pInfo->CpuSet.Id);
-            }
+static bool ApplyConfiguredUnlistedCpuSets(const ati::GlobalConfig& cfg) {
+    if (cfg.unlistedMaskMode == 1) {
+        int coreCount = ati::CpuTopology::GetSystemCoreCount();
+        DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
+        DWORD_PTR excludeMask = fullMask & ~cfg.defaultAudioAffinityMask;
+        if (excludeMask != 0 && g_isolator.ApplyUnlistedCpuSets(1, excludeMask)) {
+            s_bUnlistedMaskApplied = TRUE;
+            return true;
         }
-        offset += pInfo->Size;
+    } else if (cfg.unlistedMaskMode == 2) {
+        if (cfg.normalAffinityMask != 0 && g_isolator.ApplyUnlistedCpuSets(2, cfg.normalAffinityMask)) {
+            s_bUnlistedMaskApplied = TRUE;
+            return true;
+        }
     }
-
-    if (targetCpuSetIds.empty()) {
-        MessageBoxA(hParent, "No CPU Set IDs matched the target mask.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
-        return false;
-    }
-
-    // ホワイトリスト構築
-    std::unordered_set<std::string> whitelist;
-    whitelist.insert("ati.exe");
-    whitelist.insert("system");
-    whitelist.insert("system idle process");
-    for (const auto& r : g_isolator.GetConfig().rules) {
-        std::string lowerName = r.processName;
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-        whitelist.insert(lowerName);
-    }
-
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) {
-        MessageBoxA(hParent, "Failed to create process snapshot.", "ATI System CPU Sets", MB_OK | MB_ICONERROR);
-        return false;
-    }
-
-    DWORD myPid = GetCurrentProcessId();
-    int successCount = 0;
-    int skippedCount = 0;
-    int deniedCount = 0;
-
-    PROCESSENTRY32 pe = { sizeof(pe) };
-    if (Process32First(hSnap, &pe)) {
-        do {
-            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid) {
-                skippedCount++;
-                continue;
-            }
-            std::string exeLower = pe.szExeFile;
-            std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::tolower);
-            if (whitelist.count(exeLower) > 0) {
-                skippedCount++;
-                continue;
-            }
-
-            HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-            if (!hProcess) {
-                hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
-            }
-            if (!hProcess) {
-                deniedCount++;
-                continue;
-            }
-
-            if (pfnSetProcessDefaultCpuSets(hProcess, targetCpuSetIds.data(), static_cast<ULONG>(targetCpuSetIds.size()))) {
-                successCount++;
-            } else {
-                deniedCount++;
-            }
-            CloseHandle(hProcess);
-        } while (Process32Next(hSnap, &pe));
-    }
-    CloseHandle(hSnap);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-        "CPU Sets applied successfully!\n\n"
-        "- Target Mask: 0x%llX (%zu cores)\n"
-        "- Applied Processes: %d\n"
-        "- Whitelisted / Protected (Skipped): %d",
-        static_cast<unsigned long long>(targetMask),
-        targetCpuSetIds.size(),
-        successCount,
-        skippedCount + deniedCount);
-
-    MessageBoxA(hParent, msg, "ATI System CPU Sets", MB_OK | MB_ICONINFORMATION);
-    return true;
-}
-
-// リスト外プロセスへの CPU Sets 解除処理
-static bool ReleaseCpuSetsFromUnlistedProcesses(HWND hParent) {
-    EnableDebugPrivilege();
-
-    HMODULE hK32 = GetModuleHandleA("kernel32.dll");
-    if (!hK32) return false;
-    auto pfnSetProcessDefaultCpuSets = (PFN_SetProcessDefaultCpuSets)GetProcAddress(hK32, "SetProcessDefaultCpuSets");
-    if (!pfnSetProcessDefaultCpuSets) return false;
-
-    std::unordered_set<std::string> whitelist;
-    whitelist.insert("ati.exe");
-    whitelist.insert("system");
-    whitelist.insert("system idle process");
-    for (const auto& r : g_isolator.GetConfig().rules) {
-        std::string lowerName = r.processName;
-        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-        whitelist.insert(lowerName);
-    }
-
-    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-    if (hSnap == INVALID_HANDLE_VALUE) return false;
-
-    DWORD myPid = GetCurrentProcessId();
-    int releasedCount = 0;
-
-    PROCESSENTRY32 pe = { sizeof(pe) };
-    if (Process32First(hSnap, &pe)) {
-        do {
-            if (pe.th32ProcessID <= 4 || pe.th32ProcessID == myPid) continue;
-            std::string exeLower = pe.szExeFile;
-            std::transform(exeLower.begin(), exeLower.end(), exeLower.begin(), ::tolower);
-            if (whitelist.count(exeLower) > 0) continue;
-
-            HANDLE hProcess = OpenProcess(PROCESS_SET_LIMITED_INFORMATION, FALSE, pe.th32ProcessID);
-            if (!hProcess) {
-                hProcess = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pe.th32ProcessID);
-            }
-            if (!hProcess) continue;
-
-            if (pfnSetProcessDefaultCpuSets(hProcess, nullptr, 0)) {
-                releasedCount++;
-            }
-            CloseHandle(hProcess);
-        } while (Process32Next(hSnap, &pe));
-    }
-    CloseHandle(hSnap);
-
-    char msg[256];
-    snprintf(msg, sizeof(msg),
-        "CPU Sets restrictions released successfully!\n\n"
-        "- Restored Processes: %d\n"
-        "All general processes restored to default all-core scheduling.",
-        releasedCount);
-
-    MessageBoxA(hParent, msg, "ATI System CPU Sets", MB_OK | MB_ICONINFORMATION);
-    return true;
+    return false;
 }
 
 // Priority ComboBox オーナードロー補助 (右詰め描画)
@@ -1608,13 +1430,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         }
 
         // 入力ボックスの初期値設定 (0x HEX 表示)
-        char aHex[32] = { 0 };
-        snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.defaultAudioAffinityMask));
-        SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, aHex);
-
-        char hexBuf[32] = { 0 };
-        snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
-        SetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf);
+        SetDlgItemHexMask(hDlg, IDC_EDIT_AUDIO_CORE, s_tmpConfig.defaultAudioAffinityMask);
+        SetDlgItemHexMask(hDlg, IDC_EDIT_NORMAL_CORES, s_tmpConfig.normalAffinityMask);
 
         HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_AUDIO_PRIORITY);
         if (hCombo) {
@@ -1635,30 +1452,20 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         // リリースボタンの活性・非活性状態を反映
         HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
         if (hBtnRel) {
-        HWND hChkExcl = GetDlgItem(hDlg, IDC_BTN_APPLY_EXCLUDE_CORE);
-        if (hChkExcl) {
-            if (!s_pfnOriginalCheckboxProc) {
-                s_pfnOriginalCheckboxProc = reinterpret_cast<WNDPROC>(
-                    SetWindowLongPtrA(hChkExcl, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc))
-                );
-            } else {
-                SetWindowLongPtrA(hChkExcl, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc));
-            }
-            SendMessageA(hChkExcl, BM_SETCHECK, (s_tmpConfig.unlistedMaskMode == 1) ? BST_CHECKED : BST_UNCHECKED, 0);
-        }
-        HWND hChkNorm = GetDlgItem(hDlg, IDC_BTN_APPLY_NORMAL_MASK);
-        if (hChkNorm) {
-            if (!s_pfnOriginalCheckboxProc) {
-                s_pfnOriginalCheckboxProc = reinterpret_cast<WNDPROC>(
-                    SetWindowLongPtrA(hChkNorm, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc))
-                );
-            } else {
-                SetWindowLongPtrA(hChkNorm, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc));
-            }
-            SendMessageA(hChkNorm, BM_SETCHECK, (s_tmpConfig.unlistedMaskMode == 2) ? BST_CHECKED : BST_UNCHECKED, 0);
-        }
-        s_bUnlistedMaskApplied = g_isolator.HasAppliedUnlistedCpuSets() ? TRUE : FALSE;
-        EnableWindow(hBtnRel, (s_tmpConfig.unlistedMaskMode == 0) && s_bUnlistedMaskApplied);
+            auto subclassCheckbox = [&](int ctrlId, bool checked) {
+                HWND hChk = GetDlgItem(hDlg, ctrlId);
+                if (hChk) {
+                    WNDPROC orig = reinterpret_cast<WNDPROC>(
+                        SetWindowLongPtrA(hChk, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(CustomCheckboxProc))
+                    );
+                    if (!s_pfnOriginalCheckboxProc) s_pfnOriginalCheckboxProc = orig;
+                    SendMessageA(hChk, BM_SETCHECK, checked ? BST_CHECKED : BST_UNCHECKED, 0);
+                }
+            };
+            subclassCheckbox(IDC_BTN_APPLY_EXCLUDE_CORE, s_tmpConfig.unlistedMaskMode == 1);
+            subclassCheckbox(IDC_BTN_APPLY_NORMAL_MASK, s_tmpConfig.unlistedMaskMode == 2);
+            s_bUnlistedMaskApplied = g_isolator.HasAppliedUnlistedCpuSets() ? TRUE : FALSE;
+            EnableWindow(hBtnRel, (s_tmpConfig.unlistedMaskMode == 0) && s_bUnlistedMaskApplied);
         }
 
         // 初回レイアウトを強制適用
@@ -1880,12 +1687,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                     }
-                    char aHex[32] = { 0 };
-                    snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.defaultAudioAffinityMask));
-                    SetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, aHex);
-                    char hexBuf[32];
-                    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_tmpConfig.normalAffinityMask));
-                    SetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf);
+                    SetDlgItemHexMask(hDlg, IDC_EDIT_AUDIO_CORE, s_tmpConfig.defaultAudioAffinityMask);
+                    SetDlgItemHexMask(hDlg, IDC_EDIT_NORMAL_CORES, s_tmpConfig.normalAffinityMask);
 
                     HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
                     InvalidateRect(hList, nullptr, FALSE);
@@ -1902,19 +1705,8 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
 
         if (code == EN_CHANGE) {
             if (cmdId == IDC_EDIT_AUDIO_CORE) {
-                char buf[128] = { 0 };
-                GetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, buf, sizeof(buf));
-                std::string s(buf);
-                DWORD_PTR m = 0;
                 int fc = 0;
-                if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
-                    m = _strtoui64(s.c_str(), nullptr, 16);
-                    for (int c = 0; c < 64; ++c) {
-                        if ((m & (1ULL << c)) != 0) { fc = c; break; }
-                    }
-                } else {
-                    m = ParseCoreListToMask(s, fc);
-                }
+                DWORD_PTR m = ReadDlgItemCoreMask(hDlg, IDC_EDIT_AUDIO_CORE, &fc);
                 if (m != 0) {
                     s_tmpConfig.defaultAudioAffinityMask = m;
                     s_tmpConfig.defaultAudioCore = fc;
@@ -1922,36 +1714,42 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                     if (hList) InvalidateRect(hList, nullptr, FALSE);
                 }
             } else if (cmdId == IDC_EDIT_NORMAL_CORES) {
-                char hexBuf[32] = { 0 };
-                GetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf, sizeof(hexBuf));
-                DWORD_PTR mask = _strtoui64(hexBuf, nullptr, 16);
-                s_tmpConfig.normalAffinityMask = mask;
+                s_tmpConfig.normalAffinityMask = ReadDlgItemCoreMask(hDlg, IDC_EDIT_NORMAL_CORES);
                 HWND hList = GetDlgItem(hDlg, IDC_LIST_SETTINGS_CORES);
                 if (hList) InvalidateRect(hList, nullptr, FALSE);
             }
         }
 
-        if (cmdId == IDC_BTN_APPLY_EXCLUDE_CORE) {
-            HWND hChkExcl = GetDlgItem(hDlg, IDC_BTN_APPLY_EXCLUDE_CORE);
-            HWND hChkNorm = GetDlgItem(hDlg, IDC_BTN_APPLY_NORMAL_MASK);
-            bool isChecked = hChkExcl && (SendMessageA(hChkExcl, BM_GETCHECK, 0, 0) == BST_CHECKED);
+        if (cmdId == IDC_BTN_APPLY_EXCLUDE_CORE || cmdId == IDC_BTN_APPLY_NORMAL_MASK) {
+            int targetMode = (cmdId == IDC_BTN_APPLY_EXCLUDE_CORE) ? 1 : 2;
+            HWND hChkSelf = GetDlgItem(hDlg, cmdId);
+            HWND hChkOther = GetDlgItem(hDlg, (targetMode == 1) ? IDC_BTN_APPLY_NORMAL_MASK : IDC_BTN_APPLY_EXCLUDE_CORE);
+            bool isChecked = hChkSelf && (SendMessageA(hChkSelf, BM_GETCHECK, 0, 0) == BST_CHECKED);
             if (isChecked) {
-                int coreCount = ati::CpuTopology::GetSystemCoreCount();
-                DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
-                DWORD_PTR excludeMask = fullMask & ~s_tmpConfig.defaultAudioAffinityMask;
-                if (excludeMask == 0) {
-                    if (hChkExcl) {
-                        SendMessageA(hChkExcl, BM_SETCHECK, BST_UNCHECKED, 0);
-                        InvalidateRect(hChkExcl, nullptr, TRUE);
-                    }
-                    MessageBoxA(hDlg, "Invalid target mask (cannot exclude all cores).", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+                DWORD_PTR targetMask = 0;
+                if (targetMode == 1) {
+                    int coreCount = ati::CpuTopology::GetSystemCoreCount();
+                    DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
+                    targetMask = fullMask & ~s_tmpConfig.defaultAudioAffinityMask;
                 } else {
-                    if (hChkNorm) {
-                        SendMessageA(hChkNorm, BM_SETCHECK, BST_UNCHECKED, 0);
-                        InvalidateRect(hChkNorm, nullptr, TRUE);
+                    targetMask = s_tmpConfig.normalAffinityMask;
+                }
+                if (targetMask == 0) {
+                    if (hChkSelf) {
+                        SendMessageA(hChkSelf, BM_SETCHECK, BST_UNCHECKED, 0);
+                        InvalidateRect(hChkSelf, nullptr, TRUE);
                     }
-                    if (g_isolator.ApplyUnlistedCpuSets(1, excludeMask)) {
-                        s_tmpConfig.unlistedMaskMode = 1;
+                    MessageBoxA(hDlg,
+                                (targetMode == 1) ? "Invalid target mask (cannot exclude all cores)."
+                                                  : "Invalid normal affinity mask.",
+                                "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
+                } else {
+                    if (hChkOther) {
+                        SendMessageA(hChkOther, BM_SETCHECK, BST_UNCHECKED, 0);
+                        InvalidateRect(hChkOther, nullptr, TRUE);
+                    }
+                    if (g_isolator.ApplyUnlistedCpuSets(targetMode, targetMask)) {
+                        s_tmpConfig.unlistedMaskMode = targetMode;
                         s_bUnlistedMaskApplied = TRUE;
                         SaveConfig(g_isolator.GetConfig(), g_iniPath);
                         HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
@@ -1973,63 +1771,19 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 }
                 if (g_hMainDlg) InvalidateRect(g_hMainDlg, nullptr, FALSE);
             }
-            if (hChkExcl) InvalidateRect(hChkExcl, nullptr, TRUE);
-            return TRUE;
-        } else if (cmdId == IDC_BTN_APPLY_NORMAL_MASK) {
-            HWND hChkExcl = GetDlgItem(hDlg, IDC_BTN_APPLY_EXCLUDE_CORE);
-            HWND hChkNorm = GetDlgItem(hDlg, IDC_BTN_APPLY_NORMAL_MASK);
-            bool isChecked = hChkNorm && (SendMessageA(hChkNorm, BM_GETCHECK, 0, 0) == BST_CHECKED);
-            if (isChecked) {
-                if (s_tmpConfig.normalAffinityMask == 0) {
-                    if (hChkNorm) {
-                        SendMessageA(hChkNorm, BM_SETCHECK, BST_UNCHECKED, 0);
-                        InvalidateRect(hChkNorm, nullptr, TRUE);
-                    }
-                    MessageBoxA(hDlg, "Invalid normal affinity mask.", "ATI System CPU Sets", MB_OK | MB_ICONWARNING);
-                } else {
-                    if (hChkExcl) {
-                        SendMessageA(hChkExcl, BM_SETCHECK, BST_UNCHECKED, 0);
-                        InvalidateRect(hChkExcl, nullptr, TRUE);
-                    }
-                    if (g_isolator.ApplyUnlistedCpuSets(2, s_tmpConfig.normalAffinityMask)) {
-                        s_tmpConfig.unlistedMaskMode = 2;
-                        s_bUnlistedMaskApplied = TRUE;
-                        SaveConfig(g_isolator.GetConfig(), g_iniPath);
-                        HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
-                        if (hBtnRel) {
-                            EnableWindow(hBtnRel, FALSE);
-                            InvalidateRect(hBtnRel, nullptr, TRUE);
-                        }
-                        if (g_hMainDlg) InvalidateRect(g_hMainDlg, nullptr, FALSE);
-                    }
-                }
-            } else {
-                g_isolator.StopUnlistedPollingMask();
-                s_tmpConfig.unlistedMaskMode = 0;
-                SaveConfig(g_isolator.GetConfig(), g_iniPath);
-                HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
-                if (hBtnRel) {
-                    EnableWindow(hBtnRel, s_bUnlistedMaskApplied);
-                    InvalidateRect(hBtnRel, nullptr, TRUE);
-                }
-                if (g_hMainDlg) InvalidateRect(g_hMainDlg, nullptr, FALSE);
-            }
-            if (hChkNorm) InvalidateRect(hChkNorm, nullptr, TRUE);
+            if (hChkSelf) InvalidateRect(hChkSelf, nullptr, TRUE);
             return TRUE;
         } else if (cmdId == IDC_BTN_RELEASE_MASK) {
             if (g_isolator.ReleaseUnlistedCpuSets()) {
                 s_tmpConfig.unlistedMaskMode = 0;
                 s_bUnlistedMaskApplied = FALSE;
                 SaveConfig(g_isolator.GetConfig(), g_iniPath);
-                HWND hChkExcl = GetDlgItem(hDlg, IDC_BTN_APPLY_EXCLUDE_CORE);
-                HWND hChkNorm = GetDlgItem(hDlg, IDC_BTN_APPLY_NORMAL_MASK);
-                if (hChkExcl) {
-                    SendMessageA(hChkExcl, BM_SETCHECK, BST_UNCHECKED, 0);
-                    InvalidateRect(hChkExcl, nullptr, TRUE);
-                }
-                if (hChkNorm) {
-                    SendMessageA(hChkNorm, BM_SETCHECK, BST_UNCHECKED, 0);
-                    InvalidateRect(hChkNorm, nullptr, TRUE);
+                for (int id : {IDC_BTN_APPLY_EXCLUDE_CORE, IDC_BTN_APPLY_NORMAL_MASK}) {
+                    HWND hChk = GetDlgItem(hDlg, id);
+                    if (hChk) {
+                        SendMessageA(hChk, BM_SETCHECK, BST_UNCHECKED, 0);
+                        InvalidateRect(hChk, nullptr, TRUE);
+                    }
                 }
                 HWND hBtnRel = GetDlgItem(hDlg, IDC_BTN_RELEASE_MASK);
                 if (hBtnRel) {
@@ -2050,27 +1804,14 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 }
             }
 
-            char coreBuf[128] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_AUDIO_CORE, coreBuf, sizeof(coreBuf));
-            std::string s(coreBuf);
-            DWORD_PTR m = 0;
             int fc = 0;
-            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
-                m = _strtoui64(s.c_str(), nullptr, 16);
-                for (int c = 0; c < 64; ++c) {
-                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
-                }
-            } else {
-                m = ParseCoreListToMask(s, fc);
-            }
+            DWORD_PTR m = ReadDlgItemCoreMask(hDlg, IDC_EDIT_AUDIO_CORE, &fc);
             if (m != 0) {
                 s_tmpConfig.defaultAudioAffinityMask = m;
                 s_tmpConfig.defaultAudioCore = fc;
             }
 
-            char hexBuf[32] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_NORMAL_CORES, hexBuf, 32);
-            s_tmpConfig.normalAffinityMask = _strtoui64(hexBuf, nullptr, 16);
+            s_tmpConfig.normalAffinityMask = ReadDlgItemCoreMask(hDlg, IDC_EDIT_NORMAL_CORES);
 
             BOOL ok = FALSE;
             int poll = GetDlgItemInt(hDlg, IDC_EDIT_POLLING_MS, &ok, FALSE);
@@ -2083,18 +1824,7 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 SetProcessAffinityMask(GetCurrentProcess(), s_tmpConfig.normalAffinityMask);
             }
 
-            if (s_tmpConfig.unlistedMaskMode == 1) {
-                int coreCount = ati::CpuTopology::GetSystemCoreCount();
-                DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
-                DWORD_PTR excludeMask = fullMask & ~s_tmpConfig.defaultAudioAffinityMask;
-                if (excludeMask != 0) {
-                    g_isolator.ApplyUnlistedCpuSets(1, excludeMask);
-                }
-            } else if (s_tmpConfig.unlistedMaskMode == 2) {
-                if (s_tmpConfig.normalAffinityMask != 0) {
-                    g_isolator.ApplyUnlistedCpuSets(2, s_tmpConfig.normalAffinityMask);
-                }
-            }
+            ApplyConfiguredUnlistedCpuSets(s_tmpConfig);
             SetTimer(g_hMainDlg, TIMER_POLLING_ID, s_tmpConfig.pollingIntervalMs, nullptr);
             if (g_hMainDlg) InvalidateRect(g_hMainDlg, nullptr, FALSE);
             HWND hList = GetDlgItem(g_hMainDlg, IDC_LIST_PROCESSES);
@@ -2210,9 +1940,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         if (!s_editRule.audioCores.empty()) {
             s_editRule.audioCore = s_editRule.audioCores[0];
         }
-        char aHex[32] = { 0 };
-        snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_editRule.audioAffinityMask));
-        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, aHex);
+        SetDlgItemHexMask(hDlg, IDC_EDIT_RULE_CORE, s_editRule.audioAffinityMask);
 
         DWORD_PTR initialNormal = (s_editRule.normalAffinityMask != 0) 
             ? s_editRule.normalAffinityMask 
@@ -2220,9 +1948,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         if (s_editRule.normalAffinityMask == 0) {
             s_editRule.normalAffinityMask = initialNormal;
         }
-        char nHex[32] = { 0 };
-        snprintf(nHex, sizeof(nHex), "0x%llX", static_cast<unsigned long long>(s_editRule.normalAffinityMask));
-        SetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, nHex);
+        SetDlgItemHexMask(hDlg, IDC_EDIT_RULE_NORMAL_CORES, s_editRule.normalAffinityMask);
 
         HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_RULE_PRIO);
         if (hCombo) {
@@ -2375,12 +2101,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                             }
                         }
                     }
-                    char aHex[32] = { 0 };
-                    snprintf(aHex, sizeof(aHex), "0x%llX", static_cast<unsigned long long>(s_editRule.audioAffinityMask));
-                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, aHex);
-                    char hexBuf[32] = { 0 };
-                    snprintf(hexBuf, sizeof(hexBuf), "0x%llX", static_cast<unsigned long long>(s_editRule.normalAffinityMask));
-                    SetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, hexBuf);
+                    SetDlgItemHexMask(hDlg, IDC_EDIT_RULE_CORE, s_editRule.audioAffinityMask);
+                    SetDlgItemHexMask(hDlg, IDC_EDIT_RULE_NORMAL_CORES, s_editRule.normalAffinityMask);
 
                     HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
                     InvalidateRect(hList, nullptr, FALSE);
@@ -2396,19 +2118,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         WORD code = HIWORD(wParam);
 
         if (code == EN_CHANGE && cmdId == IDC_EDIT_RULE_CORE) {
-            char buf[128] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, buf, sizeof(buf));
-            std::string s(buf);
-            DWORD_PTR m = 0;
             int fc = 0;
-            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
-                m = _strtoui64(s.c_str(), nullptr, 16);
-                for (int c = 0; c < 64; ++c) {
-                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
-                }
-            } else {
-                m = ParseCoreListToMask(s, fc);
-            }
+            DWORD_PTR m = ReadDlgItemCoreMask(hDlg, IDC_EDIT_RULE_CORE, &fc);
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
@@ -2419,15 +2130,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
         }
 
         if (code == EN_CHANGE && cmdId == IDC_EDIT_RULE_NORMAL_CORES) {
-            char buf[128] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, buf, sizeof(buf));
-            std::string s(buf);
-            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
-                s_editRule.normalAffinityMask = _strtoui64(s.c_str(), nullptr, 16);
-            } else {
-                int fc = 0;
-                s_editRule.normalAffinityMask = ParseCoreListToMask(s, fc);
-            }
+            s_editRule.normalAffinityMask = ReadDlgItemCoreMask(hDlg, IDC_EDIT_RULE_NORMAL_CORES);
             HWND hList = GetDlgItem(hDlg, IDC_LIST_RULE_CORES);
             if (hList) InvalidateRect(hList, nullptr, FALSE);
         }
@@ -2445,19 +2148,8 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 }
             }
 
-            char buf[128] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_RULE_CORE, buf, sizeof(buf));
-            std::string s(buf);
-            DWORD_PTR m = 0;
             int fc = 0;
-            if (s.length() > 2 && (s.substr(0, 2) == "0x" || s.substr(0, 2) == "0X")) {
-                m = _strtoui64(s.c_str(), nullptr, 16);
-                for (int c = 0; c < 64; ++c) {
-                    if ((m & (1ULL << c)) != 0) { fc = c; break; }
-                }
-            } else {
-                m = ParseCoreListToMask(s, fc);
-            }
+            DWORD_PTR m = ReadDlgItemCoreMask(hDlg, IDC_EDIT_RULE_CORE, &fc);
             if (m != 0) {
                 s_editRule.audioAffinityMask = m;
                 s_editRule.audioCore = fc;
@@ -2467,15 +2159,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPAR
                 }
             }
 
-            char nBuf[128] = { 0 };
-            GetDlgItemTextA(hDlg, IDC_EDIT_RULE_NORMAL_CORES, nBuf, sizeof(nBuf));
-            std::string ns(nBuf);
-            if (ns.length() > 2 && (ns.substr(0, 2) == "0x" || ns.substr(0, 2) == "0X")) {
-                s_editRule.normalAffinityMask = _strtoui64(ns.c_str(), nullptr, 16);
-            } else {
-                int nfc = 0;
-                s_editRule.normalAffinityMask = ParseCoreListToMask(ns, nfc);
-            }
+            s_editRule.normalAffinityMask = ReadDlgItemCoreMask(hDlg, IDC_EDIT_RULE_NORMAL_CORES);
 
             g_isolator.UpdateRule(s_editRuleIndex, s_editRule);
             auto updated = g_isolator.GetConfig();
@@ -3333,18 +3017,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
         LogDebug("WM_INITDIALOG: Self isolation applied");
 
         g_isolator.Initialize(config);
-        if (config.unlistedMaskMode == 1) {
-            int coreCount = ati::CpuTopology::GetSystemCoreCount();
-            DWORD_PTR fullMask = ati::ThreadIsolator::GetFullCoreMask(coreCount);
-            DWORD_PTR excludeMask = fullMask & ~config.defaultAudioAffinityMask;
-            if (excludeMask != 0 && g_isolator.ApplyUnlistedCpuSets(1, excludeMask)) {
-                s_bUnlistedMaskApplied = TRUE;
-            }
-        } else if (config.unlistedMaskMode == 2) {
-            if (config.normalAffinityMask != 0 && g_isolator.ApplyUnlistedCpuSets(2, config.normalAffinityMask)) {
-                s_bUnlistedMaskApplied = TRUE;
-            }
-        }
+        ApplyConfiguredUnlistedCpuSets(config);
         LogDebug("WM_INITDIALOG: isolator Initialize done");
 
         RefreshListView(hList, config.rules);

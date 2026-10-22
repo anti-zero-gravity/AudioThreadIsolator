@@ -25,7 +25,7 @@
 #### Control Buttons (Right Panel)
 - **`Always on Top`**: Pins the main window to always stay in the foreground.
 - **`[Edit]`**: Opens the settings dialog for the selected process (or double-click row).
-- **`[Add]`**: Opens a dialog to pick and add running processes to the monitoring list.
+- **`[Add]`**: Opens a dialog (`Select Process`) to pick and add running processes to the monitoring list. Checking the leading `!` column in this dialog also designates processes (`UnlistedExclusions`) to be excluded when masking all unlisted (unmonitored) processes.
 - **`[Remove]`**: Removes the selected process from the monitoring list.
 - **`[Settings]`**: Opens global settings for system defaults and core protection.
 - **`[Exit]`**: Exits the application.

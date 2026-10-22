@@ -290,6 +290,8 @@ private:
   bool m_debugPrivilegeEnabled = false;
   void EnableDebugPrivilegeOnce();
   static bool BuildTargetCpuSetIds(DWORD_PTR targetMask, std::vector<ULONG> &outIds);
+  std::unordered_set<std::string> BuildUnlistedWhitelist(bool includeExclusions = true) const;
+  void ClearCpuSetsForProcessNamesLocked(const std::unordered_set<std::string> &namesLower);
   bool ApplyUnlistedCpuSetsLocked(int mode, DWORD_PTR targetMask);
 
 public:
@@ -300,6 +302,7 @@ public:
   bool HasAppliedUnlistedCpuSets() const;
   void UpdateUnlistedExclusions(const std::vector<std::string> &exclusions);
   DWORD GetUnlistedApplyCount() const;
+  static bool IsAudioDgProcess(const std::string &name);
   bool IsHeuristicsActive() const;
   // 250ms 高速検証タイマー要求中かどうか判定
   bool IsFastPollingRequired() const;

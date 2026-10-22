@@ -1,7 +1,14 @@
 $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
 
-# Kill running ATI.exe if exists
+# Kill running ATI.exe if exists (or rename locked binary if running elevated)
 taskkill.exe /F /IM ATI.exe 2>$null
+if (-not (Test-Path "build")) {
+    New-Item -ItemType Directory -Path "build" | Out-Null
+}
+if (Test-Path "ATI.exe") {
+    Remove-Item "build/ATI.old.exe" -Force -ErrorAction SilentlyContinue
+    Move-Item -Path "ATI.exe" -Destination "build/ATI.old.exe" -Force -ErrorAction SilentlyContinue
+}
 
 Write-Host "Checking g++ location..."
 $gpp = Get-Command g++ -ErrorAction SilentlyContinue
