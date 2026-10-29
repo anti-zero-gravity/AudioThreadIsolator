@@ -39,27 +39,24 @@ struct ProcessRule {
                      // THREAD_PRIORITY_IDLE)
   DWORD_PTR normalAffinityMask = 0; // 通常スレッド退避先マスク (0:
                                     // Global設定のnormalAffinityMaskを自動継承)
-  DWORD targetPriority;       // 特定優先度フィルタ (0: 指定なし/自動判定)
-  DWORD processPriorityClass; // プロセス優先度 (0: 変更なし)
+  DWORD targetPriority = 0;   // 特定優先度フィルタ (0: 指定なし/自動判定)
+  DWORD processPriorityClass = NORMAL_PRIORITY_CLASS; // プロセス優先度クラス
 
   // 監視除外・ペンディングフラグ
   // (チェックONで監視・アイソレートから除外、デフォルト: false)
   bool isBypassed = false;
   // 個別ヒューリスティック探索フラグ (デフォルト: true)
   bool enableHeuristics = true;
-  // appType アプリ種別判定 (0: 未判定, 1: 非Chromium, 2: Chromium系, 3:
-  // DAW型高負荷)
+  // appType アプリ種別判定 (0: 未判定/audiodg, 1: 非Chromium, 2: Chromium系, 3:
+  // DAW型高負荷, 4: Roon専用, 5: Voicemeeter専用)
   int appType = 0;
-  bool ignoreSig =
-      false; // シグネチャ非依存モード (TimeCritical 15 + Cycles Delta > 50M)
-  int ignoreSigCount = 0; // シグネチャ非依存モード スレッド数 (0: 無効, 1: 1スレッド, 2以上: t個スレッド)
-  std::vector<DWORD> activeAudioTids; // 検出・確定されたオーディオスレッドID群 (TID昇順)
+  std::vector<DWORD> activeAudioTids; // 検出・確定されたオーディオスレッドID群 (スロット順)
   std::vector<int> audioCores; // 各スレッド用の個別隔離先コア番号 (空の場合は audioCore を使用)
   std::vector<int> audioPriorities; // 各スレッド用の個別適用優先度 (空の場合は audioPriority を使用)
   std::unordered_set<DWORD> suspendedAudioTids; // 個別スレッド一時停止管理セット
-  int multiSearchTurns = 0;       // IgnoreSig 複数スレッド探索用カウントダウンターン数 (10秒 = 10 * turnsPerSec)
+  int multiSearchTurns = 0;       // 複数スロット探索用カウントダウンターン数 (10秒 = 10 * turnsPerSec)
   size_t lastIdentifiedCount = 0; // 前回確認時の確定オーディオスレッド数
-  bool multiSearchSleeping = false; // 10秒経過しても次スレッドが未検出の場合の休眠フラグ (以降の行は同時に sleeping)
+  bool multiSearchSleeping = false; // 10秒経過しても未確定枠が残る場合の休眠フラグ
   double cyclesDelta = 0.0; // 個別 Cycles Delta 走査閾値 (M/s, 0.0: Global継承)
   bool isDeclineBoost =
       false; // Decline:1 (ポーリングブーストを拒否し1000msで計測)
@@ -89,7 +86,7 @@ struct ProcessRule {
   // 前回終了時ステータス記録と照合 (起動時引き継ぎ用)
   DWORD lastAudioPid = 0; // 前回終了時ステータス記録: オーディオPID
   DWORD lastAudioTid = 0; // 前回終了時ステータス記録: オーディオTID (単一互換用)
-  std::vector<DWORD> lastAudioTids; // 前回終了時ステータス記録: オーディオTID群 (IgnoreSig 複数スレッド対応)
+  std::vector<DWORD> lastAudioTids; // 前回終了時ステータス記録: オーディオTID群 (複数スロット対応)
 
   // 新探索フロー状態管理
   int searchPhase = 0; // 0: 未開始/確定完了, 1: Searching...(2秒/4ターン), 2:
@@ -250,6 +247,9 @@ private:
   std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>>
       m_trackedAudioThreads;
 
+  // 過去に確定済みのオーディオスレッド履歴 (パージ・侵入者誤認防止用、キー: PID, 値: TIDセット)
+  std::unordered_map<DWORD, std::unordered_set<DWORD>> m_confirmedAudioHistory;
+
   // スレッドCPU時間サンプリング (キー: PID, 値: (キー: TID, 値:
   // 前回計測の合計CPU時間))
   std::unordered_map<DWORD, std::unordered_map<DWORD, ULONGLONG>>
@@ -262,6 +262,16 @@ private:
     std::unordered_map<DWORD, ULONGLONG> latestDelta; // 直近ターンの瞬間デルタ
     std::unordered_set<DWORD>
         audioCandidateTids; // オーディオ関連と判定された候補 TID
+    std::unordered_set<DWORD>
+        socketCandidateTids; // Roon ソケット送信候補 TID (mswsock.dll / ws2_32.dll)
+    std::unordered_set<DWORD>
+        delayExecTids; // WaitReason == 4 (DelayExecution) 観測済み TID
+    std::unordered_set<DWORD>
+        vmWs2Tids; // Voicemeeter VBAN 候補 TID (ws2_32.dll)
+    std::unordered_set<DWORD>
+        vmHwAudioTids; // Voicemeeter Hardware OUT 候補 TID (audioses/wdmaud/ksuser/ASIO)
+    std::unordered_set<DWORD>
+        vmGuiTids; // Voicemeeter GUI スレッド TID (user32/gdi32/gdiplus/win32u)
     std::unordered_set<DWORD> inspectedTids; // スタック検査済み TID (生涯1回)
   };
   std::unordered_map<DWORD, ProcessSamplingState> m_samplingStates;
@@ -307,6 +317,13 @@ public:
   void UpdateUnlistedExclusions(const std::vector<std::string> &exclusions);
   DWORD GetUnlistedApplyCount() const;
   static bool IsAudioDgProcess(const std::string &name);
+  static bool IsRoonApplianceProcess(const std::string &name);
+  static bool IsRaatServerProcess(const std::string &name);
+  static bool IsRoonBridgeProcess(const std::string &name);
+  static bool IsVoicemeeterProcess(const std::string &name);
+  static void NormalizeSpecialRule(ProcessRule &rule);
+  static size_t GetRuleSlotCount(const ProcessRule &rule);
+  static bool IsMultiSlotRule(const ProcessRule &rule);
   bool IsHeuristicsActive() const;
   // 250ms 高速検証タイマー要求中かどうか判定
   bool IsFastPollingRequired() const;

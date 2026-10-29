@@ -114,6 +114,13 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
 - **幅広い音質比較ニーズへの対応**:
   - ATI は「音切れしない範囲で最も低い優先度が音質に優れる」という思想をベースに設計されていますが、最高優先度である Realtime（Base 31）まで即座に切り替えられる柔軟性も備えています。優先度の違いによる音質特性の変化をリアルタイムに聴き比べるなど、幅広い試聴ニーズや好みに応じた運用が可能です。
 
+### 4. Tips（特定アプリケーションの設定例）
+- **Roon**:
+  - Roon は複数のプロセス（`Roon.exe`, `RoonAppliance.exe`, `RoonServer.exe`, `RAATServer.exe`）で構成されています。
+  - **サーバー PC（Roon Server / Core 側）**: 常駐させた ATI に `RoonAppliance.exe` を登録します。
+  - **レンダラー PC（Endpoint / Roon Bridge 側）**: 常駐させた ATI に `RAATServer.exe` を登録します（`RoonBridge.exe` を登録した場合は自動で `RAATServer.exe` へフォールバックします）。
+  - （※`Roon.exe` は GUI、`RoonServer.exe` は管理サービスのため、音声処理スレッドは保持していません）
+
 ---
 
 ## ダウンロード

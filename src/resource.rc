@@ -11,7 +11,7 @@ IDI_APP_ICON ICON "app.ico"
 IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 102
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "Audio Thread Isolator v1.0.5"
+CAPTION "Audio Thread Isolator v1.0.6"
 FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_PROCESSES, "SysListView32", 
@@ -120,6 +120,16 @@ BEGIN
     PUSHBUTTON      "Cancel", IDCANCEL, 58, 11, 40, 14
 END
 
+// RoonBridge Fallback Notice Dialog
+IDD_ROONBRIDGE_FALLBACK DIALOGEX 0, 0, 210, 56
+STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU
+CAPTION "RoonBridge Fallback"
+FONT 9, "Segoe UI", 400, 0, 0x0
+BEGIN
+    CTEXT           "Falling back to RoonBridge's core process:\nRAATServer.exe", -1, 10, 9, 190, 20
+    DEFPUSHBUTTON   "OK", IDOK, 85, 34, 40, 14
+END
+
 // Tray Context Menu
 IDR_TRAY_MENU MENU
 BEGIN
@@ -136,8 +146,8 @@ END
 
 // Version Information
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,4,0
-PRODUCTVERSION  1,0,4,0
+FILEVERSION     1,0,6,0
+PRODUCTVERSION  1,0,6,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -149,11 +159,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "Audio Thread Isolator\0"
-            VALUE "FileVersion",      "1.0.4.0\0"
+            VALUE "FileVersion",      "1.0.6.0\0"
             VALUE "InternalName",     "ATI\0"
             VALUE "OriginalFilename", "ATI.exe\0"
             VALUE "ProductName",      "Audio Thread Isolator\0"
-            VALUE "ProductVersion",   "1.0.4\0"
+            VALUE "ProductVersion",   "1.0.6\0"
         END
     END
     BLOCK "VarFileInfo"
@@ -162,13 +172,11 @@ BEGIN
     END
 END
 
-// Priority Matrix Embedded Assets (Standalone Single EXE)
+// Priority Matrix Embedded Assets (Standalone Single EXE: 42 Rank/Pair PNGs + Base + HitMap)
 3000 RCDATA "ui_parts/hit_map.bin"
 3001 RCDATA "ui_parts/base_dark_layer.png"
 3101 RCDATA "ui_parts/full_composites/matrix_rank_01.png"
 3102 RCDATA "ui_parts/full_composites/matrix_rank_02.png"
-3103 RCDATA "ui_parts/full_composites/matrix_rank_03.png"
-3104 RCDATA "ui_parts/full_composites/matrix_rank_04.png"
 3105 RCDATA "ui_parts/full_composites/matrix_rank_05.png"
 3106 RCDATA "ui_parts/full_composites/matrix_rank_06.png"
 3107 RCDATA "ui_parts/full_composites/matrix_rank_07.png"
@@ -177,23 +185,13 @@ END
 3110 RCDATA "ui_parts/full_composites/matrix_rank_10.png"
 3111 RCDATA "ui_parts/full_composites/matrix_rank_11.png"
 3112 RCDATA "ui_parts/full_composites/matrix_rank_12.png"
-3113 RCDATA "ui_parts/full_composites/matrix_rank_13.png"
 3114 RCDATA "ui_parts/full_composites/matrix_rank_14.png"
 3115 RCDATA "ui_parts/full_composites/matrix_rank_15.png"
-3116 RCDATA "ui_parts/full_composites/matrix_rank_16.png"
 3117 RCDATA "ui_parts/full_composites/matrix_rank_17.png"
-3118 RCDATA "ui_parts/full_composites/matrix_rank_18.png"
-3119 RCDATA "ui_parts/full_composites/matrix_rank_19.png"
 3120 RCDATA "ui_parts/full_composites/matrix_rank_20.png"
-3121 RCDATA "ui_parts/full_composites/matrix_rank_21.png"
-3122 RCDATA "ui_parts/full_composites/matrix_rank_22.png"
 3123 RCDATA "ui_parts/full_composites/matrix_rank_23.png"
-3124 RCDATA "ui_parts/full_composites/matrix_rank_24.png"
-3125 RCDATA "ui_parts/full_composites/matrix_rank_25.png"
 3126 RCDATA "ui_parts/full_composites/matrix_rank_26.png"
-3127 RCDATA "ui_parts/full_composites/matrix_rank_27.png"
 3128 RCDATA "ui_parts/full_composites/matrix_rank_28.png"
-3129 RCDATA "ui_parts/full_composites/matrix_rank_29.png"
 3130 RCDATA "ui_parts/full_composites/matrix_rank_30.png"
 3131 RCDATA "ui_parts/full_composites/matrix_rank_31.png"
 3132 RCDATA "ui_parts/full_composites/matrix_rank_32.png"
@@ -202,8 +200,6 @@ END
 3135 RCDATA "ui_parts/full_composites/matrix_rank_35.png"
 3136 RCDATA "ui_parts/full_composites/matrix_rank_36.png"
 3137 RCDATA "ui_parts/full_composites/matrix_rank_37.png"
-3138 RCDATA "ui_parts/full_composites/matrix_rank_38.png"
-3139 RCDATA "ui_parts/full_composites/matrix_rank_39.png"
 3140 RCDATA "ui_parts/full_composites/matrix_rank_40.png"
 3141 RCDATA "ui_parts/full_composites/matrix_rank_41.png"
 3142 RCDATA "ui_parts/full_composites/matrix_rank_42.png"
@@ -214,4 +210,11 @@ END
 3147 RCDATA "ui_parts/full_composites/matrix_rank_47.png"
 3148 RCDATA "ui_parts/full_composites/matrix_rank_48.png"
 3149 RCDATA "ui_parts/full_composites/matrix_rank_49.png"
+3200 RCDATA "ui_parts/full_composites/matrix_normal_col_0.png"
+3201 RCDATA "ui_parts/full_composites/matrix_normal_col_1.png"
+3202 RCDATA "ui_parts/full_composites/matrix_normal_col_2.png"
+3203 RCDATA "ui_parts/full_composites/matrix_normal_col_3.png"
+3204 RCDATA "ui_parts/full_composites/matrix_normal_col_4.png"
+3205 RCDATA "ui_parts/full_composites/matrix_normal_col_5.png"
+3206 RCDATA "ui_parts/full_composites/matrix_normal_col_6.png"
 

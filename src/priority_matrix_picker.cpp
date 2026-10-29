@@ -138,27 +138,36 @@ static Gdiplus::Image* GetRankImage(int rank) {
         return s_pBaseDarkImg;
     }
 
-    auto it = s_compositeCache.find(rank);
+    const PriorityMatrixEntry* entry = GetMatrixEntryByRank(rank);
+    bool isNormalPair = (entry && entry->processPriorityClass == NORMAL_PRIORITY_CLASS);
+    int cacheKey = isNormalPair ? (IDR_MATRIX_NORMAL_COL_BASE + entry->col) : rank;
+
+    auto it = s_compositeCache.find(cacheKey);
     if (it != s_compositeCache.end()) {
         return it->second;
     }
 
-    // まず内部リソース (RCDATA 3101..3149) から読み込み
-    Gdiplus::Image* img = LoadImageFromResource(IDR_MATRIX_RANK_BASE + rank);
+    // まず内部リソース (Normalペア: RCDATA 3200..3206 / 他: RCDATA 3101..3149) から読み込み
+    int resId = isNormalPair ? (IDR_MATRIX_NORMAL_COL_BASE + entry->col) : (IDR_MATRIX_RANK_BASE + rank);
+    Gdiplus::Image* img = LoadImageFromResource(resId);
     if (img && img->GetLastStatus() == Gdiplus::Ok) {
-        s_compositeCache[rank] = img;
+        s_compositeCache[cacheKey] = img;
         return img;
     }
 
     // フォールバック (外部ファイル探索)
     FindUiPartsDirectory();
     wchar_t fname[64];
-    swprintf(fname, 64, L"\\full_composites\\matrix_rank_%02d.png", rank);
+    if (isNormalPair) {
+        swprintf(fname, 64, L"\\full_composites\\matrix_normal_col_%d.png", entry->col);
+    } else {
+        swprintf(fname, 64, L"\\full_composites\\matrix_rank_%02d.png", rank);
+    }
     std::wstring fullPath = s_uiPartsDirW + fname;
 
     img = Gdiplus::Image::FromFile(fullPath.c_str());
     if (img && img->GetLastStatus() == Gdiplus::Ok) {
-        s_compositeCache[rank] = img;
+        s_compositeCache[cacheKey] = img;
         return img;
     }
     return nullptr;
@@ -253,9 +262,14 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         Gdiplus::Pen cardBorder(Gdiplus::Color(255, 38, 46, 61), 1.0f);
         g.DrawRectangle(&cardBorder, hudLeft, hudTop, hudW, hudH);
 
-        // HUD Typography & Details
+        // HUD Typography & Details (Fixed coordinates & font sizes across all 49 ranks so nothing shifts on hover)
         const PriorityMatrixEntry* entry = GetMatrixEntryByRank(activeRank);
         if (entry) {
+            bool isNormalPair = (entry->processPriorityClass == NORMAL_PRIORITY_CLASS);
+            const PriorityMatrixEntry* fgEntry = isNormalPair ? GetMatrixEntryByRowCol(3, entry->col) : nullptr;
+            const PriorityMatrixEntry* bgEntry = isNormalPair ? GetMatrixEntryByRowCol(2, entry->col) : nullptr;
+            bool isSplitValue = (isNormalPair && fgEntry && bgEntry && fgEntry->basePriority != bgEntry->basePriority);
+
             int textPadX = hudLeft + static_cast<int>(16 * s_scale);
             int curY = hudTop + static_cast<int>(14 * s_scale);
 
@@ -266,9 +280,13 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
 
             curY += static_cast<int>(20 * s_scale);
 
-            // Large Base Priority Hero Number & Rank
-            wchar_t bpBuf[16];
-            swprintf(bpBuf, 16, L"%d", entry->basePriority);
+            // Large Base Priority Hero Number & Rank (strictly 42px / 14px fixed)
+            wchar_t bpBuf[32];
+            if (isSplitValue) {
+                swprintf(bpBuf, 32, L"%d / %d", fgEntry->basePriority, bgEntry->basePriority);
+            } else {
+                swprintf(bpBuf, 32, L"%d", entry->basePriority);
+            }
             Gdiplus::Font heroFont(L"Segoe UI", 42.0f * s_scale, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
             Gdiplus::SolidBrush heroBrush(Gdiplus::Color(255, 255, 255, 255));
             g.DrawString(bpBuf, -1, &heroFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &heroBrush);
@@ -280,8 +298,12 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             float rankY = static_cast<float>(curY) + 16.0f * s_scale;
 
             // Rank label next to base priority
-            wchar_t rankBuf[32];
-            swprintf(rankBuf, 32, L"Rank #%d / 49", entry->rank);
+            wchar_t rankBuf[48];
+            if (isNormalPair && fgEntry && bgEntry) {
+                swprintf(rankBuf, 48, L"Rank #%d, #%d / 49", fgEntry->rank, bgEntry->rank);
+            } else {
+                swprintf(rankBuf, 48, L"Rank #%d / 49", entry->rank);
+            }
             Gdiplus::Font rankFont(L"Segoe UI", 14.0f * s_scale, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
             Gdiplus::SolidBrush rankBrush(Gdiplus::Color(255, 96, 165, 250));
             g.DrawString(rankBuf, -1, &rankFont, Gdiplus::PointF(rankX, rankY), &rankBrush);
@@ -289,12 +311,13 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             curY += static_cast<int>(50 * s_scale);
 
             // Separator line
+            int innerW = hudW - static_cast<int>(32 * s_scale);
             Gdiplus::Pen sepPen(Gdiplus::Color(40, 255, 255, 255), 1.0f);
-            g.DrawLine(&sepPen, textPadX, curY, textPadX + hudW - static_cast<int>(32 * s_scale), curY);
+            g.DrawLine(&sepPen, textPadX, curY, textPadX + innerW, curY);
 
             curY += static_cast<int>(14 * s_scale);
 
-            // Detail fields (UnitPixel for strict DPI tracking)
+            // Detail fields (strictly identical font sizes & Y steps across all 49 cells)
             Gdiplus::Font lblFont(L"Segoe UI", 12.0f * s_scale, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
             Gdiplus::Font valFont(L"Segoe UI", 14.0f * s_scale, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
             Gdiplus::Font monoFont(L"Consolas", 12.5f * s_scale, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
@@ -304,34 +327,75 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             Gdiplus::SolidBrush valBrush(Gdiplus::Color(255, 241, 245, 249));
             Gdiplus::SolidBrush accentBrush(Gdiplus::Color(255, 56, 189, 248));
 
+            int rowStepLbl = static_cast<int>(18 * s_scale);
+            int rowStepVal = static_cast<int>(26 * s_scale);
+
             // Process Class
             g.DrawString(L"Process Class:", -1, &lblFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &lblBrush);
-            curY += static_cast<int>(18 * s_scale);
+            curY += rowStepLbl;
             wchar_t pClassBuf[64];
-            MultiByteToWideChar(CP_ACP, 0, entry->processLabel, -1, pClassBuf, 64);
+            if (isNormalPair) {
+                wcscpy_s(pClassBuf, L"Normal (Foreground / Background)");
+            } else {
+                MultiByteToWideChar(CP_ACP, 0, entry->processLabel, -1, pClassBuf, 64);
+            }
             g.DrawString(pClassBuf, -1, &valFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &valBrush);
 
-            curY += static_cast<int>(26 * s_scale);
+            curY += rowStepVal;
 
             // Thread Priority
             g.DrawString(L"Thread Priority:", -1, &lblFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &lblBrush);
-            curY += static_cast<int>(18 * s_scale);
+            curY += rowStepLbl;
             wchar_t tPrioBuf[64];
             MultiByteToWideChar(CP_ACP, 0, entry->threadLabel, -1, tPrioBuf, 64);
             g.DrawString(tPrioBuf, -1, &valFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &accentBrush);
 
-            curY += static_cast<int>(26 * s_scale);
+            curY += rowStepVal;
 
             // Formula
             g.DrawString(L"Base Formula:", -1, &lblFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &lblBrush);
-            curY += static_cast<int>(18 * s_scale);
-            wchar_t formBuf[64];
-            MultiByteToWideChar(CP_ACP, 0, entry->formulaStr, -1, formBuf, 64);
+            curY += rowStepLbl;
+            wchar_t formBuf[96];
+            if (isSplitValue) {
+                swprintf(formBuf, 96, L"FG: 9 + (%+d) = %d | BG: 7 + (%+d) = %d",
+                         entry->threadPriority, fgEntry->basePriority,
+                         entry->threadPriority, bgEntry->basePriority);
+            } else {
+                MultiByteToWideChar(CP_ACP, 0, entry->formulaStr, -1, formBuf, 96);
+            }
             Gdiplus::SolidBrush formBrush(Gdiplus::Color(255, 203, 213, 225));
             g.DrawString(formBuf, -1, &monoFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &formBrush);
 
             // Bottom Instructions
             int btmY = hudTop + hudH - static_cast<int>(24 * s_scale);
+
+            // Normal Priority OS Behavior Note (shown only in the empty space below Base Formula)
+            if (isNormalPair) {
+                int noteTop = curY + static_cast<int>(24 * s_scale);
+                int noteH = btmY - noteTop - static_cast<int>(6 * s_scale);
+                if (noteH > static_cast<int>(24 * s_scale)) {
+                    float noteLeft = static_cast<float>(textPadX) + 8.0f * s_scale;
+                    float noteWidth = static_cast<float>(innerW) - 8.0f * s_scale;
+                    Gdiplus::RectF noteRect(noteLeft, static_cast<float>(noteTop), noteWidth, static_cast<float>(noteH));
+                    Gdiplus::Font noteFont(L"Segoe UI", 10.2f * s_scale, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+                    Gdiplus::SolidBrush noteBrush(Gdiplus::Color(255, 196, 210, 228));
+                    const wchar_t* kNormalNote =
+                        L"For Normal priority only, Windows automatically changes priority when an app is in front (Foreground) or behind (Background). Processes without a window always use the lower Background priority.";
+
+                    Gdiplus::RectF measuredNoteRect;
+                    g.MeasureString(kNormalNote, -1, &noteFont, noteRect, &measuredNoteRect);
+
+                    Gdiplus::Pen accentBarPen(Gdiplus::Color(200, 56, 189, 248), 2.0f * s_scale);
+                    g.DrawLine(&accentBarPen,
+                               static_cast<float>(textPadX),
+                               measuredNoteRect.Y + 2.0f * s_scale,
+                               static_cast<float>(textPadX),
+                               measuredNoteRect.Y + measuredNoteRect.Height - 2.0f * s_scale);
+
+                    g.DrawString(kNormalNote, -1, &noteFont, noteRect, nullptr, &noteBrush);
+                }
+            }
+
             Gdiplus::SolidBrush hintBrush(Gdiplus::Color(255, 100, 116, 139));
             g.DrawString(L"Click to apply ｜ [Esc] to cancel", -1, &hintFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(btmY)), &hintBrush);
         }

@@ -189,8 +189,44 @@ static std::string GetProcessPriorityString(DWORD pClass) {
     case NORMAL_PRIORITY_CLASS: return "Normal";
     case BELOW_NORMAL_PRIORITY_CLASS: return "Below Normal";
     case IDLE_PRIORITY_CLASS: return "Idle";
-    case 0: default: return "(Default)";
+    case 0: default: return "Normal";
     }
+}
+
+static std::string GetThreadShortName(int prio) {
+    switch (prio) {
+    case THREAD_PRIORITY_IDLE:          return "Idle";
+    case THREAD_PRIORITY_LOWEST:        return "Lowest";
+    case THREAD_PRIORITY_BELOW_NORMAL:  return "Below";
+    case THREAD_PRIORITY_NORMAL:        return "Normal";
+    case THREAD_PRIORITY_ABOVE_NORMAL:  return "Above";
+    case THREAD_PRIORITY_HIGHEST:       return "Highest";
+    case THREAD_PRIORITY_TIME_CRITICAL: return "Time Critical";
+    default:                            return std::to_string(prio);
+    }
+}
+
+static std::string FormatThreadPriorityDisplay(DWORD pClass, int threadPrio) {
+    DWORD effectiveClass = (pClass != 0) ? pClass : NORMAL_PRIORITY_CLASS;
+    std::string name = GetThreadShortName(threadPrio);
+
+    if (effectiveClass == NORMAL_PRIORITY_CLASS) {
+        int fgBase = 9;
+        int bgBase = 7;
+        if (ati::GetNormalPairBasePriorities(threadPrio, fgBase, bgBase)) {
+            if (fgBase == bgBase) {
+                return name + " " + std::to_string(fgBase);
+            }
+            return name + " FG " + std::to_string(fgBase) + " - BG " + std::to_string(bgBase);
+        }
+    }
+
+    int rank = ati::FindRankByPrio(effectiveClass, threadPrio);
+    const auto* entry = ati::GetMatrixEntryByRank(rank);
+    if (entry) {
+        return name + " " + std::to_string(entry->basePriority);
+    }
+    return GetPriorityString(threadPrio);
 }
 
 // --- コア番号・マスク変換ヘルパー (ANSI) ---
@@ -484,7 +520,7 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                 rule.audioAffinityMask = config.defaultAudioAffinityMask;
                 rule.audioPriority = config.defaultAudioPriority;
                 rule.targetPriority = 0;
-                rule.processPriorityClass = 0;
+                rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
                 rule.applyCount = 0;
                 rule.currentThreadCount = 0;
                 rule.detectedThreadName = "";
@@ -525,15 +561,7 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                     const std::string& k = kv.first;
                     const std::string& v = kv.second;
 
-                    if (k == "IgnoreSig" || k == "IgnoreSigRank") {
-                        rule.ignoreSig = true;
-                        if (!v.empty()) {
-                            int cnt = atoi(v.c_str());
-                            rule.ignoreSigCount = (cnt > 0) ? cnt : 1;
-                        } else {
-                            rule.ignoreSigCount = 1;
-                        }
-                    } else if (k == "AudioCore" || k == "AudioCores" || k == "AudioCoreMask") {
+                    if (k == "AudioCore" || k == "AudioCores" || k == "AudioCoreMask") {
                         int fc = 0;
                         DWORD_PTR m = ParseCoreListToMask(v, fc);
                         rule.audioCores.clear();
@@ -622,16 +650,28 @@ static void LoadConfig(ati::GlobalConfig& config, const std::string& iniPath) {
                             } else if (v == "Idle") {
                                 rule.processPriorityClass = IDLE_PRIORITY_CLASS;
                             } else {
-                                rule.processPriorityClass = static_cast<DWORD>(atoi(v.c_str()));
+                                DWORD parsedPrio = static_cast<DWORD>(atoi(v.c_str()));
+                                rule.processPriorityClass = (parsedPrio != 0) ? parsedPrio : NORMAL_PRIORITY_CLASS;
                             }
                         }
                     }
+
+                ati::ThreadIsolator::NormalizeSpecialRule(rule);
 
                 if (rule.isBypassed) {
                     rule.detectedThreadName = "Bypassed";
                 }
 
-                config.rules.push_back(rule);
+                bool dupRule = false;
+                for (const auto& existing : config.rules) {
+                    if (_stricmp(existing.processName.c_str(), rule.processName.c_str()) == 0) {
+                        dupRule = true;
+                        break;
+                    }
+                }
+                if (!dupRule) {
+                    config.rules.push_back(rule);
+                }
             }
             p += strlen(p) + 1;
         }
@@ -724,14 +764,6 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
             if (!val.empty()) val += ", ";
             val += "Decline:1";
         }
-        if (rule.ignoreSig) {
-            if (!val.empty()) val += ", ";
-            if (rule.ignoreSigCount > 1) {
-                val += "IgnoreSig:" + std::to_string(rule.ignoreSigCount);
-            } else {
-                val += "IgnoreSig";
-            }
-        }
         if (!val.empty()) val += ", ";
         if (rule.audioCores.size() > 1) {
             std::string coreListStr;
@@ -764,8 +796,8 @@ static void SaveConfig(const ati::GlobalConfig& config, const std::string& iniPa
         if (rule.targetPriority != 0) {
             val += ", TargetPriority:" + std::to_string(rule.targetPriority);
         }
-        // 正常隔離中かつ稼働中のプロセスのみ、次回照合用として AudioPid / AudioTid を記録 (未起動やBypass時は消去)
-        if (rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && (!rule.activeAudioTids.empty() || rule.activeAudioTid != 0)) {
+        // 検証用: INI 保存時の AudioPid / AudioTid 出力を抑止
+        if (false && rule.isAudioIsolated && rule.isRunning && !rule.isBypassed && rule.activePid != 0 && (!rule.activeAudioTids.empty() || rule.activeAudioTid != 0)) {
             val += ", AudioPid:" + std::to_string(rule.activePid);
             val += ", AudioTid:";
             if (!rule.activeAudioTids.empty()) {
@@ -802,6 +834,16 @@ static std::string StripExeExtension(const std::string& name) {
     return name;
 }
 
+static std::string FormatProcessSlotDisplayName(const ati::ProcessRule& r, size_t slotIdx) {
+    std::string baseName = StripExeExtension(r.processName);
+    if (ati::ThreadIsolator::IsVoicemeeterProcess(r.processName)) {
+        if (slotIdx == 0) return "VBAN - " + baseName;
+        if (slotIdx == 1) return "Hardware OUT -";
+        if (slotIdx == 2) return "VAIO/AUX & DSP -";
+    }
+    return baseName;
+}
+
 static std::string GetCoreLabel(int coreIdx, const std::vector<ati::CoreInfo>& cores) {
     for (const auto& c : cores) {
         if (c.logicalIndex == coreIdx) return c.label;
@@ -824,13 +866,13 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
 
     for (size_t i = 0; i < rules.size(); ++i) {
         const auto& r = rules[i];
-        size_t rowCount = (r.ignoreSig && r.ignoreSigCount > 1) ? static_cast<size_t>(r.ignoreSigCount) : 1;
+        size_t rowCount = ati::ThreadIsolator::GetRuleSlotCount(r);
 
         for (size_t s = 0; s < rowCount; ++s) {
             DWORD tid = 0;
             if (s < r.activeAudioTids.size()) {
                 tid = r.activeAudioTids[s];
-            } else if (s == 0) {
+            } else if (s == 0 && !ati::ThreadIsolator::IsMultiSlotRule(r)) {
                 tid = r.activeAudioTid;
             }
 
@@ -848,13 +890,13 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
             lvi.pszText = const_cast<LPSTR>("");
             ListView_InsertItem(hList, &lvi);
 
-            // 1: Process Name (.exe を除いて表示)
-            std::string displayName = StripExeExtension(r.processName);
+            // 1: Process Name (.exe を除いて表示 / マルチスロット役割表記)
+            std::string displayName = FormatProcessSlotDisplayName(r, s);
             ListView_SetItemText(hList, itemIdx, 1, const_cast<LPSTR>(displayName.c_str()));
 
             // 2: Thread Priority
             int rowPrio = (s < r.audioPriorities.size()) ? r.audioPriorities[s] : r.audioPriority;
-            std::string prioStr = GetPriorityString(rowPrio);
+            std::string prioStr = FormatThreadPriorityDisplay(r.processPriorityClass, rowPrio);
             ListView_SetItemText(hList, itemIdx, 2, const_cast<LPSTR>(prioStr.c_str()));
 
             // 3: Process Priority
@@ -870,9 +912,8 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
                 thName = "Bypassed";
             } else if (!r.isRunning) {
                 thName = "Not running";
-            } else if (r.ignoreSig && r.ignoreSigCount > 1) {
-                size_t confirmedCount = r.activeAudioTids.size();
-                if (s < confirmedCount && tid != 0) {
+            } else if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
+                if (s < r.activeAudioTids.size() && tid != 0) {
                     thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(tid);
                 } else if (r.multiSearchSleeping) {
                     thName = "sleeping...";
@@ -883,11 +924,7 @@ static void RefreshListView(HWND hList, const std::vector<ati::ProcessRule>& rul
                     int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
                     if (sec < 1) sec = 1;
                     if (sec > 10) sec = 10;
-                    if (s == confirmedCount) {
-                        thName = "Standby " + std::to_string(sec);
-                    } else {
-                        thName = "Standby 10";
-                    }
+                    thName = "Standby " + std::to_string(sec);
                 }
             } else if (r.isAudioIsolated && tid != 0) {
                 thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(tid);
@@ -953,7 +990,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
     int count = ListView_GetItemCount(hList);
     size_t expectedRows = 0;
     for (const auto& r : rules) {
-        expectedRows += (r.ignoreSig && r.ignoreSigCount > 1) ? static_cast<size_t>(r.ignoreSigCount) : 1;
+        expectedRows += ati::ThreadIsolator::GetRuleSlotCount(r);
     }
     if (count != static_cast<int>(expectedRows) || g_displayRows.size() != expectedRows) {
         RefreshListView(hList, rules);
@@ -970,7 +1007,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
         // 最新の TID を更新
         if (dr.subIndex < r.activeAudioTids.size()) {
             dr.tid = r.activeAudioTids[dr.subIndex];
-        } else if (dr.subIndex == 0) {
+        } else if (dr.subIndex == 0 && !ati::ThreadIsolator::IsMultiSlotRule(r)) {
             dr.tid = r.activeAudioTid;
         } else {
             dr.tid = 0;
@@ -981,12 +1018,12 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
         // 0: Indicator (カスタムドロー描画、テキストは空)
         SetSubItemTextIfChanged(hList, item, 0, "");
 
-        // 1: Process Name (.exe を除いて表示)
-        SetSubItemTextIfChanged(hList, item, 1, StripExeExtension(r.processName));
+        // 1: Process Name (.exe を除いて表示 / マルチスロット役割表記)
+        SetSubItemTextIfChanged(hList, item, 1, FormatProcessSlotDisplayName(r, dr.subIndex));
 
         // 2: Thread Priority
         int rowPrio = (dr.subIndex < r.audioPriorities.size()) ? r.audioPriorities[dr.subIndex] : r.audioPriority;
-        std::string prioStr = GetPriorityString(rowPrio);
+        std::string prioStr = FormatThreadPriorityDisplay(r.processPriorityClass, rowPrio);
         SetSubItemTextIfChanged(hList, item, 2, prioStr);
 
         // 3: Process Priority
@@ -1002,9 +1039,8 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
             thName = "Bypassed";
         } else if (!r.isRunning) {
             thName = "Not running";
-        } else if (r.ignoreSig && r.ignoreSigCount > 1) {
-            size_t confirmedCount = r.activeAudioTids.size();
-            if (dr.subIndex < confirmedCount && dr.tid != 0) {
+        } else if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
+            if (dr.subIndex < r.activeAudioTids.size() && dr.tid != 0) {
                 thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(dr.tid);
             } else if (r.multiSearchSleeping) {
                 thName = "sleeping...";
@@ -1015,11 +1051,7 @@ static void UpdateListViewDynamic(HWND hList, const std::vector<ati::ProcessRule
                 int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
                 if (sec < 1) sec = 1;
                 if (sec > 10) sec = 10;
-                if (dr.subIndex == confirmedCount) {
-                    thName = "Standby " + std::to_string(sec);
-                } else {
-                    thName = "Standby 10";
-                }
+                thName = "Standby " + std::to_string(sec);
             }
         } else if (r.isAudioIsolated && dr.tid != 0) {
             thName = "PID " + std::to_string(r.activePid) + " / TID " + std::to_string(dr.tid);
@@ -2244,6 +2276,17 @@ static INT_PTR CALLBACK SortConfirmDlgProc(HWND hDlg, UINT msg, WPARAM wParam, L
     return FALSE;
 }
 
+// RoonBridge -> RAATServer.exe フォールバック案内ダイアログ (メインウィンドウ直上センタリング・OKのみ)
+static void ShowRoonBridgeFallbackDialog(HWND hDlg) {
+    DialogBoxParamA(
+        g_hInstance,
+        MAKEINTRESOURCEA(IDD_ROONBRIDGE_FALLBACK),
+        hDlg,
+        SortConfirmDlgProc,
+        reinterpret_cast<LPARAM>(hDlg)
+    );
+}
+
 // プロセス名昇順ソート確認＆実行ヘルパー (Process Name カラム見出しクリック時専用)
 static void SortProcessesByName(HWND hDlg) {
     static bool s_inSortPrompt = false;
@@ -2423,8 +2466,7 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam, LPARA
                             auto& targetRule = config.rules[ruleIdx];
                             targetRule.processPriorityClass = entry->processPriorityClass;
 
-                            size_t requiredSlots = (targetRule.ignoreSig && targetRule.ignoreSigCount > 1)
-                                ? static_cast<size_t>(targetRule.ignoreSigCount) : 1;
+                            size_t requiredSlots = ati::ThreadIsolator::GetRuleSlotCount(targetRule);
                             if (targetRule.audioPriorities.size() < requiredSlots) {
                                 targetRule.audioPriorities.resize(requiredSlots, targetRule.audioPriority);
                             }
@@ -2963,7 +3005,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
     case WM_INITDIALOG: {
         LogDebug("WM_INITDIALOG: start");
         g_hMainDlg = hDlg;
-        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.5");
+        SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.6");
 
         HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
         if (!hList) LogDebug("WM_INITDIALOG: hList is NULL!");
@@ -3403,28 +3445,36 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
             if (ati::ShowProcessPickerDialog(hDlg, g_hInstance, selected, exclusions)) {
                 g_isolator.UpdateUnlistedExclusions(exclusions);
                 auto config = g_isolator.GetConfig();
+                bool didFallbackRoonBridge = false;
                 for (const auto& sp : selected) {
+                    if (ati::ThreadIsolator::IsRoonBridgeProcess(sp.exeFileName)) {
+                        didFallbackRoonBridge = true;
+                    }
+                    ati::ProcessRule newRule;
+                    newRule.processName = sp.exeFileName;
+                    newRule.audioCore = config.defaultAudioCore;
+                    newRule.audioAffinityMask = config.defaultAudioAffinityMask;
+                    newRule.audioPriority = config.defaultAudioPriority;
+                    newRule.currentThreadCount = 0;
+                    newRule.targetPriority = 0;
+                    newRule.processPriorityClass = (sp.currentPriorityClass != 0)
+                        ? sp.currentPriorityClass
+                        : NORMAL_PRIORITY_CLASS;
+                    newRule.applyCount = 0;
+                    newRule.detectedThreadName = "";
+                    newRule.activePid = 0;
+                    newRule.isRunning = false;
+                    ati::ThreadIsolator::NormalizeSpecialRule(newRule);
+
                     bool exists = false;
-                    for (const auto& r : config.rules) {
-                        if (_stricmp(r.processName.c_str(), sp.exeFileName.c_str()) == 0) {
+                    auto latestRules = g_isolator.GetRulesSnapshot();
+                    for (const auto& r : latestRules) {
+                        if (_stricmp(r.processName.c_str(), newRule.processName.c_str()) == 0) {
                             exists = true;
                             break;
                         }
                     }
                     if (!exists) {
-                        ati::ProcessRule newRule;
-                        newRule.processName = sp.exeFileName;
-                        newRule.audioCore = config.defaultAudioCore;
-                        newRule.audioAffinityMask = config.defaultAudioAffinityMask;
-                        newRule.audioPriority = config.defaultAudioPriority;
-                        newRule.currentThreadCount = 0;
-                        newRule.targetPriority = 0;
-                        newRule.processPriorityClass = 0;
-                        newRule.applyCount = 0;
-                        newRule.detectedThreadName = "";
-                        newRule.activePid = 0;
-                        newRule.isRunning = false;
-
                         g_isolator.AddRule(newRule);
                     }
                 }
@@ -3433,6 +3483,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                 HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
                 RefreshListView(hList, updated.rules);
                 AdjustWindowSizeToContent(hDlg, GetDpiScaleForWindow(hDlg));
+                if (didFallbackRoonBridge) {
+                    ShowRoonBridgeFallbackDialog(hDlg);
+                }
             }
             return TRUE;
         }
@@ -3521,8 +3574,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                             // sleeping... 状態のナッジ点滅 ● クリック時: bypass 解除時と同様に探索を即時リスタート
                             const auto& dr = g_displayRows[rowIdx];
                             if (targetRule.isRunning && !targetRule.isBypassed) {
-                                if (targetRule.ignoreSig && targetRule.ignoreSigCount > 1) {
-                                    bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size());
+                                if (ati::ThreadIsolator::IsMultiSlotRule(targetRule)) {
+                                    bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size() && targetRule.activeAudioTids[dr.subIndex] != 0);
                                     if (!isSlotConfirmed && targetRule.multiSearchSleeping) {
                                         g_isolator.ResumeMultiSearch(ruleIdx);
                                         g_isolator.ScanAndIsolate();
@@ -3572,7 +3625,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         auto rules = g_isolator.GetRulesSnapshot();
                         if (dr.ruleIndex < rules.size()) {
                             const auto& targetRule = rules[dr.ruleIndex];
-                            if (targetRule.isRunning && dr.tid != 0) {
+                            bool isAudioDg = ati::ThreadIsolator::IsAudioDgProcess(targetRule.processName);
+                            if (targetRule.isRunning && (dr.tid != 0 || (isAudioDg && targetRule.isAudioIsolated))) {
                                 g_isolator.ToggleSuspendAudioThread(dr.ruleIndex, dr.tid);
                                 auto updatedRules = g_isolator.GetRulesSnapshot();
                                 UpdateListViewDynamic(hList, updatedRules);
@@ -3595,9 +3649,9 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                         if (ruleIdx < rules.size()) {
                             const auto& targetRule = rules[ruleIdx];
                             bool isHandled = false;
-                            if (targetRule.ignoreSig && targetRule.ignoreSigCount > 1) {
+                            if (ati::ThreadIsolator::IsMultiSlotRule(targetRule)) {
                                 const auto& dr = g_displayRows[rowIdx];
-                                bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size());
+                                bool isSlotConfirmed = (dr.subIndex < targetRule.activeAudioTids.size() && targetRule.activeAudioTids[dr.subIndex] != 0);
                                 if (!isSlotConfirmed && targetRule.multiSearchSleeping) {
                                     g_isolator.ResumeMultiSearch(ruleIdx);
                                     g_isolator.ScanAndIsolate();
@@ -3685,8 +3739,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                     int dotY = rcSub.top + (cellH - dotSize) / 2;
 
                                     COLORREF col;
-                                    if (r.ignoreSig && r.ignoreSigCount > 1) {
-                                        bool isSlotConfirmed = (dr.subIndex < r.activeAudioTids.size());
+                                    if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
+                                        bool isSlotConfirmed = (dr.subIndex < r.activeAudioTids.size() && r.activeAudioTids[dr.subIndex] != 0);
                                         if (isSlotConfirmed) {
                                             if (r.hasIntruderThreads) {
                                                 col = s_pulseTick ? RGB(124, 224, 173) : RGB(216, 178, 76);
@@ -3754,7 +3808,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                 FillRect(hdc, &rcSub, hBkBrush);
                                 if (!(state & LVIS_SELECTED)) DeleteObject(hBkBrush);
 
-                                std::string procName = StripExeExtension(r.processName);
+                                std::string procName = FormatProcessSlotDisplayName(r, dr.subIndex);
                                 HFONT hFont = GetEffectiveFont(hList);
                                 HGDIOBJ oldFont = SelectObject(hdc, hFont);
                                 SetBkMode(hdc, TRANSPARENT);
@@ -3874,7 +3928,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam, LPARAM l
                                 int cbY = rcSub.top + (cellH - cbSize) / 2;
                                 RECT rcCb = { cbX, cbY, cbX + cbSize, cbY + cbSize };
                                 UINT uState = DFCS_BUTTONCHECK;
-                                if (!r.isRunning || dr.tid == 0) {
+                                bool isAudioDg = ati::ThreadIsolator::IsAudioDgProcess(r.processName);
+                                if (!r.isRunning || (dr.tid == 0 && !(isAudioDg && r.isAudioIsolated))) {
                                     uState |= DFCS_INACTIVE;
                                 } else if (isSusp) {
                                     uState |= DFCS_CHECKED;
@@ -4040,7 +4095,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
         LogDebug("WinMain: Another instance detected. Terminating previous instance to launch anew.");
 
         // 1. 既存ウィンドウの探索
-        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.5");
+        HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.6");
+        if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.5");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
         if (!hExisting) hExisting = FindWindowA(nullptr, "Audio Thread Isolator");

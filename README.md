@@ -114,6 +114,13 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 - **Catering to Diverse Listening Preferences**:
   - While ATI's core philosophy centers on "the lowest priority that guarantees dropout-free playback achieves the highest audio quality," the 2D Priority Matrix Picker also enables instant elevation up to `Realtime (31)`. This allows users to audition and compare subtle sound quality characteristics across the entire priority spectrum in real time.
 
+### 4. Tips (Application-Specific Configuration)
+- **Roon**:
+  - Roon consists of multiple distinct processes (`Roon.exe`, `RoonAppliance.exe`, `RoonServer.exe`, and `RAATServer.exe`).
+  - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
+  - **Renderer PC (Endpoint / Roon Bridge)**: Register `RAATServer.exe` in the ATI instance running on the endpoint machine (registering `RoonBridge.exe` will automatically fall back to `RAATServer.exe`).
+  - (*Note: `Roon.exe` handles GUI and `RoonServer.exe` manages system services; neither performs real-time audio streaming.)
+
 ---
 
 ## Download

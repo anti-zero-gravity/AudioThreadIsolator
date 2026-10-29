@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v1.0.5 - Specification & User Manual (spec.md)
+# Audio Thread Isolator (ATI) v1.0.6 - Specification & User Manual (spec.md)
 
 ## 1. Application Overview
 
@@ -29,26 +29,30 @@
 | Col | Header | Summary & Role | Operation Details |
 |:---:|:---|:---|:---|
 | 0 | **`!`** | Toggles monitoring and temporary bypass. Checking this suspends ATI intervention. | Click to toggle |
-| 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multiple threads are detected via `IgnoreSig:t`, child rows display an L-shaped tree line (`└`) to indicate parent-child hierarchy. | Double-click to open edit dialog.<br>Click header to sort ascending ("SORT?" prompt). |
-| 2 | **`Thread Priority`** | Relative thread priority applied to audio thread.<br>When multi-thread expansion is active, each row can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
-| 3 | **`Process Priority`** | Priority class applied to the process (PID) hosting the audio thread. | Click cell to select via 2D Priority Matrix Picker |
-| 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the genuine playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
+| 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multi-row expansion is active for Voicemeeter (`AppType: 5`), displays each thread's role label and draws an L-shaped tree line (`└`) on child rows. For Roon (`AppType: 4`), displays the original process name (`RoonAppliance` / `RAATServer`) as a single row. | Double-click to open edit dialog.<br>Click header to sort ascending ("SORT?" prompt). |
+| 2 | **`Thread Priority`** | Thread priority level and effective Base Priority (e.g., `Below 9`, `Time Critical 15`, or `Below FG 8 - BG 6` when Process Priority is `Normal` with Foreground/Background variation).<br>When multi-thread expansion is active, each row can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
+| 3 | **`Process Priority`** | Priority class applied to the process (PID) hosting the audio thread (e.g., `Normal`, `Above Normal`, `High`). Automatically reads and displays the live process priority upon registration. | Click cell to select via 2D Priority Matrix Picker |
+| 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the genuine playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>For `audiodg.exe`, suspends and resumes the entire process (all threads) at once.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
 | 5 | **`Audio Core PID/TID`** | Displays detection state, isolated PID, and TID. | Click operation: Restarts search when sleeping; toggles Bypass when running. |
 | 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard confirmed apps, total process thread count during search or for Chromium / `audiodg.exe`, and `0` when sleeping. | Double-click to open edit dialog. |
 | 7 | **`Chgs`** | Count of times audio thread was detected and priorities were applied. | Double-click to open edit dialog. |
 | 8 | **`Audio`** | Dedicated audio CPU core number (e.g., `#1`). When multi-thread expansion is active, shows the core assigned to each thread. | Double-click to open edit dialog. |
 | 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>In multi-thread expansion, since sibling threads share the same parent process and eviction mask, rows 2 and beyond display `same`. | Double-click to open edit dialog. |
 
-- **`IgnoreSig:t` Multi-Audio Thread Expansion**:
-  - By configuring thread count `t` (natural number) such as `IgnoreSig:2` in `ATI.ini`, ATI identifies and isolates the top `t` highest-activity audio threads—including in apps without standard audio signatures (such as Voicemeeter)—and expands them into `t` rows.
-  - **10-Second Scan Countdown & Simultaneous `sleeping...` Transition**:
-    - Continuously scans for pending unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on the active scanning slot (while subsequent slots wait at `Standby 10`).
-    - If no subsequent thread is detected within 10 seconds, all unconfirmed slots transition simultaneously to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-locked threads.
+- **Dedicated Multi-Row Expansion (Voicemeeter)**:
+  - All Voicemeeter editions (`AppType: 5`, 3 rows) automatically expand into role-specific rows and isolate each audio/network thread independently.
+  - **10-Second Scan Countdown & `sleeping...` Transition**:
+    - Continuously scans for unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on pending rows.
+    - Slots remaining undetected after 10 seconds (for example, when VBAN is disabled in Voicemeeter) transition to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-confirmed threads.
   - Editing and saving settings via `[Edit]` or double-clicking any sibling row updates all expanded rows of the process simultaneously.
+- **Roon Dedicated Continuous Standby (`AppType: 4`)**:
+  - `RoonAppliance.exe` and `RAATServer.exe` operate as single-slot (1 row) rules.
+  - During silence or pause, they never transition to `sleeping...`; like Chromium (`AppType: 2`), they continuously remain in `Searching...` to immediately isolate newly active threads upon playback resumption.
 
 - **Rank Selection via 2D Priority Matrix Picker**:
   - Clicking the `Thread Priority` (Col 2) or `Process Priority` (Col 3) cell pops up a 7x7 3D visual matrix.
   - Hovering over pillars displays rank details (Base Priority, Rank #, Process Class, Thread Priority), and clicking a pillar (Rank 1 to 49) immediately applies both Process Class and Thread Priority to the active process/threads and saves them to `ATI.ini`.
+  - When hovering or selecting `Normal` priority class, both the Foreground and Background rows illuminate simultaneously to reflect Windows' dynamic foreground/background priority switching, displaying both FG/BG effective priorities and an explanatory note in the right-hand HUD panel.
 
 #### Status Displays (Col 5) and Indicators
 
@@ -56,6 +60,7 @@
 |:---|:---|:---|:---|
 | `Not running` | None (Unchecked `☐` / `☑`) | Application is not running (standby). | Check to pre-configure Bypass before launch |
 | `Searching...` | ● Coral Pink | Searching for audio thread. | Toggles Bypass |
+| `Need Admin` | ● Coral Pink | Process requires administrator privileges (e.g. `audiodg.exe`), but ATI is running without elevation. Relaunch ATI as Administrator. | Toggles Bypass |
 | `Standby` / `Standby 10..1` | ● Coral Pink | Continuous monitoring standby. Awaiting audio output. | Transitions to Bypass (displays ☑ in ! col) |
 | `sleeping...` | ● Flashing Muted Purple / Red | Sleeping due to silence / inactivity. | Immediately restarts search |
 | `PID <pid> / TID <tid>` | ● Cyan / Teal | Audio thread identified and isolated onto audio core (displayed as `PID <pid> / -` for `audiodg.exe`). | Transitions to Bypass (displays ☑ in ! col) |
@@ -127,10 +132,16 @@ Opened by double-clicking a process row or clicking `[Edit]` on the main window.
   Automatically identifies the internal dedicated audio service process across multi-process browser trees, tracking and isolating active audio output threads in real time.
 - **Standard Audio, Media & Voice Apps (foobar2000, mpv, Firefox, Discord, etc.)**:
   Identifies playback and voice streaming threads from CPU activity and audio processing characteristics, automatically transitioning to sleep (`sleeping...`) during silent standby.
-- **Custom Architecture Apps (Voicemeeter, etc.)**:
-  Identifies playback threads from continuous thread activity and periodic audio wait states in applications lacking conventional signatures.
+- **Voicemeeter Series (`AppType: 5`)**:
+  Automatically recognizes all Voicemeeter editions—Standard (`voicemeeter` / `voicemeeter_x64`), Banana (`voicemeeterpro` / `voicemeeterpro_x64`), and Potato (`voicemeeter8` / `voicemeeter8_x64`)—and expands into **3 rows** upon registration:
+  - Row 1 (Parent): `VBAN - <ProcessName>` (network audio streaming thread)
+  - Row 2 (`└`): `Hardware OUT -` (physical audio device output thread)
+  - Row 3 (`└`): `VAIO/AUX & DSP -` (virtual inputs, internal mixing, and DSP engine thread)
 - **Windows Audio Engine (`audiodg.exe`)**:
   In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
+- **Roon Dedicated Control (`AppType: 4` — `RoonAppliance.exe` / `RAATServer.exe` / `RoonBridge.exe`)**:
+  - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
+  - **Renderer PC (Endpoint / Roon Bridge)**: Register `RAATServer.exe` in the ATI instance running on the endpoint machine (registering `RoonBridge.exe` will automatically fall back to `RAATServer.exe`).
 
 ---
 
@@ -161,8 +172,7 @@ Saved per registered process under the executable name as key, with comma-separa
 | **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
-| **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW). | `0`, `1`, `2`, `3` |
-| **`IgnoreSig`** | Signature-independent mode. Specify `:t` to isolate top `t` audio threads (default: 1). | `IgnoreSig`, `IgnoreSig:t` (`t` is thread count) |
+| **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW, `4`: Roon dedicated, `5`: Voicemeeter dedicated). | `0`, `1`, `2`, `3`, `4`, `5` |
 | **`AudioPid` / `AudioTid`** | Cached PID/TID from previous session for fast recovery. | Numeric |
 
 ---

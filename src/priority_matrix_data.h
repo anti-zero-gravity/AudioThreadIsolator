@@ -74,6 +74,33 @@ inline const PriorityMatrixEntry* GetMatrixEntryByRank(int rank) {
     return nullptr;
 }
 
+inline const PriorityMatrixEntry* GetMatrixEntryByRowCol(int row, int col) {
+    for (int i = 0; i < 49; ++i) {
+        if (kPriorityMatrixEntries[i].row == row && kPriorityMatrixEntries[i].col == col) {
+            return &kPriorityMatrixEntries[i];
+        }
+    }
+    return nullptr;
+}
+
+inline bool GetNormalPairBasePriorities(int threadPrio, int& outFgBase, int& outBgBase) {
+    const PriorityMatrixEntry* fg = nullptr;
+    const PriorityMatrixEntry* bg = nullptr;
+    for (int i = 0; i < 49; ++i) {
+        if (kPriorityMatrixEntries[i].threadPriority == threadPrio &&
+            kPriorityMatrixEntries[i].processPriorityClass == NORMAL_PRIORITY_CLASS) {
+            if (kPriorityMatrixEntries[i].row == 3) fg = &kPriorityMatrixEntries[i];
+            else if (kPriorityMatrixEntries[i].row == 2) bg = &kPriorityMatrixEntries[i];
+        }
+    }
+    if (fg && bg) {
+        outFgBase = fg->basePriority;
+        outBgBase = bg->basePriority;
+        return true;
+    }
+    return false;
+}
+
 inline int FindRankByPrio(DWORD procClass, int threadPrio) {
     for (int i = 0; i < 49; ++i) {
         if (kPriorityMatrixEntries[i].processPriorityClass == procClass &&
