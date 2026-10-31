@@ -51,6 +51,7 @@ struct ProcessRule {
   // DAW型高負荷, 4: Roon専用, 5: Voicemeeter専用)
   int appType = 0;
   std::vector<DWORD> activeAudioTids; // 検出・確定されたオーディオスレッドID群 (スロット順)
+  std::vector<DWORD_PTR> audioSlotMasks; // 各スロット用の個別隔離先コアマスク (空の場合は audioCores / audioCore を使用)
   std::vector<int> audioCores; // 各スレッド用の個別隔離先コア番号 (空の場合は audioCore を使用)
   std::vector<int> audioPriorities; // 各スレッド用の個別適用優先度 (空の場合は audioPriority を使用)
   std::unordered_set<DWORD> suspendedAudioTids; // 個別スレッド一時停止管理セット

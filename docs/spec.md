@@ -137,6 +137,8 @@ Opened by double-clicking a process row or clicking `[Edit]` on the main window.
   - Row 1 (Parent): `VBAN - <ProcessName>` (network audio streaming thread)
   - Row 2 (`└`): `Hardware OUT -` (physical audio device output thread)
   - Row 3 (`└`): `VAIO/AUX & DSP -` (virtual inputs, internal mixing, and DSP engine thread)
+  - The isolation core is assigned per row. `AudioCore` in `ATI.ini` always stores three values in row order "Row 1, Row 2, Row 3" (duplicates allowed, e.g., `AudioCore:11, 3, 0xC00`). In addition to single core numbers, a hexadecimal affinity mask (e.g., `0xC00`) can be specified to assign multiple cores to a slot (useful for compute-intensive workloads such as Slot 3 VAIO/AUX & DSP). On registration, all three are filled with the first core of `DefaultAudioCore`; if the INI holds fewer than three values, the missing ones are filled with the same core.
+  - The edit dialog edits the slot of the row that was double-clicked (or selected for Edit); multiple cores can be toggled or entered as a hexadecimal mask in the `Audio Core` row.
 - **Windows Audio Engine (`audiodg.exe`)**:
   In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
 - **Roon Dedicated Control (`AppType: 4` — `RoonAppliance.exe` / `RAATServer.exe` / `RoonBridge.exe`)**:
@@ -168,7 +170,7 @@ Saved per registered process under the executable name as key, with comma-separa
 
 | Parameter | Description | Valid Values |
 |:---|:---|:---|
-| **`AudioCore`** | Core assigned to audio thread. Comma-separated for multiple cores (e.g., `AudioCore:11, 10`). | `0` to (Max Cores - 1), comma-separated |
+| **`AudioCore`** | Core or hexadecimal mask assigned to audio thread. Comma-separated for multiple slots/cores (e.g., `AudioCore:11, 3, 0xC00`). | `0` to (Max Cores - 1), hex mask (`0x`...), comma-separated |
 | **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
