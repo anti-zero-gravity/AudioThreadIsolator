@@ -1033,8 +1033,6 @@ static std::string FormatProcessSlotDisplayName(const ati::ProcessRule &r,
       return "VBAN - " + baseName;
     if (slotIdx == 1)
       return "Hardware OUT -";
-    if (slotIdx == 2)
-      return "VAIO/AUX & DSP -";
   }
   return baseName;
 }

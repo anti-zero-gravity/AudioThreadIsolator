@@ -1823,11 +1823,10 @@ bool ThreadIsolator::TryIdentifyAudioThread(
       maxDelta = threadDeltas[candTid];
     }
   } else if (IsVoicemeeterProcess(rule.processName)) {
-    // === AppType: 5 (Voicemeeter 全エディション 3行モード):
+    // === AppType: 5 (Voicemeeter 全エディション 2行モード):
     // Slot 0 (親行): ws2_32.dll 保持スレッド 最大 Delta (VBAN - <procName>)
     // Slot 1 (子行1): audioses/wdmaud/ksuser/dsound/ASIO 保持スレッド 最大
-    // Delta (Hardware OUT -) Slot 2 (子行2): 非GUI・非BelowNormal かつ
-    // (TimeCritical || DelayExecution) の最大 Delta (VAIO/AUX & DSP -) ===
+    // Delta (Hardware OUT -) ===
     double effectiveRuleDelta =
         (rule.cyclesDelta > 0.0) ? rule.cyclesDelta : 1.0;
     ULONG64 deltaThreshold = CalculateDeltaThreshold(
@@ -1850,11 +1849,6 @@ bool ThreadIsolator::TryIdentifyAudioThread(
          curAliveSet.count(rule.activeAudioTids[1]) > 0)
             ? rule.activeAudioTids[1]
             : 0;
-    DWORD prevSlot2 =
-        (rule.activeAudioTids.size() >= 3 && rule.activeAudioTids[2] != 0 &&
-         curAliveSet.count(rule.activeAudioTids[2]) > 0)
-            ? rule.activeAudioTids[2]
-            : 0;
 
     for (const auto &ti : threadInfos) {
       ULONG64 curCycle = 0;
@@ -1872,7 +1866,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
           sampleState.delayExecTids.insert(ti.tid);
         }
 
-        if (rule.appType != -1 && d >= deltaThreshold && ti.tid != prevSlot2 &&
+        if (rule.appType != -1 && d >= deltaThreshold &&
             sampleState.vmWs2Tids.count(ti.tid) == 0 &&
             sampleState.vmHwAudioTids.count(ti.tid) == 0 &&
             sampleState.vmGuiTids.count(ti.tid) == 0) {
@@ -1895,8 +1889,6 @@ bool ThreadIsolator::TryIdentifyAudioThread(
         (prevSlot0 != 0 && rule.suspendedAudioTids.count(prevSlot0) > 0);
     bool slot1Paused =
         (prevSlot1 != 0 && rule.suspendedAudioTids.count(prevSlot1) > 0);
-    bool slot2Paused =
-        (prevSlot2 != 0 && rule.suspendedAudioTids.count(prevSlot2) > 0);
 
     // Slot 0: VBAN (ws2_32.dll) 最大 Delta
     DWORD nextSlot0 = prevSlot0;
@@ -1904,8 +1896,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     if (!slot0Paused) {
       DWORD bestSlot0 = 0;
       for (const auto &ti : threadInfos) {
-        if ((slot1Paused && ti.tid == prevSlot1) ||
-            (slot2Paused && ti.tid == prevSlot2))
+        if (slot1Paused && ti.tid == prevSlot1)
           continue;
         if (sampleState.vmWs2Tids.count(ti.tid) > 0) {
           ULONG64 d = threadDeltas[ti.tid];
@@ -1928,7 +1919,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     if (!slot1Paused) {
       DWORD bestSlot1 = 0;
       for (const auto &ti : threadInfos) {
-        if (ti.tid == nextSlot0 || (slot2Paused && ti.tid == prevSlot2))
+        if (ti.tid == nextSlot0)
           continue;
         if (sampleState.vmWs2Tids.count(ti.tid) == 0 &&
             sampleState.vmHwAudioTids.count(ti.tid) > 0) {
@@ -1946,47 +1937,9 @@ bool ThreadIsolator::TryIdentifyAudioThread(
       }
     }
 
-    // Slot 2: VAIO/AUX & DSP (非GUI・非BelowNormal かつ TimeCritical または
-    // DelayExecution) 最大 Delta
-    DWORD nextSlot2 =
-        (prevSlot2 != nextSlot0 && prevSlot2 != nextSlot1) ? prevSlot2 : 0;
-    ULONG64 maxSlot2Delta = 0;
-    if (!slot2Paused) {
-      DWORD bestSlot2 = 0;
-      for (const auto &ti : threadInfos) {
-        if (ti.tid == nextSlot0 || ti.tid == nextSlot1)
-          continue;
-        if (sampleState.vmGuiTids.count(ti.tid) > 0 ||
-            sampleState.vmWs2Tids.count(ti.tid) > 0 ||
-            sampleState.vmHwAudioTids.count(ti.tid) > 0)
-          continue;
-        if (ti.priority == THREAD_PRIORITY_BELOW_NORMAL)
-          continue;
-        bool isNativeTimeCritical =
-            (ti.priority == THREAD_PRIORITY_TIME_CRITICAL ||
-             ti.priority == 15 || ti.basePri >= 15);
-        auto wrIt = waitReasons.find(ti.tid);
-        bool isDelayExec = (wrIt != waitReasons.end() && wrIt->second == 4) ||
-                           (sampleState.delayExecTids.count(ti.tid) > 0);
-        if (!isNativeTimeCritical && !isDelayExec)
-          continue;
-        ULONG64 d = threadDeltas[ti.tid];
-        if (d >= deltaThreshold && d > maxSlot2Delta) {
-          maxSlot2Delta = d;
-          bestSlot2 = ti.tid;
-        }
-      }
-      if (bestSlot2 != 0 &&
-          (nextSlot2 == 0 || maxSlot2Delta >= deltaThreshold ||
-           threadDeltas[nextSlot2] == 0)) {
-        nextSlot2 = bestSlot2;
-      }
-    }
-
-    if (nextSlot0 != 0 || nextSlot1 != 0 || nextSlot2 != 0) {
-      rule.activeAudioTids = {nextSlot0, nextSlot1, nextSlot2};
-      candTid = (nextSlot0 != 0) ? nextSlot0
-                                 : ((nextSlot1 != 0) ? nextSlot1 : nextSlot2);
+    if (nextSlot0 != 0 || nextSlot1 != 0) {
+      rule.activeAudioTids = {nextSlot0, nextSlot1};
+      candTid = (nextSlot0 != 0) ? nextSlot0 : nextSlot1;
       maxDelta = threadDeltas[candTid];
     }
   } else {
@@ -4184,7 +4137,7 @@ void ThreadIsolator::NormalizeSpecialRule(ProcessRule &rule) {
 
 size_t ThreadIsolator::GetRuleSlotCount(const ProcessRule &rule) {
   if (IsVoicemeeterProcess(rule.processName)) {
-    return 3;
+    return 2;
   }
   return 1;
 }

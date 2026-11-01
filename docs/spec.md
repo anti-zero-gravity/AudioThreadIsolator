@@ -40,7 +40,7 @@
 | 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>In multi-thread expansion, since sibling threads share the same parent process and eviction mask, rows 2 and beyond display `same`. | Double-click to open edit dialog. |
 
 - **Dedicated Multi-Row Expansion (Voicemeeter)**:
-  - All Voicemeeter editions (`AppType: 5`, 3 rows) automatically expand into role-specific rows and isolate each audio/network thread independently.
+  - All Voicemeeter editions (`AppType: 5`, 2 rows) automatically expand into role-specific rows and isolate each audio/network thread independently.
   - **10-Second Scan Countdown & `sleeping...` Transition**:
     - Continuously scans for unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on pending rows.
     - Slots remaining undetected after 10 seconds (for example, when VBAN is disabled in Voicemeeter) transition to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-confirmed threads.
@@ -133,11 +133,10 @@ Opened by double-clicking a process row or clicking `[Edit]` on the main window.
 - **Standard Audio, Media & Voice Apps (foobar2000, mpv, Firefox, Discord, etc.)**:
   Identifies playback and voice streaming threads from CPU activity and audio processing characteristics, automatically transitioning to sleep (`sleeping...`) during silent standby.
 - **Voicemeeter Series (`AppType: 5`)**:
-  Automatically recognizes all Voicemeeter editions—Standard (`voicemeeter` / `voicemeeter_x64`), Banana (`voicemeeterpro` / `voicemeeterpro_x64`), and Potato (`voicemeeter8` / `voicemeeter8_x64`)—and expands into **3 rows** upon registration:
+  Automatically recognizes all Voicemeeter editions—Standard (`voicemeeter` / `voicemeeter_x64`), Banana (`voicemeeterpro` / `voicemeeterpro_x64`), and Potato (`voicemeeter8` / `voicemeeter8_x64`)—and expands into **2 rows** upon registration (`VAIO/AUX & DSP` threads are placed onto the normal thread eviction cores):
   - Row 1 (Parent): `VBAN - <ProcessName>` (network audio streaming thread)
   - Row 2 (`└`): `Hardware OUT -` (physical audio device output thread)
-  - Row 3 (`└`): `VAIO/AUX & DSP -` (virtual inputs, internal mixing, and DSP engine thread)
-  - The isolation core is assigned per row. `AudioCore` in `ATI.ini` always stores three values in row order "Row 1, Row 2, Row 3" (duplicates allowed, e.g., `AudioCore:11, 3, 0xC00`). In addition to single core numbers, a hexadecimal affinity mask (e.g., `0xC00`) can be specified to assign multiple cores to a slot (useful for compute-intensive workloads such as Slot 3 VAIO/AUX & DSP). On registration, all three are filled with the first core of `DefaultAudioCore`; if the INI holds fewer than three values, the missing ones are filled with the same core.
+  - The isolation core is assigned per row. `AudioCore` in `ATI.ini` always stores two values in row order "Row 1, Row 2" (duplicates allowed, e.g., `AudioCore:3, 2`). In addition to single core numbers, a hexadecimal affinity mask (e.g., `0xC00`) can be specified to assign multiple cores to a slot. On registration, both are filled with the first core of `DefaultAudioCore`; if the INI holds fewer than two values, the missing ones are filled with the same core.
   - The edit dialog edits the slot of the row that was double-clicked (or selected for Edit); multiple cores can be toggled or entered as a hexadecimal mask in the `Audio Core` row.
 - **Windows Audio Engine (`audiodg.exe`)**:
   In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
