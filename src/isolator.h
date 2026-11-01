@@ -54,6 +54,7 @@ struct ProcessRule {
   std::vector<DWORD_PTR> audioSlotMasks; // 各スロット用の個別隔離先コアマスク (空の場合は audioCores / audioCore を使用)
   std::vector<int> audioCores; // 各スレッド用の個別隔離先コア番号 (空の場合は audioCore を使用)
   std::vector<int> audioPriorities; // 各スレッド用の個別適用優先度 (空の場合は audioPriority を使用)
+  std::vector<bool> slotBypassed; // 各スロット用の個別バイパスフラグ (マルチスロット用)
   std::unordered_set<DWORD> suspendedAudioTids; // 個別スレッド一時停止管理セット
   int multiSearchTurns = 0;       // 複数スロット探索用カウントダウンターン数 (10秒 = 10 * turnsPerSec)
   size_t lastIdentifiedCount = 0; // 前回確認時の確定オーディオスレッド数
@@ -139,7 +140,7 @@ public:
   void RemoveRule(size_t index);
   void UpdateRule(size_t index, const ProcessRule &rule);
   void ToggleProcessHeuristics(size_t index);
-  void ToggleProcessBypass(size_t index);
+  void ToggleProcessBypass(size_t index, size_t slot = 0);
   void RestartSearch(size_t index);
   void ResumeMultiSearch(size_t index);
   bool ToggleSuspendAudioThread(size_t index, DWORD tid = 0);
@@ -264,13 +265,9 @@ private:
     std::unordered_set<DWORD>
         audioCandidateTids; // オーディオ関連と判定された候補 TID
     std::unordered_set<DWORD>
-        socketCandidateTids; // Roon ソケット送信候補 TID (mswsock.dll / ws2_32.dll)
+        socketCandidateTids; // ソケット送受信候補 TID (mswsock.dll / ws2_32.dll)
     std::unordered_set<DWORD>
         delayExecTids; // WaitReason == 4 (DelayExecution) 観測済み TID
-    std::unordered_set<DWORD>
-        vmWs2Tids; // Voicemeeter VBAN 候補 TID (ws2_32.dll)
-    std::unordered_set<DWORD>
-        vmHwAudioTids; // Voicemeeter Hardware OUT 候補 TID (audioses/wdmaud/ksuser/ASIO)
     std::unordered_set<DWORD>
         vmGuiTids; // Voicemeeter GUI スレッド TID (user32/gdi32/gdiplus/win32u)
     std::unordered_set<DWORD> inspectedTids; // スタック検査済み TID (生涯1回)

@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v1.0.6 - Specification & User Manual (spec.md)
+# Audio Thread Isolator (ATI) v1.0.7 - Specification & User Manual (spec.md)
 
 ## 1. Application Overview
 
@@ -37,10 +37,10 @@
 | 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard confirmed apps, total process thread count during search or for Chromium / `audiodg.exe`, and `0` when sleeping. | Double-click to open edit dialog. |
 | 7 | **`Chgs`** | Count of times audio thread was detected and priorities were applied. | Double-click to open edit dialog. |
 | 8 | **`Audio`** | Dedicated audio CPU core number (e.g., `#1`). When multi-thread expansion is active, shows the core assigned to each thread. | Double-click to open edit dialog. |
-| 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`).<br>In multi-thread expansion, since sibling threads share the same parent process and eviction mask, rows 2 and beyond display `same`. | Double-click to open edit dialog. |
+| 9 | **`Excluded`** | List of CPU cores excluded from normal thread placement (e.g., `!#1`). In multi-thread expansion, all slots directly display the held mask. | Double-click to open edit dialog. |
 
 - **Dedicated Multi-Row Expansion (Voicemeeter)**:
-  - All Voicemeeter editions (`AppType: 5`, 2 rows) automatically expand into role-specific rows and isolate each audio/network thread independently.
+  - All Voicemeeter editions (`AppType: 5`, 2 rows) automatically expand into role-specific rows and isolate each network/audio engine thread independently.
   - **10-Second Scan Countdown & `sleeping...` Transition**:
     - Continuously scans for unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on pending rows.
     - Slots remaining undetected after 10 seconds (for example, when VBAN is disabled in Voicemeeter) transition to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-confirmed threads.
@@ -130,13 +130,14 @@ Opened by double-clicking a process row or clicking `[Edit]` on the main window.
 
 - **Chromium Browsers (Chrome, Edge, Brave, Vivaldi, etc.)**:
   Automatically identifies the internal dedicated audio service process across multi-process browser trees, tracking and isolating active audio output threads in real time.
-- **Standard Audio, Media & Voice Apps (foobar2000, mpv, Firefox, Discord, etc.)**:
-  Identifies playback and voice streaming threads from CPU activity and audio processing characteristics, automatically transitioning to sleep (`sleeping...`) during silent standby.
+- **Standard Audio & Media Apps (foobar2000, mpv, Firefox, etc.)**:
+  Identifies playback streaming threads from CPU activity and audio processing characteristics, automatically transitioning to sleep (`sleeping...`) during silent standby.
 - **Voicemeeter Series (`AppType: 5`)**:
-  Automatically recognizes all Voicemeeter editions—Standard (`voicemeeter` / `voicemeeter_x64`), Banana (`voicemeeterpro` / `voicemeeterpro_x64`), and Potato (`voicemeeter8` / `voicemeeter8_x64`)—and expands into **2 rows** upon registration (`VAIO/AUX & DSP` threads are placed onto the normal thread eviction cores):
+  Automatically recognizes all Voicemeeter editions—Standard (`voicemeeter` / `voicemeeter_x64`), Banana (`voicemeeterpro` / `voicemeeterpro_x64`), and Potato (`voicemeeter8` / `voicemeeter8_x64`)—and expands into **2 rows** upon registration:
   - Row 1 (Parent): `VBAN - <ProcessName>` (network audio streaming thread)
-  - Row 2 (`└`): `Hardware OUT -` (physical audio device output thread)
-  - The isolation core is assigned per row. `AudioCore` in `ATI.ini` always stores two values in row order "Row 1, Row 2" (duplicates allowed, e.g., `AudioCore:3, 2`). In addition to single core numbers, a hexadecimal affinity mask (e.g., `0xC00`) can be specified to assign multiple cores to a slot. On registration, both are filled with the first core of `DefaultAudioCore`; if the INI holds fewer than two values, the missing ones are filled with the same core.
+  - Row 2 (`└`): `VAIO/AUX & DSP -` (main audio engine handling physical Hardware OUT, virtual I/O, mixing, and DSP processing)
+  - **2-Line Independent INI Format**: Saved and restored in `ATI.ini` as two lines (`<ProcessName>(1)=...`, `<ProcessName>(2)=...`), storing each slot's `AudioCore` (single core number or hex mask such as `0xC0C`), `AudioPriority`, and `Bypass:1` independently. If either of the two lines is missing on startup due to a manual editing mistake, the entry is ignored; if missing upon exit, both lines are cleared from `ATI.ini`.
+  - **Per-Slot Bypass (Mask Switch)**: Clicking the `!` column (Col 0) or `PID / TID` column (Col 5) on either of the two rows toggles Bypass ON / OFF for that individual slot. When Bypass is ON, the slot's thread keeps its priority unchanged while the normal eviction mask (`NormalCores`) is immediately applied; toggling Bypass OFF immediately reapplies the slot's dedicated audio core mask.
   - The edit dialog edits the slot of the row that was double-clicked (or selected for Edit); multiple cores can be toggled or entered as a hexadecimal mask in the `Audio Core` row.
 - **Windows Audio Engine (`audiodg.exe`)**:
   In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
@@ -154,9 +155,9 @@ Configuration is saved in `ATI.ini` in the same directory as the executable.
 
 | Key | Description | Valid Range | Default |
 |:---|:---|:---|:---|
-| **`DefaultAudioCore`** | Default audio core assigned to newly registered processes. | `0` to (Max Cores - 1) | `5` |
+| **`DefaultAudioCore`** | Default audio core assigned to newly registered processes. | `0` to (Max Cores - 1) | `1` (`0` for single-core) |
 | **`DefaultAudioPriority`** | Default thread priority assigned to newly registered processes. | `-15` (Idle) to `+15` (Time Critical) | `-15` |
-| **`NormalCores`** | Hexadecimal mask of cores allocated to normal threads. | Hex bitmask (e.g., `0x1D`) | `0x1D` |
+| **`NormalCores`** | Hexadecimal mask of cores allocated to normal threads. | Hex bitmask (e.g., `0x3F3`) | All cores excluding `DefaultAudioCore` |
 | **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
 | **`BoostPollingIntervalMs`** | Fast polling interval during thread search or state transitions. | `50`, `100`, `250` | `250` |
 | **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
@@ -174,7 +175,6 @@ Saved per registered process under the executable name as key, with comma-separa
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
 | **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW, `4`: Roon dedicated, `5`: Voicemeeter dedicated). | `0`, `1`, `2`, `3`, `4`, `5` |
-| **`AudioPid` / `AudioTid`** | Cached PID/TID from previous session for fast recovery. | Numeric |
 
 ---
 

@@ -581,6 +581,14 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
   DWORD chars =
       GetPrivateProfileSectionA("Processes", sectionBuf, 4096, iniPath.c_str());
   if (chars > 0) {
+    struct VmPendingSlots {
+      std::string canonicalName;
+      bool hasSlot[2] = {false, false};
+      ati::ProcessRule slotRules[2];
+    };
+    std::unordered_map<std::string, VmPendingSlots> vmPending;
+    std::vector<std::string> vmOrder;
+
     char *p = sectionBuf;
     while (*p) {
       std::string line(p);
@@ -596,8 +604,33 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
                isspace(static_cast<unsigned char>(procName.back())))
           procName.pop_back();
 
+        int vmSlotIdx = -1;
+        std::string baseProcName = procName;
+        if (procName.length() > 3 && procName.back() == ')') {
+          size_t openParen = procName.rfind('(');
+          if (openParen != std::string::npos &&
+              openParen + 2 == procName.length() - 1) {
+            char numCh = procName[openParen + 1];
+            if (numCh >= '1' && numCh <= '2') {
+              vmSlotIdx = numCh - '1';
+              baseProcName = procName.substr(0, openParen);
+              while (!baseProcName.empty() &&
+                     isspace(static_cast<unsigned char>(baseProcName.back())))
+                baseProcName.pop_back();
+            }
+          }
+        }
+
+        bool isVmProc =
+            ati::ThreadIsolator::IsVoicemeeterProcess(baseProcName);
+        if (isVmProc && (vmSlotIdx < 0 || vmSlotIdx >= 2)) {
+          // Voicemeeter で (1)/(2) 指定がない行は編集ミスとして無視
+          p += strlen(p) + 1;
+          continue;
+        }
+
         ati::ProcessRule rule;
-        rule.processName = procName;
+        rule.processName = isVmProc ? baseProcName : procName;
         rule.audioCore = config.defaultAudioCore;
         rule.audioAffinityMask = config.defaultAudioAffinityMask;
         rule.audioPriority = config.defaultAudioPriority;
@@ -790,24 +823,21 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
           }
         }
 
-        // マルチスロット: AudioCore の不足分は DefaultAudioCore の先頭コアで埋める
-        size_t slotCount = ati::ThreadIsolator::GetRuleSlotCount(rule);
-        if (slotCount > 1) {
-          if (rule.audioSlotMasks.size() < slotCount) {
-            size_t prevS = rule.audioSlotMasks.size();
-            rule.audioSlotMasks.resize(slotCount, 0);
-            for (size_t i = prevS; i < slotCount; ++i) {
-              if (i < rule.audioCores.size() && rule.audioCores[i] >= 0 && rule.audioCores[i] < 64) {
-                rule.audioSlotMasks[i] = (1ULL << rule.audioCores[i]);
-              } else {
-                rule.audioSlotMasks[i] = (1ULL << config.defaultAudioCore);
-              }
-            }
+        if (isVmProc) {
+          std::string lowerBase = baseProcName;
+          for (char &ch : lowerBase) {
+            ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
           }
-          if (rule.audioCores.size() < slotCount) {
-            rule.audioCores.resize(slotCount, config.defaultAudioCore);
+          if (vmPending.find(lowerBase) == vmPending.end()) {
+            vmPending[lowerBase].canonicalName = baseProcName;
+            vmOrder.push_back(lowerBase);
           }
+          vmPending[lowerBase].hasSlot[vmSlotIdx] = true;
+          vmPending[lowerBase].slotRules[vmSlotIdx] = rule;
+          p += strlen(p) + 1;
+          continue;
         }
+
         ati::ThreadIsolator::NormalizeSpecialRule(rule);
 
         if (rule.isBypassed) {
@@ -827,6 +857,63 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
         }
       }
       p += strlen(p) + 1;
+    }
+
+    // Voicemeeter 2行構成の検証と結合 ((1),(2) が両方揃っている場合のみ登録、欠けていたら無視)
+    for (const auto &lowerBase : vmOrder) {
+      const auto &vm = vmPending[lowerBase];
+      if (!vm.hasSlot[0] || !vm.hasSlot[1]) {
+        continue;
+      }
+      ati::ProcessRule merged = vm.slotRules[0];
+      merged.processName = vm.canonicalName;
+      merged.appType = 5;
+      merged.isBypassed = false;
+      merged.audioSlotMasks.resize(2, 0);
+      merged.audioCores.resize(2, config.defaultAudioCore);
+      merged.audioPriorities.resize(2, config.defaultAudioPriority);
+      merged.slotBypassed.resize(2, false);
+
+      for (int s = 0; s < 2; ++s) {
+        const auto &sr = vm.slotRules[s];
+        if (!sr.audioSlotMasks.empty() && sr.audioSlotMasks[0] != 0) {
+          merged.audioSlotMasks[s] = sr.audioSlotMasks[0];
+        } else if (sr.audioAffinityMask != 0) {
+          merged.audioSlotMasks[s] = sr.audioAffinityMask;
+        } else if (sr.audioCore >= 0 && sr.audioCore < 64) {
+          merged.audioSlotMasks[s] = (1ULL << sr.audioCore);
+        } else {
+          merged.audioSlotMasks[s] = (1ULL << config.defaultAudioCore);
+        }
+
+        if (!sr.audioCores.empty()) {
+          merged.audioCores[s] = sr.audioCores[0];
+        } else {
+          merged.audioCores[s] = sr.audioCore;
+        }
+
+        if (!sr.audioPriorities.empty()) {
+          merged.audioPriorities[s] = sr.audioPriorities[0];
+        } else {
+          merged.audioPriorities[s] = sr.audioPriority;
+        }
+
+        merged.slotBypassed[s] = sr.isBypassed;
+      }
+      merged.audioPriority = merged.audioPriorities[0];
+      ati::ThreadIsolator::NormalizeSpecialRule(merged);
+
+      bool dupRule = false;
+      for (const auto &existing : config.rules) {
+        if (_stricmp(existing.processName.c_str(),
+                     merged.processName.c_str()) == 0) {
+          dupRule = true;
+          break;
+        }
+      }
+      if (!dupRule) {
+        config.rules.push_back(merged);
+      }
     }
   }
 }
@@ -900,6 +987,71 @@ static void SaveConfig(const ati::GlobalConfig &config,
 
   std::vector<char> sectionBuf;
   for (const auto &rule : config.rules) {
+    if (ati::ThreadIsolator::IsVoicemeeterProcess(rule.processName)) {
+      if (rule.audioSlotMasks.size() < 2 || rule.audioCores.size() < 2 ||
+          rule.audioPriorities.size() < 2 || rule.slotBypassed.size() < 2) {
+        // 2スロット揃っていない場合は2行丸ごとINIからクリア（出力しない）
+        continue;
+      }
+      for (size_t s = 0; s < 2; ++s) {
+        std::string val = "AppType:5";
+        if (rule.cyclesDelta > 0.0) {
+          char dBuf[32];
+          if (std::floor(rule.cyclesDelta) == rule.cyclesDelta) {
+            snprintf(dBuf, sizeof(dBuf), "%.0f", rule.cyclesDelta);
+          } else {
+            snprintf(dBuf, sizeof(dBuf), "%.1f", rule.cyclesDelta);
+          }
+          val += ", Delta:" + std::string(dBuf);
+        }
+        if (rule.isDeclineBoost) {
+          val += ", Decline:1";
+        }
+        DWORD_PTR sm = rule.audioSlotMasks[s];
+        std::string coreStr;
+        if ((sm & (sm - 1)) == 0 && sm != 0) {
+          int c = 0;
+          for (int bit = 0; bit < 64; ++bit) {
+            if (sm == (1ULL << bit)) {
+              c = bit;
+              break;
+            }
+          }
+          coreStr = std::to_string(c);
+        } else if (sm != 0) {
+          char sHex[32];
+          snprintf(sHex, sizeof(sHex), "0x%llX",
+                   static_cast<unsigned long long>(sm));
+          coreStr = sHex;
+        } else {
+          coreStr = std::to_string(rule.audioCores[s]);
+        }
+        val += ", AudioCore:" + coreStr;
+        val += ", AudioPriority:" + std::to_string(rule.audioPriorities[s]);
+        if (rule.processPriorityClass != 0) {
+          val += ", ProcessPriority:" +
+                 GetProcessPriorityString(rule.processPriorityClass);
+        }
+        if (rule.normalAffinityMask != 0) {
+          char nHex[32] = {0};
+          snprintf(nHex, sizeof(nHex), "0x%llX",
+                   static_cast<unsigned long long>(rule.normalAffinityMask));
+          val += ", NormalCores:" + std::string(nHex);
+        }
+        if (rule.targetPriority != 0) {
+          val += ", TargetPriority:" + std::to_string(rule.targetPriority);
+        }
+        if (rule.slotBypassed[s]) {
+          val += ", Bypass:1";
+        }
+        std::string entry =
+            rule.processName + "(" + std::to_string(s + 1) + ")=" + val;
+        sectionBuf.insert(sectionBuf.end(), entry.begin(), entry.end());
+        sectionBuf.push_back('\0');
+      }
+      continue;
+    }
+
     DWORD_PTR rMask = rule.audioAffinityMask
                           ? rule.audioAffinityMask
                           : ati::ThreadIsolator::MakeCoreMask(rule.audioCore);
@@ -1032,7 +1184,7 @@ static std::string FormatProcessSlotDisplayName(const ati::ProcessRule &r,
     if (slotIdx == 0)
       return "VBAN - " + baseName;
     if (slotIdx == 1)
-      return "Hardware OUT -";
+      return "VAIO/AUX & DSP -";
   }
   return baseName;
 }
@@ -1110,7 +1262,11 @@ static void RefreshListView(HWND hList,
 
       // 5: Audio Core PID/TID
       std::string thName;
-      if (r.isBypassed) {
+      bool isSlotByp =
+          ati::ThreadIsolator::IsMultiSlotRule(r)
+              ? (s < r.slotBypassed.size() && r.slotBypassed[s])
+              : r.isBypassed;
+      if (isSlotByp) {
         thName = "Bypassed";
       } else if (!r.isRunning) {
         thName = "Not running";
@@ -1200,10 +1356,8 @@ static void RefreshListView(HWND hList,
       ListView_SetItemText(hList, itemIdx, 8,
                            const_cast<LPSTR>(forAudioStr.c_str()));
 
-      // 9: Excluded (最小TID以外は "same")
-      if (s > 0) {
-        ListView_SetItemText(hList, itemIdx, 9, const_cast<LPSTR>("same"));
-      } else {
+      // 9: Excluded (全スロットで保持マスクをそのまま表示)
+      {
         int coreCount = ati::CpuTopology::GetSystemCoreCount();
         DWORD_PTR normalMask = (r.normalAffinityMask != 0)
                                    ? r.normalAffinityMask
@@ -1287,7 +1441,11 @@ static void UpdateListViewDynamic(HWND hList,
 
     // 5: Audio Core PID/TID
     std::string thName;
-    if (r.isBypassed) {
+    bool isSlotByp =
+        ati::ThreadIsolator::IsMultiSlotRule(r)
+            ? (dr.subIndex < r.slotBypassed.size() && r.slotBypassed[dr.subIndex])
+            : r.isBypassed;
+    if (isSlotByp) {
       thName = "Bypassed";
     } else if (!r.isRunning) {
       thName = "Not running";
@@ -1374,10 +1532,8 @@ static void UpdateListViewDynamic(HWND hList,
     }
     SetSubItemTextIfChanged(hList, item, 8, forAudioStr);
 
-    // 9: Excluded (最小TID以外は "same")
-    if (dr.subIndex > 0) {
-      SetSubItemTextIfChanged(hList, item, 9, "same");
-    } else {
+    // 9: Excluded (全スロットで保持マスクをそのまま表示)
+    {
       int coreCount = ati::CpuTopology::GetSystemCoreCount();
       DWORD_PTR normalMask = (r.normalAffinityMask != 0)
                                  ? r.normalAffinityMask
@@ -2577,6 +2733,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
             }
             SyncAudioCoresFromMask(s_editRule.audioCores,
                                    s_editRule.audioAffinityMask);
+            s_editRule.audioSlotMasks = {s_editRule.audioAffinityMask};
             int firstCore = 0;
             if (!s_editRule.audioCores.empty()) {
               firstCore = s_editRule.audioCores[0];
@@ -2598,6 +2755,13 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               } else {
                 s_editRule.normalAffinityMask |= bit;
                 s_editRule.audioAffinityMask &= ~bit; // 相互排他
+                if (s_editMultiSlot &&
+                    s_editRuleSlot < s_editRule.audioSlotMasks.size()) {
+                  s_editRule.audioSlotMasks[s_editRuleSlot] =
+                      s_editRule.audioAffinityMask;
+                } else {
+                  s_editRule.audioSlotMasks = {s_editRule.audioAffinityMask};
+                }
                 SyncAudioCoresFromMask(s_editRule.audioCores,
                                        s_editRule.audioAffinityMask);
                 int firstCore = 0;
@@ -2643,6 +2807,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           InvalidateRect(hList, nullptr, FALSE);
       } else if (m != 0) {
         s_editRule.audioAffinityMask = m;
+        s_editRule.audioSlotMasks = {m};
         s_editRule.audioCore = fc;
         SyncAudioCoresFromMask(s_editRule.audioCores,
                                s_editRule.audioAffinityMask);
@@ -2697,6 +2862,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         s_editRule.audioAffinityMask = combinedMask;
       } else if (m != 0) {
         s_editRule.audioAffinityMask = m;
+        s_editRule.audioSlotMasks = {m};
         s_editRule.audioCore = fc;
         SyncAudioCoresFromMask(s_editRule.audioCores,
                                s_editRule.audioAffinityMask);
@@ -3131,6 +3297,66 @@ static void SaveWindowMetricsAndConfig(HWND hDlg) {
   ati::GlobalConfig curCfg = g_isolator.GetConfig();
   curCfg.columnWidths = g_colWidths;
   curCfg.windowHeight = g_windowHeight;
+
+  // 終了時検証: ATI.ini 上で Voicemeeter の 3 行 ((1),(2),(3)) が手編集等で欠損していた場合は
+  // ルールごと破棄して 3 行丸ごと INI からクリアする
+  char secBuf[4096] = {0};
+  DWORD secChars =
+      GetPrivateProfileSectionA("Processes", secBuf, 4096, g_iniPath.c_str());
+  if (secChars > 0) {
+    std::unordered_map<std::string, int> vmDiskMask;
+    std::unordered_set<std::string> vmDiskSeen;
+    char *p = secBuf;
+    while (*p) {
+      std::string line(p);
+      size_t eqPos = line.find('=');
+      if (eqPos != std::string::npos) {
+        std::string key = line.substr(0, eqPos);
+        while (!key.empty() && isspace(static_cast<unsigned char>(key.front())))
+          key.erase(key.begin());
+        while (!key.empty() && isspace(static_cast<unsigned char>(key.back())))
+          key.pop_back();
+        std::string baseName = key;
+        int slotIdx = -1;
+        if (key.length() > 3 && key.back() == ')') {
+          size_t op = key.rfind('(');
+          if (op != std::string::npos && op + 2 == key.length() - 1) {
+            char nc = key[op + 1];
+            if (nc >= '1' && nc <= '2') {
+              slotIdx = nc - '1';
+              baseName = key.substr(0, op);
+              while (!baseName.empty() &&
+                     isspace(static_cast<unsigned char>(baseName.back())))
+                baseName.pop_back();
+            }
+          }
+        }
+        if (ati::ThreadIsolator::IsVoicemeeterProcess(baseName)) {
+          std::string lowerBase = baseName;
+          for (char &ch : lowerBase)
+            ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+          vmDiskSeen.insert(lowerBase);
+          if (slotIdx >= 0 && slotIdx < 2) {
+            vmDiskMask[lowerBase] |= (1 << slotIdx);
+          }
+        }
+      }
+      p += strlen(p) + 1;
+    }
+    for (auto it = curCfg.rules.begin(); it != curCfg.rules.end();) {
+      if (ati::ThreadIsolator::IsVoicemeeterProcess(it->processName)) {
+        std::string lowerName = it->processName;
+        for (char &ch : lowerName)
+          ch = static_cast<char>(tolower(static_cast<unsigned char>(ch)));
+        if (vmDiskSeen.count(lowerName) > 0 && vmDiskMask[lowerName] != 0x3) {
+          it = curCfg.rules.erase(it);
+          continue;
+        }
+      }
+      ++it;
+    }
+  }
+
   SaveConfig(curCfg, g_iniPath);
 }
 
@@ -3618,7 +3844,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.6");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.7");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -4219,8 +4445,13 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               // sleeping... 状態のナッジ点滅 ● クリック時: bypass
               // 解除時と同様に探索を即時リスタート
               const auto &dr = g_displayRows[rowIdx];
-              if (targetRule.isRunning && !targetRule.isBypassed) {
-                if (ati::ThreadIsolator::IsMultiSlotRule(targetRule)) {
+              bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(targetRule);
+              bool isRowBypassed =
+                  isMulti ? (dr.subIndex < targetRule.slotBypassed.size() &&
+                             targetRule.slotBypassed[dr.subIndex])
+                          : targetRule.isBypassed;
+              if (targetRule.isRunning && !isRowBypassed) {
+                if (isMulti) {
                   bool isSlotConfirmed =
                       (dr.subIndex < targetRule.activeAudioTids.size() &&
                        targetRule.activeAudioTids[dr.subIndex] != 0);
@@ -4243,14 +4474,13 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               }
 
               // 全状態でクリック可: 未起動時は事前除外トグル、起動中は Bypass
-              // 切替 ● クリック時: 内部状態を全破棄して即時 Bypass → ☑ 表示 ☑
-              // 解除時: ゼロからリスタート（ScanAndIsolate 即時実行）
+              // 切替 (マルチスロット時は対象スロット単体のマスクスイッチ)
               {
                 bool wasRunning = targetRule.isRunning;
-                g_isolator.ToggleProcessBypass(ruleIdx);
+                g_isolator.ToggleProcessBypass(ruleIdx, dr.subIndex);
                 SaveConfig(g_isolator.GetConfig(), g_iniPath);
 
-                // 起動中の Bypass 解除時は直ちにアイソレーターを即時実行
+                // 起動中の Bypass 切替時は直ちにアイソレーターを即時実行
                 if (wasRunning) {
                   g_isolator.ScanAndIsolate();
                 }
@@ -4289,19 +4519,24 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         } else if (lvhti.iItem >= 0 && lvhti.iSubItem == 5) {
           // Col 5 (Audio Core PID/TID 列):
           // - sleeping... 状態時: bypass 解除時と同様に探索を即時リスタート
-          // - Standby (稼働) 状態時: Bypass へ切り替え、! カラムに ☑ を表示
+          // - Standby / 稼働状態時: Bypass (マルチスロット時はスロット単体) へ切り替え、! カラムに ☑ を表示
           if (ati::IsPriorityMatrixPickerOpen()) {
             ati::ClosePriorityMatrixPicker();
           }
           size_t rowIdx = static_cast<size_t>(lvhti.iItem);
           if (rowIdx < g_displayRows.size()) {
-            size_t ruleIdx = g_displayRows[rowIdx].ruleIndex;
+            const auto &dr = g_displayRows[rowIdx];
+            size_t ruleIdx = dr.ruleIndex;
             auto rules = g_isolator.GetRulesSnapshot();
             if (ruleIdx < rules.size()) {
               const auto &targetRule = rules[ruleIdx];
+              bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(targetRule);
+              bool isRowBypassed =
+                  isMulti ? (dr.subIndex < targetRule.slotBypassed.size() &&
+                             targetRule.slotBypassed[dr.subIndex])
+                          : targetRule.isBypassed;
               bool isHandled = false;
-              if (ati::ThreadIsolator::IsMultiSlotRule(targetRule)) {
-                const auto &dr = g_displayRows[rowIdx];
+              if (isMulti && !isRowBypassed) {
                 bool isSlotConfirmed =
                     (dr.subIndex < targetRule.activeAudioTids.size() &&
                      targetRule.activeAudioTids[dr.subIndex] != 0);
@@ -4312,15 +4547,15 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                 }
               }
               if (!isHandled) {
-                if (targetRule.detectedThreadName == "sleeping...") {
+                if (!isMulti && targetRule.detectedThreadName == "sleeping...") {
                   g_isolator.RestartSearch(ruleIdx);
                   g_isolator.ScanAndIsolate();
                 } else {
                   bool wasRunning = targetRule.isRunning;
-                  g_isolator.ToggleProcessBypass(ruleIdx);
+                  g_isolator.ToggleProcessBypass(ruleIdx, dr.subIndex);
                   SaveConfig(g_isolator.GetConfig(), g_iniPath);
-                  if (wasRunning && targetRule.isBypassed) {
-                    // Bypass 解除時は直ちにスキャン実行
+                  if (wasRunning) {
+                    // 起動中の Bypass 切替時は直ちにスキャン実行
                     g_isolator.ScanAndIsolate();
                   }
                 }
@@ -4387,9 +4622,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                 int cellW = rcSub.right - rcSub.left;
                 int cellH = rcSub.bottom - rcSub.top;
                 float scale = GetDpiScaleForWindow(hDlg);
+                bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(r);
+                bool isRowBypassed =
+                    isMulti ? (dr.subIndex < r.slotBypassed.size() &&
+                               r.slotBypassed[dr.subIndex])
+                            : r.isBypassed;
 
-                if (r.isRunning && !r.isBypassed) {
-                  // 起動中（稼働中）: 丸印インジケーターを描画
+                if (r.isRunning && !isRowBypassed) {
+                  // 起動中（稼働中・非Bypass）: 丸印インジケーターを描画
                   int dotSize = ScaleI(10, scale);
                   if (dotSize > cellH - 4)
                     dotSize = cellH - 4;
@@ -4400,7 +4640,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                   int dotY = rcSub.top + (cellH - dotSize) / 2;
 
                   COLORREF col;
-                  if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
+                  if (isMulti) {
                     bool isSlotConfirmed =
                         (dr.subIndex < r.activeAudioTids.size() &&
                          r.activeAudioTids[dr.subIndex] != 0);
@@ -4446,14 +4686,14 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                   SelectObject(hdc, oldBrush);
                   DeleteObject(hPen);
                   DeleteObject(hBr);
-                } else if (dr.subIndex == 0) {
-                  // 未起動時 (親行のみチェックボックス描画)
+                } else if (isMulti || dr.subIndex == 0) {
+                  // 未起動時またはBypass時 (マルチスロットは全スロット個別、単一スロットは親行にチェックボックス描画)
                   int cbSize = ScaleI(Layout::kCheckboxSize, scale);
                   int cbX = rcSub.left + (cellW - cbSize) / 2;
                   int cbY = rcSub.top + (cellH - cbSize) / 2;
                   RECT rcCb = {cbX, cbY, cbX + cbSize, cbY + cbSize};
                   UINT uState =
-                      DFCS_BUTTONCHECK | (r.isBypassed ? DFCS_CHECKED : 0);
+                      DFCS_BUTTONCHECK | (isRowBypassed ? DFCS_CHECKED : 0);
                   DrawFrameControl(hdc, &rcCb, DFC_BUTTON, uState);
                 }
 
@@ -4805,7 +5045,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
              "instance to launch anew.");
 
     // 1. 既存ウィンドウの探索
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.6");
+    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.7");
+    if (!hExisting)
+      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.6");
     if (!hExisting)
       hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.5");
     if (!hExisting)

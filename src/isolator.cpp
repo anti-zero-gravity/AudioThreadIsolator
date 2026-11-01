@@ -603,66 +603,6 @@ static bool CollectThreadStackPointers(HANDLE hProcess, HANDLE hThread,
   return !ptrs.empty();
 }
 
-static void InspectVoicemeeterThreadStack(HANDLE hProcess, HANDLE hThread,
-                                          bool &hasWs2, bool &hasHwAudio,
-                                          bool &hasGui) {
-  hasWs2 = false;
-  hasHwAudio = false;
-  hasGui = false;
-
-  std::vector<DWORD_PTR> ptrs;
-  if (!CollectThreadStackPointers(hProcess, hThread, ptrs))
-    return;
-
-  std::unordered_map<DWORD_PTR, std::string> modNameCache;
-  for (size_t i = 0; i < ptrs.size(); ++i) {
-    DWORD_PTR p = ptrs[i];
-    MEMORY_BASIC_INFORMATION mbi = {0};
-    if (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(p), &mbi,
-                       sizeof(mbi))) {
-      if (mbi.Protect == PAGE_EXECUTE_READ ||
-          mbi.Protect == PAGE_EXECUTE_READWRITE) {
-        DWORD_PTR allocBase = reinterpret_cast<DWORD_PTR>(mbi.AllocationBase);
-        if (allocBase != 0) {
-          std::string modName;
-          auto cIt = modNameCache.find(allocBase);
-          if (cIt != modNameCache.end()) {
-            modName = cIt->second;
-          } else {
-            if (s_pfnGetMappedFileNameA) {
-              char mPath[MAX_PATH] = {0};
-              if (s_pfnGetMappedFileNameA(hProcess, mbi.AllocationBase, mPath,
-                                          sizeof(mPath)) > 0) {
-                modName = ToLowerA(mPath);
-              }
-            }
-            modNameCache[allocBase] = modName;
-          }
-
-          if (!modName.empty()) {
-            if (modName.find("ws2_32") != std::string::npos) {
-              hasWs2 = true;
-            }
-            if (modName.find("audioses") != std::string::npos ||
-                modName.find("wdmaud") != std::string::npos ||
-                modName.find("ksuser") != std::string::npos ||
-                modName.find("dsound") != std::string::npos ||
-                IsRegisteredAsioDll(modName)) {
-              hasHwAudio = true;
-            }
-            if (modName.find("user32") != std::string::npos ||
-                modName.find("gdi32") != std::string::npos ||
-                modName.find("gdiplus") != std::string::npos ||
-                modName.find("win32u") != std::string::npos) {
-              hasGui = true;
-            }
-          }
-        }
-      }
-    }
-  }
-}
-
 static std::string QueryCallstackAudioSignature(HANDLE hProcess, HANDLE hThread,
                                                 int appType = 1) {
   std::vector<DWORD_PTR> ptrs;
@@ -676,6 +616,8 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess, HANDLE hThread,
   bool hasDiscordVoice = false;
   bool hasAvrt = false;
   bool hasRoonSocket = false;
+  bool hasVmWs2 = false;
+  bool hasVmGui = false;
 
   for (size_t i = 0; i < ptrs.size(); ++i) {
     DWORD_PTR p = ptrs[i];
@@ -703,6 +645,19 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess, HANDLE hThread,
           }
 
           if (!modName.empty()) {
+            // (0) Voicemeeter 専用シグネチャ (AppType: 5 限定)
+            if (appType == 5) {
+              if (modName.find("ws2_32") != std::string::npos) {
+                hasVmWs2 = true;
+              }
+              if (modName.find("user32") != std::string::npos ||
+                  modName.find("gdi32") != std::string::npos ||
+                  modName.find("gdiplus") != std::string::npos ||
+                  modName.find("win32u") != std::string::npos) {
+                hasVmGui = true;
+              }
+              continue;
+            }
             // (1) InstantAud.ax (CyberLink PowerDVD オーディオ出力)
             if (modName.find("instantaud") != std::string::npos) {
               return "InstantAud.ax (CyberLink)";
@@ -756,55 +711,19 @@ static std::string QueryCallstackAudioSignature(HANDLE hProcess, HANDLE hThread,
             }
           }
         }
-
-        // 従来の Godot 等の埋め込みバイナリ向けシグネチャ走査 (フォールバック)
-        BYTE codeBuf[512] = {0};
-        DWORD_PTR codeStart = (p >= 128) ? (p - 128) : p;
-        SIZE_T cRead = 0;
-        if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(codeStart),
-                              codeBuf, sizeof(codeBuf), &cRead) &&
-            cRead >= 64) {
-          // x64 相対参照 [rip + disp32] の走査
-          for (size_t c = 0; c + 7 <= cRead; ++c) {
-            if (codeBuf[c] == 0x48 &&
-                (codeBuf[c + 1] == 0x8d || codeBuf[c + 1] == 0x8b)) {
-              BYTE modrm = codeBuf[c + 2];
-              if ((modrm & 0xC7) == 0x05) { // [rip + disp32]
-                INT32 disp = *reinterpret_cast<const INT32 *>(&codeBuf[c + 3]);
-                DWORD_PTR targetAddr = (codeStart + c + 7) + disp;
-                if (targetAddr >= 0x10000 && targetAddr <= 0x7FFFFFFFFFFFULL) {
-                  char strBuf[64] = {0};
-                  SIZE_T sRead = 0;
-                  if (ReadProcessMemory(hProcess,
-                                        reinterpret_cast<LPCVOID>(targetAddr),
-                                        strBuf, sizeof(strBuf) - 1, &sRead) &&
-                      sRead >= 8) {
-                    std::string lowerStr = ToLowerA(strBuf);
-                    if (lowerStr.find("audio_driver_wasapi") !=
-                            std::string::npos ||
-                        lowerStr.find("audiodriverwasapi") !=
-                            std::string::npos) {
-                      return "WASAPI (Godot AudioDriver)";
-                    }
-                  }
-                }
-              }
-            }
-          }
-
-          // 直近コードバッファ内の ASCII 文字列もチェック
-          std::string lowerCode(reinterpret_cast<const char *>(codeBuf), cRead);
-          lowerCode = ToLowerA(lowerCode);
-          if (lowerCode.find("audio_driver_wasapi") != std::string::npos ||
-              lowerCode.find("audiodriverwasapi") != std::string::npos) {
-            return "WASAPI (Godot AudioDriver)";
-          }
-        }
       }
     }
   }
   if (appType == 4 && hasRoonSocket) {
     return "Roon Socket (mswsock.dll)";
+  }
+  if (appType == 5) {
+    std::string vmSig;
+    if (hasVmWs2)
+      vmSig += "[WS2]";
+    if (hasVmGui)
+      vmSig += "[GUI]";
+    return vmSig;
   }
   return "";
 }
@@ -1039,10 +958,56 @@ void ThreadIsolator::ToggleProcessHeuristics(size_t index) {
   }
 }
 
-void ThreadIsolator::ToggleProcessBypass(size_t index) {
+void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
   std::lock_guard<std::mutex> lock(m_mutex);
   if (index < m_config.rules.size()) {
     auto &rule = m_config.rules[index];
+    if (IsMultiSlotRule(rule)) {
+      size_t slotCount = GetRuleSlotCount(rule);
+      if (rule.slotBypassed.size() < slotCount) {
+        rule.slotBypassed.resize(slotCount, false);
+      }
+      if (slot < slotCount) {
+        rule.slotBypassed[slot] = !rule.slotBypassed[slot];
+        m_appliedThreads.clear();
+        if (rule.slotBypassed[slot]) {
+          if (slot < rule.activeAudioTids.size() &&
+              rule.activeAudioTids[slot] != 0) {
+            DWORD tid = rule.activeAudioTids[slot];
+            if (rule.suspendedAudioTids.count(tid) > 0) {
+              HANDLE hThread = OpenThread(THREAD_SUSPEND_RESUME, FALSE, tid);
+              if (hThread) {
+                while (ResumeThread(hThread) > 1) {
+                }
+                CloseHandle(hThread);
+              }
+              rule.suspendedAudioTids.erase(tid);
+              rule.isAudioThreadSuspended = !rule.suspendedAudioTids.empty();
+            }
+            if (rule.activePid != 0) {
+              m_confirmedAudioHistory[rule.activePid].erase(tid);
+            }
+          }
+        } else {
+          if (rule.isRunning) {
+            bool needSearch = (slot >= rule.activeAudioTids.size() ||
+                               rule.activeAudioTids[slot] == 0);
+            if (needSearch) {
+              int intervalMs =
+                  NormalizePollingInterval(m_config.pollingIntervalMs);
+              int turnsPerSec = 1000 / intervalMs;
+              if (turnsPerSec < 1)
+                turnsPerSec = 1;
+              rule.multiSearchSleeping = false;
+              rule.multiSearchTurns = 10 * turnsPerSec;
+            }
+          }
+        }
+      }
+      rule.isBypassed = false;
+      return;
+    }
+
     rule.isBypassed = !rule.isBypassed;
     if (rule.audioServicePid != 0) {
       ClearChromiumTrackingState(rule.audioServicePid);
@@ -1634,15 +1599,21 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
     }
   }
 
-  // 2. Ideal Processor をオーディオコアに固定
-  SetThreadIdealProcessor(hThread, static_cast<DWORD>(audioCore));
-
-  // 3. アフィニティを audioMask に設定
-  DWORD_PTR prevMask = SetThreadAffinityMask(hThread, audioMask);
-  if (prevMask != 0 && prevMask != audioMask) {
-    m_appliedThreads[tid] = audioMask;
-    rule.applyCount++;
-    changed = true;
+  // 2. アフィニティおよび Ideal Processor を設定 (未適用またはマスク変更時のみ発行)
+  DWORD_PTR curAff = QueryThreadAffinityMask(hThread);
+  bool needApplyMask = (curAff != audioMask ||
+                        m_appliedThreads.find(tid) == m_appliedThreads.end() ||
+                        m_appliedThreads[tid] != audioMask);
+  if (needApplyMask) {
+    DWORD_PTR prevMask = SetThreadAffinityMask(hThread, audioMask);
+    if (prevMask != 0) {
+      m_appliedThreads[tid] = audioMask;
+      if (prevMask != audioMask) {
+        rule.applyCount++;
+        changed = true;
+      }
+    }
+    SetThreadIdealProcessor(hThread, static_cast<DWORD>(audioCore));
   }
 
   return changed;
@@ -1704,10 +1675,10 @@ bool ThreadIsolator::TryIdentifyAudioThread(
         if (rule.appType != -1 && d >= deltaThreshold &&
             sampleState.inspectedTids.find(ti.tid) ==
                 sampleState.inspectedTids.end()) {
+          sampleState.inspectedTids.insert(ti.tid);
           std::string stackSig =
               QueryCallstackAudioSignature(hProcess, ti.hThread, 4);
           if (!stackSig.empty()) {
-            sampleState.inspectedTids.insert(ti.tid);
             if (stackSig.find("Roon Socket") != std::string::npos) {
               sampleState.socketCandidateTids.insert(ti.tid);
             } else {
@@ -1825,14 +1796,13 @@ bool ThreadIsolator::TryIdentifyAudioThread(
   } else if (IsVoicemeeterProcess(rule.processName)) {
     // === AppType: 5 (Voicemeeter 全エディション 2行モード):
     // Slot 0 (親行): ws2_32.dll 保持スレッド 最大 Delta (VBAN - <procName>)
-    // Slot 1 (子行1): audioses/wdmaud/ksuser/dsound/ASIO 保持スレッド 最大
-    // Delta (Hardware OUT -) ===
+    // Slot 1 (子行): 非GUI・非BelowNormal・非Slot0 最大 Delta
+    // (VAIO/AUX & DSP -) ===
     double effectiveRuleDelta =
         (rule.cyclesDelta > 0.0) ? rule.cyclesDelta : 1.0;
     ULONG64 deltaThreshold = CalculateDeltaThreshold(
         effectiveRuleDelta, m_config.defaultCyclesDelta, intervalMs);
 
-    auto waitReasons = QueryProcessThreadsWaitReason(pid);
     std::unordered_map<DWORD, ULONG64> threadDeltas;
     std::unordered_set<DWORD> curAliveSet;
     for (const auto &ti : threadInfos) {
@@ -1850,6 +1820,14 @@ bool ThreadIsolator::TryIdentifyAudioThread(
             ? rule.activeAudioTids[1]
             : 0;
 
+    bool slot0Paused =
+        (prevSlot0 != 0 && rule.suspendedAudioTids.count(prevSlot0) > 0);
+    bool slot1Paused =
+        (prevSlot1 != 0 && rule.suspendedAudioTids.count(prevSlot1) > 0);
+
+    bool slot0Bypassed = (rule.slotBypassed.size() > 0 && rule.slotBypassed[0]);
+    bool slot1Bypassed = (rule.slotBypassed.size() > 1 && rule.slotBypassed[1]);
+
     for (const auto &ti : threadInfos) {
       ULONG64 curCycle = 0;
       if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
@@ -1861,44 +1839,30 @@ bool ThreadIsolator::TryIdentifyAudioThread(
         sampleState.lastCycles[ti.tid] = curCycle;
         threadDeltas[ti.tid] = d;
 
-        auto wrIt = waitReasons.find(ti.tid);
-        if (wrIt != waitReasons.end() && wrIt->second == 4 && d > 0) {
-          sampleState.delayExecTids.insert(ti.tid);
-        }
-
+        // 各スレッドにつき生涯1回のみ 32KB スタック走査を実行
         if (rule.appType != -1 && d >= deltaThreshold &&
-            sampleState.vmWs2Tids.count(ti.tid) == 0 &&
-            sampleState.vmHwAudioTids.count(ti.tid) == 0 &&
-            sampleState.vmGuiTids.count(ti.tid) == 0) {
-          bool hasWs2 = false;
-          bool hasHwAudio = false;
-          bool hasGui = false;
-          InspectVoicemeeterThreadStack(hProcess, ti.hThread, hasWs2,
-                                        hasHwAudio, hasGui);
-          if (hasWs2)
-            sampleState.vmWs2Tids.insert(ti.tid);
-          if (hasHwAudio)
-            sampleState.vmHwAudioTids.insert(ti.tid);
-          if (hasGui)
+            sampleState.inspectedTids.find(ti.tid) ==
+                sampleState.inspectedTids.end()) {
+          sampleState.inspectedTids.insert(ti.tid);
+          std::string vmSig =
+              QueryCallstackAudioSignature(hProcess, ti.hThread, 5);
+          if (vmSig.find("[WS2]") != std::string::npos)
+            sampleState.socketCandidateTids.insert(ti.tid);
+          if (vmSig.find("[GUI]") != std::string::npos)
             sampleState.vmGuiTids.insert(ti.tid);
         }
       }
     }
 
-    bool slot0Paused =
-        (prevSlot0 != 0 && rule.suspendedAudioTids.count(prevSlot0) > 0);
-    bool slot1Paused =
-        (prevSlot1 != 0 && rule.suspendedAudioTids.count(prevSlot1) > 0);
-
     // Slot 0: VBAN (ws2_32.dll) 最大 Delta
     DWORD nextSlot0 = prevSlot0;
     ULONG64 maxSlot0Delta = 0;
-    if (!slot0Paused) {
+    if (!slot0Paused && !slot0Bypassed) {
       DWORD bestSlot0 = 0;
       for (const auto &ti : threadInfos) {
         if (slot1Paused && ti.tid == prevSlot1)
           continue;
-        if (sampleState.vmWs2Tids.count(ti.tid) > 0) {
+        if (sampleState.socketCandidateTids.count(ti.tid) > 0) {
           ULONG64 d = threadDeltas[ti.tid];
           if (d >= deltaThreshold && d > maxSlot0Delta) {
             maxSlot0Delta = d;
@@ -1913,21 +1877,23 @@ bool ThreadIsolator::TryIdentifyAudioThread(
       }
     }
 
-    // Slot 1: Hardware OUT (audioses/wdmaud/ksuser/dsound/ASIO) 最大 Delta
+    // Slot 1: VAIO/AUX & DSP (メインエンジン: 非GUI・非BelowNormal・非Slot0 最大 Delta)
     DWORD nextSlot1 = (prevSlot1 != nextSlot0) ? prevSlot1 : 0;
     ULONG64 maxSlot1Delta = 0;
-    if (!slot1Paused) {
+    if (!slot1Paused && !slot1Bypassed) {
       DWORD bestSlot1 = 0;
       for (const auto &ti : threadInfos) {
         if (ti.tid == nextSlot0)
           continue;
-        if (sampleState.vmWs2Tids.count(ti.tid) == 0 &&
-            sampleState.vmHwAudioTids.count(ti.tid) > 0) {
-          ULONG64 d = threadDeltas[ti.tid];
-          if (d >= deltaThreshold && d > maxSlot1Delta) {
-            maxSlot1Delta = d;
-            bestSlot1 = ti.tid;
-          }
+        if (sampleState.socketCandidateTids.count(ti.tid) > 0 ||
+            sampleState.vmGuiTids.count(ti.tid) > 0)
+          continue;
+        if (ti.priority == THREAD_PRIORITY_BELOW_NORMAL)
+          continue;
+        ULONG64 d = threadDeltas[ti.tid];
+        if (d >= deltaThreshold && d > maxSlot1Delta) {
+          maxSlot1Delta = d;
+          bestSlot1 = ti.tid;
         }
       }
       if (bestSlot1 != 0 &&
@@ -3528,11 +3494,15 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      auto countConfirmed = [](const std::vector<DWORD> &v) -> size_t {
+      auto countSatisfied = [&rule](size_t totalSlots) -> size_t {
         size_t n = 0;
-        for (DWORD x : v) {
-          if (x != 0)
+        for (size_t s = 0; s < totalSlots; ++s) {
+          bool bypassed = (s < rule.slotBypassed.size() && rule.slotBypassed[s]);
+          bool hasTid =
+              (s < rule.activeAudioTids.size() && rule.activeAudioTids[s] != 0);
+          if (bypassed || hasTid) {
             ++n;
+          }
         }
         return n;
       };
@@ -3542,9 +3512,9 @@ bool ThreadIsolator::ScanAndIsolate() {
       auto &sampleState = m_samplingStates[pid];
 
       if (isMultiSlot) {
-        // === 複数スロットモード (AppType: 4 Roon / AppType: 5 Voicemeeter):
-        // 10秒間カウントダウン継続スキャン ===
-        size_t curCount = countConfirmed(rule.activeAudioTids);
+        // === 複数スロットモード (AppType: 5 Voicemeeter 2スロット):
+        // 未確定かつ非Bypassスロットが存在する間のみ10秒間カウントダウン探索 ===
+        size_t curCount = countSatisfied(targetCount);
         if (curCount < targetCount) {
           // 新たなスレッドが特定された場合:
           // 次のスレッド探索のためタイマーを10秒にリセット
@@ -3566,7 +3536,7 @@ bool ThreadIsolator::ScanAndIsolate() {
                                    identifiedAudioTid, identifiedAudioLabel,
                                    stateChanged);
 
-            size_t afterCount = countConfirmed(rule.activeAudioTids);
+            size_t afterCount = countSatisfied(targetCount);
             if (afterCount > curCount) {
               // 新スレッド検出成功！
               rule.lastIdentifiedCount = afterCount;
@@ -3586,32 +3556,15 @@ bool ThreadIsolator::ScanAndIsolate() {
                 rule.multiSearchSleeping = true;
               }
             }
-          } else if (curCount > 0) {
-            // 一部スロットのみ稼働中に sleeping 状態にある場合も動的追従は継続
-            TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
-                                   pid, audioMask, intervalMs,
-                                   "DynamicTracking", identifiedAudioTid,
-                                   identifiedAudioLabel, stateChanged);
-            if (countConfirmed(rule.activeAudioTids) >= targetCount) {
-              rule.multiSearchSleeping = false;
-              rule.multiSearchTurns = 0;
-            }
           }
         } else {
-          // 目標スレッド数がすべて揃っている: 常時動的追従を継続
+          // 全非Bypassスロットが確定済み: 定常時の探索負荷をゼロにする
           rule.multiSearchSleeping = false;
           rule.multiSearchTurns = 0;
-          TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess, pid,
-                                 audioMask, intervalMs, "DynamicTracking",
-                                 identifiedAudioTid, identifiedAudioLabel,
-                                 stateChanged);
         }
       } else {
         // === 通常モード (単一スレッド): Searching... -> Standby 10..3 ->
         // Standby 2..1 -> sleeping... ===
-        bool isSuspended =
-            (identifiedAudioTid != 0 &&
-             rule.suspendedAudioTids.count(identifiedAudioTid) > 0);
         if (identifiedAudioTid == 0) {
           if (rule.searchPhase == 0) {
             rule.searchPhase = 1;
@@ -3621,7 +3574,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           }
 
           if (rule.appType == 4) {
-            // AppType 4 (Roon): 常に Searching... で毎ターン探索
+            // AppType 4 (Roon): 未確定時のみ毎ターン探索
             rule.detectedThreadName = "Searching...";
             TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
                                    pid, audioMask, intervalMs, "Searching...",
@@ -3640,59 +3593,70 @@ bool ThreadIsolator::ScanAndIsolate() {
                                    identifiedAudioTid, identifiedAudioLabel,
                                    stateChanged);
           }
-        } else if (!isSuspended) {
-          // 動的追従 (エフェメラルスレッド交代対応):
-          // 確定済みスレッドがある場合でも、サスペンド中でなければ毎ターン評価を行い、
-          // より高負荷な新オーディオスレッドが出現した場合は即座にバトンタッチ
-          DWORD dynamicTid = 0;
-          std::string dynamicLabel = "";
-          if (TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
-                                     pid, audioMask, intervalMs,
-                                     "DynamicTracking", dynamicTid,
-                                     dynamicLabel, stateChanged)) {
-            if (dynamicTid != 0 && dynamicTid != identifiedAudioTid) {
-              identifiedAudioTid = dynamicTid;
-              identifiedAudioLabel = dynamicLabel;
-              rule.activeAudioTid = dynamicTid;
-              rule.activeAudioTids = {dynamicTid};
-              m_trackedAudioThreads[pid].clear();
-              m_trackedAudioThreads[pid][dynamicTid] = dynamicLabel;
-              m_confirmedAudioHistory[pid].insert(dynamicTid);
-              rule.detectedThreadName = dynamicLabel;
-              stateChanged = true;
-            }
-          }
         }
       }
 
       // 3. アフィニティおよび優先度の適用
-      // (オーディオスレッド特定時のみ退避・適用を実行)
+      // (オーディオスレッド特定時またはスロットBypass制御時のみ退避・適用を実行)
       std::vector<DWORD> intruderTids;
       DWORD_PTR effectiveNormal = normalMask;
 
       std::unordered_set<DWORD> audioTidSet;
-      for (DWORD t : rule.activeAudioTids) {
-        if (t != 0) {
+      std::unordered_set<DWORD> bypassedSlotTidSet;
+      for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
+        DWORD t = rule.activeAudioTids[s];
+        if (t == 0)
+          continue;
+        bool slotByp = (s < rule.slotBypassed.size() && rule.slotBypassed[s]);
+        if (slotByp) {
+          bypassedSlotTidSet.insert(t);
+          m_confirmedAudioHistory[pid].erase(t);
+        } else {
           audioTidSet.insert(t);
           m_confirmedAudioHistory[pid].insert(t);
         }
       }
-      if (audioTidSet.empty() && identifiedAudioTid != 0) {
+      if (audioTidSet.empty() && bypassedSlotTidSet.empty() &&
+          identifiedAudioTid != 0 && !isMultiSlot) {
         audioTidSet.insert(identifiedAudioTid);
         m_confirmedAudioHistory[pid].insert(identifiedAudioTid);
       }
 
-      DWORD_PTR combinedAudioMask = audioMask;
-      for (int c : rule.audioCores) {
-        combinedAudioMask |= (1ULL << c);
+      DWORD_PTR combinedAudioMask = isMultiSlot ? 0 : audioMask;
+      if (isMultiSlot) {
+        for (size_t s = 0; s < targetCount; ++s) {
+          if (s < rule.slotBypassed.size() && rule.slotBypassed[s])
+            continue;
+          if (s < rule.audioSlotMasks.size() && rule.audioSlotMasks[s] != 0) {
+            combinedAudioMask |= rule.audioSlotMasks[s];
+          } else if (s < rule.audioCores.size() && rule.audioCores[s] >= 0 &&
+                     rule.audioCores[s] < 64) {
+            combinedAudioMask |= (1ULL << rule.audioCores[s]);
+          }
+        }
+      } else {
+        for (int c : rule.audioCores) {
+          combinedAudioMask |= (1ULL << c);
+        }
       }
 
-      if (!audioTidSet.empty()) {
-        // まず非オーディオスレッド (通常スレッド群)
-        // を通常コア群へ先行退避し、真の侵入者を物理検出
+      if (!audioTidSet.empty() || !bypassedSlotTidSet.empty()) {
+        // まず非オーディオスレッド (通常スレッド群およびスロットBypass対象スレッド)
+        // を通常コア群へ退避し、真の侵入者を物理検出
         for (const auto &ti : threadInfos) {
           if (audioTidSet.count(ti.tid) > 0)
             continue;
+
+          // 個別Bypass中のスロット確定スレッド:
+          // 優先度は一切変更せず (intruderTids に含めず)、除外マスク (effectiveNormal) を適用
+          if (bypassedSlotTidSet.count(ti.tid) > 0) {
+            if (EvacuateNormalThreadSettings(ti.hThread, ti.tid,
+                                             effectiveNormal)) {
+              stateChanged = true;
+            }
+            continue;
+          }
+
           // 過去にオーディオスレッドとして確定されたスレッドはパージ（通常コア退避・侵入者降格）しない
           if (m_confirmedAudioHistory[pid].count(ti.tid) > 0)
             continue;
@@ -3702,7 +3666,8 @@ bool ThreadIsolator::ScanAndIsolate() {
           // (A) オーディオコア単独に自己バインドしている、または
           // (B)
           // 以前のサイクルで通常コア群へ退避させたにもかかわらず自らオーディオコアへ再バインドして居座るスレッド
-          if ((ti.currentAffinity & combinedAudioMask) != 0) {
+          if (combinedAudioMask != 0 &&
+              (ti.currentAffinity & combinedAudioMask) != 0) {
             bool isSpecificToAudio =
                 ((ti.currentAffinity & ~combinedAudioMask) == 0);
             bool wasPreviouslyEvacuated =
@@ -3762,12 +3727,14 @@ bool ThreadIsolator::ScanAndIsolate() {
       int intruderPrio = GetOneStepLowerPriority(targetAudioPrio);
 
       // オーディオスレッド群への適用
-      // (スロットごとに個別コア・個別サスペンド制御)
-      if (!audioTidSet.empty()) {
+      // (スロットごとに個別コア・個別サスペンド・個別Bypass制御)
+      if (!audioTidSet.empty() || !bypassedSlotTidSet.empty()) {
         for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
           DWORD aTid = rule.activeAudioTids[s];
           if (aTid == 0)
             continue;
+          bool isSlotBypassed =
+              (s < rule.slotBypassed.size() && rule.slotBypassed[s]);
 
           int assignedCore = rule.audioCore;
           DWORD_PTR assignedMask = (assignedCore >= 0 && assignedCore < 64)
@@ -3815,13 +3782,14 @@ bool ThreadIsolator::ScanAndIsolate() {
                 primaryAudioPid = pid;
                 primaryAudioTid = ti.tid;
               }
-
-              int slotAudioPrio = (s < rule.audioPriorities.size())
-                                      ? rule.audioPriorities[s]
-                                      : targetAudioPrio;
-              if (ApplyAudioThreadSettings(ti.hThread, ti.tid, slotAudioPrio,
-                                           assignedCore, assignedMask, rule)) {
-                stateChanged = true;
+              if (!isSlotBypassed) {
+                int slotAudioPrio = (s < rule.audioPriorities.size())
+                                        ? rule.audioPriorities[s]
+                                        : targetAudioPrio;
+                if (ApplyAudioThreadSettings(ti.hThread, ti.tid, slotAudioPrio,
+                                             assignedCore, assignedMask, rule)) {
+                  stateChanged = true;
+                }
               }
               break;
             }
@@ -4129,9 +4097,27 @@ void ThreadIsolator::NormalizeSpecialRule(ProcessRule &rule) {
     if (!rule.audioCores.empty()) {
       rule.audioCore = rule.audioCores[0];
     }
+  } else {
+    DWORD_PTR singleMask =
+        (rule.audioAffinityMask != 0)
+            ? rule.audioAffinityMask
+            : ((rule.audioCore >= 0 && rule.audioCore < 64)
+                   ? (1ULL << rule.audioCore)
+                   : 0);
+    if (singleMask != 0) {
+      rule.audioAffinityMask = singleMask;
+      rule.audioSlotMasks = {singleMask};
+    }
   }
   if (rule.audioPriorities.size() > slotCount) {
     rule.audioPriorities.resize(slotCount);
+  } else if (slotCount > 1 && rule.audioPriorities.size() < slotCount) {
+    rule.audioPriorities.resize(slotCount, rule.audioPriority);
+  }
+  if (rule.slotBypassed.size() > slotCount) {
+    rule.slotBypassed.resize(slotCount);
+  } else if (slotCount > 1 && rule.slotBypassed.size() < slotCount) {
+    rule.slotBypassed.resize(slotCount, false);
   }
 }
 
