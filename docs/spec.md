@@ -172,7 +172,7 @@ Saved per registered process under the executable name as key, with comma-separa
 |:---|:---|:---|
 | **`AudioCore`** | Core or hexadecimal mask assigned to audio thread. Comma-separated for multiple slots/cores (e.g., `AudioCore:11, 3, 0xC00`). | `0` to (Max Cores - 1), hex mask (`0x`...), comma-separated |
 | **`AudioPriority`** | Relative priority for audio thread. Comma-separated for multiple threads (e.g., `AudioPriority:-15, -15`). | `-15`, `-2`, `-1`, `0`, `1`, `2`, `15`, comma-separated |
-| **`NormalCores`** | Eviction core bitmask assigned to normal threads. | Hex mask starting with `0x` |
+| **`NormalCores`** | Eviction core bitmask assigned to normal threads. When multiple cores are enabled, normal threads retain the multi-core affinity mask while their Ideal CPU (`SetThreadIdealProcessor`) is automatically distributed in round-robin order sorted by `Cycles Delta` descending. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
 | **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW, `4`: Roon dedicated, `5`: Voicemeeter dedicated). | `0`, `1`, `2`, `3`, `4`, `5` |
 
@@ -185,7 +185,7 @@ Saved per registered process under the executable name as key, with comma-separa
 2. **Behavior on Temporary Bypass (`!` / Bypass)**:
    - Entering Bypass stops ATI monitoring and active affinity adjustments for that process. Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling (as an exception, `audiodg.exe` automatically restores to standard settings upon Bypass, rule removal, or application exit).
 3. **Single-Instance Enforcement & Self-Protection**:
-   - Launching a second instance automatically terminates the previous instance and starts anew. To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
+   - Multiple instances are prevented; launching ATI while an instance is already running restores the existing instance's system tray icon (recovering from Explorer crashes if the icon disappeared), activates its main window to the foreground, and immediately exits the new instance. To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
 4. **Control Scope by Launch Mode (Standard vs. Administrator)**:
    - Launching ATI as Administrator (e.g., via **`Restart as Administrator`** in the tray menu) unlocks `Realtime` priority (Base 16–31) and expands the range of controllable processes.
    - **Broader Unlisted Mask Coverage**: System services and elevated processes that are skipped in standard user mode due to OS access restrictions become eligible for affinity masking.

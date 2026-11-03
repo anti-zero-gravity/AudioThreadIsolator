@@ -873,11 +873,14 @@ void ThreadIsolator::Initialize(const GlobalConfig &config) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_config = config;
   m_appliedThreads.clear();
+  m_appliedIdealCores.clear();
   m_prevThreadCpuTimes.clear();
   m_samplingStates.clear();
   m_chromiumThreadTracks.clear();
   m_chromiumAudioStates.clear();
   m_chromiumEvictedPids.clear();
+  m_nonChromiumMaskedPids.clear();
+  m_confirmedAudioHistory.clear();
   m_audioDgAppliedTids.clear();
   m_audioDgLastPrio.clear();
 }
@@ -886,8 +889,11 @@ void ThreadIsolator::UpdateConfig(const GlobalConfig &config) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_config = config;
   m_appliedThreads.clear();
+  m_appliedIdealCores.clear();
   m_prevThreadCpuTimes.clear();
   m_samplingStates.clear();
+  m_nonChromiumMaskedPids.clear();
+  m_confirmedAudioHistory.clear();
   // 注意: 設定更新（優先度変更やコア変更等）時に Chromium
   // の追従情報や確定状態を破棄してはならない
   // 破棄すると定常確定スレッドが見失われ、長時間のサンプリングに逆戻りしてしまうため維持する
@@ -907,6 +913,7 @@ void ThreadIsolator::AddRule(const ProcessRule &rule) {
     RestoreAffinityForProcessNamesLocked({ToLowerA(norm.processName)});
   }
   m_appliedThreads.clear();
+  m_appliedIdealCores.clear();
 }
 
 void ThreadIsolator::RemoveRule(size_t index) {
@@ -928,7 +935,10 @@ void ThreadIsolator::UpdateRule(size_t index, const ProcessRule &rule) {
     NormalizeSpecialRule(norm);
     m_config.rules[index] = norm;
     m_appliedThreads.clear();
+    m_appliedIdealCores.clear();
     m_prevThreadCpuTimes.clear();
+    m_nonChromiumMaskedPids.clear();
+    m_confirmedAudioHistory.clear();
   }
 }
 
@@ -970,6 +980,7 @@ void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
       if (slot < slotCount) {
         rule.slotBypassed[slot] = !rule.slotBypassed[slot];
         m_appliedThreads.clear();
+        m_appliedIdealCores.clear();
         if (rule.slotBypassed[slot]) {
           if (slot < rule.activeAudioTids.size() &&
               rule.activeAudioTids[slot] != 0) {
@@ -1614,6 +1625,7 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
       }
     }
     SetThreadIdealProcessor(hThread, static_cast<DWORD>(audioCore));
+    m_appliedIdealCores[tid] = audioCore;
   }
 
   return changed;
@@ -1622,10 +1634,14 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
 // 共通ヘルパー: 通常スレッドへのアフィニティマスク退避適用 (Type 1 & Type 2
 // 共通)
 bool ThreadIsolator::EvacuateNormalThreadSettings(HANDLE hThread, DWORD tid,
-                                                  DWORD_PTR normalMask) {
+                                                  DWORD_PTR normalMask,
+                                                  int idealCore) {
   bool changed = false;
   DWORD_PTR curAff = QueryThreadAffinityMask(hThread);
-  if (curAff != normalMask) {
+  bool needApplyMask = (curAff != normalMask ||
+                        m_appliedThreads.find(tid) == m_appliedThreads.end() ||
+                        m_appliedThreads[tid] != normalMask);
+  if (needApplyMask) {
     DWORD_PTR prevMask = SetThreadAffinityMask(hThread, normalMask);
     if (prevMask != 0) {
       m_appliedThreads[tid] = normalMask;
@@ -1634,6 +1650,37 @@ bool ThreadIsolator::EvacuateNormalThreadSettings(HANDLE hThread, DWORD tid,
       }
     }
   }
+
+  if (idealCore < 0 && normalMask != 0) {
+    auto it = m_appliedIdealCores.find(tid);
+    if (it != m_appliedIdealCores.end() && it->second >= 0 &&
+        it->second < static_cast<int>(sizeof(DWORD_PTR) * 8) &&
+        (normalMask & (static_cast<DWORD_PTR>(1) << it->second)) != 0) {
+      idealCore = it->second;
+    } else {
+      std::vector<int> cores;
+      for (int c = 0; c < static_cast<int>(sizeof(DWORD_PTR) * 8); ++c) {
+        if ((normalMask & (static_cast<DWORD_PTR>(1) << c)) != 0) {
+          cores.push_back(c);
+        }
+      }
+      if (!cores.empty()) {
+        idealCore = cores[m_idealRoundRobinCounter++ % cores.size()];
+      }
+    }
+  }
+
+  if (idealCore >= 0) {
+    bool needApplyIdeal =
+        (needApplyMask ||
+         m_appliedIdealCores.find(tid) == m_appliedIdealCores.end() ||
+         m_appliedIdealCores[tid] != idealCore);
+    if (needApplyIdeal) {
+      SetThreadIdealProcessor(hThread, static_cast<DWORD>(idealCore));
+      m_appliedIdealCores[tid] = idealCore;
+    }
+  }
+
   return changed;
 }
 
@@ -1670,6 +1717,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
           d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
         }
         sampleState.lastCycles[ti.tid] = curCycle;
+        sampleState.latestDelta[ti.tid] = d;
         threadDeltas[ti.tid] = d;
 
         if (rule.appType != -1 && d >= deltaThreshold &&
@@ -1746,6 +1794,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
           d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
         }
         sampleState.lastCycles[ti.tid] = curCycle;
+        sampleState.latestDelta[ti.tid] = d;
         threadDeltas[ti.tid] = d;
 
         auto wrIt = waitReasons.find(ti.tid);
@@ -1837,6 +1886,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
           d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
         }
         sampleState.lastCycles[ti.tid] = curCycle;
+        sampleState.latestDelta[ti.tid] = d;
         threadDeltas[ti.tid] = d;
 
         // 各スレッドにつき生涯1回のみ 32KB スタック走査を実行
@@ -1919,6 +1969,7 @@ bool ThreadIsolator::TryIdentifyAudioThread(
           d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
         }
         sampleState.lastCycles[ti.tid] = curCycle;
+        sampleState.latestDelta[ti.tid] = d;
 
         // 秒換算 CyclesDelta の 1 ターン閾値
         ULONG64 deltaThreshold = CalculateDeltaThreshold(
@@ -1985,6 +2036,9 @@ bool ThreadIsolator::TryIdentifyAudioThread(
                            std::to_string(identifiedAudioTid);
     m_trackedAudioThreads[pid].clear();
     m_trackedAudioThreads[pid][identifiedAudioTid] = identifiedAudioLabel;
+    if (rule.appType != 4) {
+      m_confirmedAudioHistory[pid].clear();
+    }
     m_confirmedAudioHistory[pid].insert(identifiedAudioTid);
     for (DWORD t : rule.activeAudioTids) {
       if (t != 0) {
@@ -2006,6 +2060,9 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     if (!isDynamic || !wasIsolated || prevPid != pid ||
         prevActiveTid != identifiedAudioTid ||
         prevActiveTids != rule.activeAudioTids) {
+      for (const auto &ti : threadInfos) {
+        m_appliedIdealCores.erase(ti.tid);
+      }
       stateChanged = true;
       char hLog[128];
       snprintf(hLog, sizeof(hLog),
@@ -3510,6 +3567,7 @@ bool ThreadIsolator::ScanAndIsolate() {
       // 2. スレッド探索フロー
       size_t targetCount = GetRuleSlotCount(rule);
       auto &sampleState = m_samplingStates[pid];
+      bool scannedCyclesInTurn = false;
 
       if (isMultiSlot) {
         // === 複数スロットモード (AppType: 5 Voicemeeter 2スロット):
@@ -3531,6 +3589,7 @@ bool ThreadIsolator::ScanAndIsolate() {
             }
 
             // 10秒間継続スキャン (インターバル休止なしで毎ターン計測・判定)
+            scannedCyclesInTurn = true;
             TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
                                    pid, audioMask, intervalMs, "Scanning...",
                                    identifiedAudioTid, identifiedAudioLabel,
@@ -3576,11 +3635,13 @@ bool ThreadIsolator::ScanAndIsolate() {
           if (rule.appType == 4) {
             // AppType 4 (Roon): 未確定時のみ毎ターン探索
             rule.detectedThreadName = "Searching...";
+            scannedCyclesInTurn = true;
             TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
                                    pid, audioMask, intervalMs, "Searching...",
                                    identifiedAudioTid, identifiedAudioLabel,
                                    stateChanged);
           } else if (rule.searchPhase == 1) {
+            scannedCyclesInTurn = true;
             TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
                                    pid, audioMask, intervalMs, "Searching...",
                                    identifiedAudioTid, identifiedAudioLabel,
@@ -3588,6 +3649,7 @@ bool ThreadIsolator::ScanAndIsolate() {
           } else if (rule.searchPhase == 2) {
             // Standby 10..3
           } else if (rule.searchPhase == 3) {
+            scannedCyclesInTurn = true;
             TryIdentifyAudioThread(rule, sampleState, threadInfos, hProcess,
                                    pid, audioMask, intervalMs, "Standby 2..1",
                                    identifiedAudioTid, identifiedAudioLabel,
@@ -3603,6 +3665,9 @@ bool ThreadIsolator::ScanAndIsolate() {
 
       std::unordered_set<DWORD> audioTidSet;
       std::unordered_set<DWORD> bypassedSlotTidSet;
+      if (rule.appType != 4) {
+        m_confirmedAudioHistory[pid].clear();
+      }
       for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
         DWORD t = rule.activeAudioTids[s];
         if (t == 0)
@@ -3641,24 +3706,106 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
 
       if (!audioTidSet.empty() || !bypassedSlotTidSet.empty()) {
+        std::vector<int> normalCoreList;
+        for (int c = 0; c < 64; ++c) {
+          if ((effectiveNormal & (1ULL << c)) != 0) {
+            normalCoreList.push_back(c);
+          }
+        }
+
+        // 退避対象スレッドに未適用または Ideal CPU 未設定のものがあるか確認
+        bool needRebalanceIdeal = false;
+        std::vector<size_t> evacIndices;
+        for (size_t idx = 0; idx < threadInfos.size(); ++idx) {
+          const auto &ti = threadInfos[idx];
+          if (audioTidSet.count(ti.tid) > 0)
+            continue;
+          if (rule.appType == 4 &&
+              m_confirmedAudioHistory[pid].count(ti.tid) > 0 &&
+              bypassedSlotTidSet.count(ti.tid) == 0)
+            continue;
+          evacIndices.push_back(idx);
+          if (ti.currentAffinity != effectiveNormal ||
+              m_appliedThreads.find(ti.tid) == m_appliedThreads.end() ||
+              m_appliedThreads[ti.tid] != effectiveNormal ||
+              m_appliedIdealCores.find(ti.tid) == m_appliedIdealCores.end()) {
+            needRebalanceIdeal = true;
+          }
+        }
+
+        // Cycles Delta 降順で Ideal CPU をラウンドロビン割り当て (例: 4->5->6->7->4->5...)
+        std::unordered_map<DWORD, int> targetIdealCores;
+        if (!normalCoreList.empty() && !evacIndices.empty()) {
+          if (needRebalanceIdeal) {
+            if (!scannedCyclesInTurn) {
+              for (size_t idx : evacIndices) {
+                const auto &ti = threadInfos[idx];
+                ULONG64 curC = 0;
+                if (QueryThreadCycleTime(ti.hThread, &curC)) {
+                  auto prevIt = sampleState.lastCycles.find(ti.tid);
+                  ULONG64 d = 0;
+                  if (prevIt != sampleState.lastCycles.end() &&
+                      prevIt->second > 0) {
+                    d = (curC >= prevIt->second) ? (curC - prevIt->second) : 0;
+                  }
+                  sampleState.lastCycles[ti.tid] = curC;
+                  sampleState.latestDelta[ti.tid] = d;
+                }
+              }
+            }
+            std::vector<size_t> sortedIndices = evacIndices;
+            std::sort(sortedIndices.begin(), sortedIndices.end(),
+                      [&](size_t a, size_t b) {
+                        DWORD tidA = threadInfos[a].tid;
+                        DWORD tidB = threadInfos[b].tid;
+                        ULONGLONG dA = sampleState.latestDelta[tidA];
+                        ULONGLONG dB = sampleState.latestDelta[tidB];
+                        if (dA != dB)
+                          return dA > dB;
+                        ULONG64 cA = sampleState.lastCycles[tidA];
+                        ULONG64 cB = sampleState.lastCycles[tidB];
+                        if (cA != cB)
+                          return cA > cB;
+                        return tidA < tidB;
+                      });
+            for (size_t rank = 0; rank < sortedIndices.size(); ++rank) {
+              DWORD tid = threadInfos[sortedIndices[rank]].tid;
+              targetIdealCores[tid] =
+                  normalCoreList[rank % normalCoreList.size()];
+            }
+          } else {
+            for (size_t idx : evacIndices) {
+              DWORD tid = threadInfos[idx].tid;
+              targetIdealCores[tid] = m_appliedIdealCores[tid];
+            }
+          }
+        }
+
         // まず非オーディオスレッド (通常スレッド群およびスロットBypass対象スレッド)
         // を通常コア群へ退避し、真の侵入者を物理検出
         for (const auto &ti : threadInfos) {
           if (audioTidSet.count(ti.tid) > 0)
             continue;
 
+          int idealCore = -1;
+          auto idIt = targetIdealCores.find(ti.tid);
+          if (idIt != targetIdealCores.end()) {
+            idealCore = idIt->second;
+          }
+
           // 個別Bypass中のスロット確定スレッド:
           // 優先度は一切変更せず (intruderTids に含めず)、除外マスク (effectiveNormal) を適用
           if (bypassedSlotTidSet.count(ti.tid) > 0) {
             if (EvacuateNormalThreadSettings(ti.hThread, ti.tid,
-                                             effectiveNormal)) {
+                                             effectiveNormal, idealCore)) {
               stateChanged = true;
             }
             continue;
           }
 
-          // 過去にオーディオスレッドとして確定されたスレッドはパージ（通常コア退避・侵入者降格）しない
-          if (m_confirmedAudioHistory[pid].count(ti.tid) > 0)
+          // Roon (AppType: 4) のみ: 過去にオーディオスレッドとして確定されたエフェメラルスレッドはパージしない
+          if (rule.appType == 4 &&
+              m_confirmedAudioHistory[pid].count(ti.tid) > 0)
             continue;
 
           // スキャン時点 (退避前) の物理アフィニティを検査:
@@ -3685,9 +3832,9 @@ bool ThreadIsolator::ScanAndIsolate() {
             }
           }
 
-          // 通常コア群 (effectiveNormal) へ退避
+          // 通常コア群 (effectiveNormal) へ退避・Ideal CPU 分散適用
           if (EvacuateNormalThreadSettings(ti.hThread, ti.tid,
-                                           effectiveNormal)) {
+                                           effectiveNormal, idealCore)) {
             stateChanged = true;
           }
         }

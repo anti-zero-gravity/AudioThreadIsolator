@@ -193,13 +193,17 @@ private:
                                 int audioCore, DWORD_PTR audioMask,
                                 ProcessRule &rule);
 
-  // 通常スレッドへのアフィニティマスク退避適用共通ルーチン (Type 1 & Type 2
+  // 通常スレッドへのアフィニティマスク退避・Ideal Processor 分散適用共通ルーチン (Type 1 & Type 2
   // 共通)
   bool EvacuateNormalThreadSettings(HANDLE hThread, DWORD tid,
-                                    DWORD_PTR normalMask);
+                                    DWORD_PTR normalMask,
+                                    int idealCore = -1);
 
   // キー: TID, 値: 適用済みマスク
   std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;
+  // キー: TID, 値: 適用済み Ideal Processor 番号
+  std::unordered_map<DWORD, int> m_appliedIdealCores;
+  size_t m_idealRoundRobinCounter = 0;
 
   // Chromium モード: アフィニティ適用済み子プロセス PID セット (差分検出用)
   std::unordered_set<DWORD> m_chromiumMaskedPids;
