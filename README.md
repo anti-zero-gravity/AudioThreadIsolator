@@ -33,7 +33,7 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
   - Automatically enables `SeIncreaseBasePriorityPrivilege` and `SeDebugPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
   - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted Hard Affinity masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
 - **Automatic Hard Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
-  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessDefaultCpuSets` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
+  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessAffinityMask` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
   - Processes checked in the leading red `!` column of `Select Process` (`[Add]`) are individually excluded from unlisted polling mask targets (`UnlistedExclusions`).
   - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default full-core affinity across all non-monitored processes.
 
@@ -120,6 +120,11 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
   - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
   - **Renderer PC (Endpoint / Roon Bridge)**: Register `RAATServer.exe` in the ATI instance running on the endpoint machine (registering `RoonBridge.exe` will automatically fall back to `RAATServer.exe`).
   - (*Note: `Roon.exe` handles GUI and `RoonServer.exe` manages system services; neither performs real-time audio streaming.)
+- **Voicemeeter + VBAN Receptor (Network Audio Configuration)**:
+  - Recommended environment when running Voicemeeter on the server PC and VBAN Receptor on the renderer PC with both threads executing at low priority:
+    - **Network Connection**: Direct Ethernet LAN cable connection between Server PC and Renderer PC
+    - **NIC Advanced Properties**: Enable all hardware offloads, disable Flow Control, set Speed & Duplex to "10M FULL"
+    - **ATI Core Allocation**: The recommended number of assigned Audio Cores for Voicemeeter's `VAIO/AUX & DSP` slot is 4 cores or more (e.g. multi-core allocation via hex mask).
 
 ---
 

@@ -33,7 +33,7 @@
   - OS 特権（`SeIncreaseBasePriorityPrivilege` および `SeDebugPrivilege`）を自動有効化し、通常起動では制限される Windows カーネルのリアルタイム優先度クラス（Base Priority 16〜31）が 2D Priority Matrix Picker から選択・即時適用可能（※管理者権限でない場合は High priority にサイレントでフォールバック）。
   - **起動モードによる設定範囲の違い**: 管理者モードではシステムサービスや昇格プロセスへのアクセスが可能になり、Unlisted マスク（強制アフィニティ）を適用できるプロセス数が増えるほか、権限不足によりスレッドを捕捉できずに `sleeping...` へ移行してしまうプロセス（`audiodg.exe` や管理者権限動作のゲーム等）が減少し、コア隔離が可能になります。
 - **監視対象外（Unlisted）プロセスの自動アフィニティ退避と個別除外**:
-  - Global Settings の排他チェックボックス（`Default Audio Core` 除外 / `Excluded` マスク適用）を ON にすると、ATI 未登録の全プロセスへ `SetProcessDefaultCpuSets` を一括適用し、以降に新規起動するプロセスへも `INI×10` 周期で自動追従適用（メイン画面凡例先頭に `● <累計数> Unmonitored Processes Masked` を表示）。
+  - Global Settings の排他チェックボックス（`Default Audio Core` 除外 / `Excluded` マスク適用）を ON にすると、ATI 未登録の全プロセスへ `SetProcessAffinityMask` を一括適用し、以降に新規起動するプロセスへも `INI×10` 周期で自動追従適用（メイン画面凡例先頭に `● <累計数> Unmonitored Processes Masked` を表示）。
   - `[Add]`（`Select Process`）画面の先頭 `!` カラムでチェックしたプロセスは、ポーリングマスク対象から個別に除外可能（`UnlistedExclusions`）。
   - チェックを外すとポーリング適用のみ停止し、緑に点灯した `Unmask All` ボタンから明示的に全プロセスのマスクを一括解除可能。
 
@@ -120,6 +120,11 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
   - **サーバー PC（Roon Server / Core 側）**: 常駐させた ATI に `RoonAppliance.exe` を登録します。
   - **レンダラー PC（Endpoint / Roon Bridge 側）**: 常駐させた ATI に `RAATServer.exe` を登録します（`RoonBridge.exe` を登録した場合は自動で `RAATServer.exe` へフォールバックします）。
   - （※`Roon.exe` は GUI、`RoonServer.exe` は管理サービスのため、音声処理スレッドは保持していません）
+- **Voicemeeter + VBAN Receptor（ネットワーク再生構成）**:
+  - サーバー PC に Voicemeeter、レンダラー PC に VBAN Receptor を登録して両スレッドを低優先度で動作させる場合の推奨環境:
+    - **ネットワーク接続**: サーバー PC とレンダラー PC 間を Ethernet LAN ケーブル直結
+    - **NIC 詳細設定**: 各種オフロードは「有効」、フロー制御は「無効」、デュプレックス（速度と二重方式）は「10M FULL」
+    - **ATI コア割り当て**: Voicemeeter の `VAIO/AUX & DSP` 項目に対する Audio Core 割り当て CPU の推奨数は「4個以上」（例: 16進マスクによる複数コア割り当て）
 
 ---
 

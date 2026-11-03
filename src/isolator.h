@@ -253,9 +253,6 @@ private:
   std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>>
       m_trackedAudioThreads;
 
-  // 過去に確定済みのオーディオスレッド履歴 (パージ・侵入者誤認防止用、キー: PID, 値: TIDセット)
-  std::unordered_map<DWORD, std::unordered_set<DWORD>> m_confirmedAudioHistory;
-
   // スレッドCPU時間サンプリング (キー: PID, 値: (キー: TID, 値:
   // 前回計測の合計CPU時間))
   std::unordered_map<DWORD, std::unordered_map<DWORD, ULONGLONG>>

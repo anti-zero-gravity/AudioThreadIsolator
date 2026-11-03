@@ -3894,7 +3894,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.7");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.8");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -5097,7 +5097,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     UINT uRestoreMsg = RegisterWindowMessageA("ATI_RestoreInstance");
 
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.7");
+    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.8");
+    if (!hExisting)
+      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.7");
     if (!hExisting)
       hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.6");
     if (!hExisting)
