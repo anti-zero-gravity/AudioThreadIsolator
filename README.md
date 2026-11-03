@@ -18,8 +18,8 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
   - Implemented in modern C++17 using pure Win32 API and Common Controls.
   - Zero external dependencies or runtime requirements (no .NET or VC++ runtimes).
   - Single compact binary (~1.15 MB) with negligible memory footprint (~1–2 MB) and near-zero CPU usage.
-- **3-Stage Audio Thread Detection Engine**:
-  - Automatically identifies real-time playback threads across media players, browsers (Chromium / Vivaldi / Chrome), DAWs, and audio editors (iZotope RX, etc.).
+- **Audio Thread Detection Engine**:
+  - Automatically identifies real-time playback threads across media players, browsers (Chromium / Vivaldi / Chrome), DAWs, and audio applications via thread descriptions, module inspection, and application-specific profiles.
 - **Multi-Core Affinity Support**:
   - Assign playback threads to one or multiple dedicated CPU cores (e.g., `#1` or `#1, #2`) to handle heavy real-time audio workloads without dropouts.
 - **Always on Top & Window Resizing**:
@@ -33,7 +33,7 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
   - Automatically enables `SeIncreaseBasePriorityPrivilege` and `SeDebugPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
   - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted Hard Affinity masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
 - **Automatic Hard Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
-  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessDefaultCpuSets` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
+  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessAffinityMask` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
   - Processes checked in the leading red `!` column of `Select Process` (`[Add]`) are individually excluded from unlisted polling mask targets (`UnlistedExclusions`).
   - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default full-core affinity across all non-monitored processes.
 
@@ -41,44 +41,35 @@ By isolating critical audio threads onto dedicated cores and migrating heavy bac
 
 ## How It Works
 
-ATI employs a robust, 3-stage heuristic engine to reliably detect and isolate audio playback threads in both known and unknown applications:
+ATI inspects threads within registered processes using the following detection methods:
 
-### 1. Stage 1: Thread Description Keyword Matching
+### 1. Thread Description Keyword Matching
 - Queries thread descriptions via Windows 10+ native API (`GetThreadDescription`).
 - Matches against known audio keywords and patterns:
   - **Media Players**: `ao/*` (e.g., `ao/wasapi`, `ao/pipewire`).
   - **Chromium Browsers**: `wasapi_render_thread`, `AudioOutputDevice`, `AudioThread`, `CrAudio`.
   - **Generic Keywords**: `audio`, `playback`, `wasapi`, `asio`.
-- Excludes utility/watchdog threads (e.g., `audio.CrUtilityMain`, `watchdog`) to prevent false positives.
 
-### 2. Stage 2: Module Start Address Inspection
-- For specialized audio software (DAWs, VST hosts, editors) that do not set thread descriptions, ATI queries the thread start address (`Win32StartAddress`).
-- Determines whether the thread was spawned by an audio driver module:
-  - ASIO driver DLLs (e.g., `*asiodriver*.dll`, `vbvmaux_asiodriver64.dll`).
-  - Windows Audio Core DLLs (`audioses.dll`, `dmusic.dll`, etc.).
 
-### 3. Stage 3: Call Stack Disassembly Scanning & Enhanced Heuristic Sampling
-For unknown applications, games, or engines without thread descriptions (Godot, Unity, DirectSound, WinMM), ATI combines advanced static and dynamic inspection techniques:
+### 2. Module Inspection (Start Address & Stack Pointers)
+- For specialized audio software (DAWs, VST hosts, editors) that do not set thread descriptions, ATI queries thread start addresses (`Win32StartAddress`) and stack references.
+- Determines whether the thread was spawned by an audio driver or related module:
+  - **ASIO Driver DLLs**: Automatically reads installed ASIO driver paths from the Windows Registry (`HKLM\SOFTWARE\ASIO`, etc.) to match active driver modules.
+  - **Windows Audio Core DLLs**: Matches core audio modules such as `audioses.dll`, `dmusic.dll`, `avrt.dll`, etc.
 
-- **Stack Base Inspection & Call Stack Disassembly Scanning**:
-  - **FMOD / Unity**: Scans memory preceding `StackBase` in the thread TEB to extract embedded plaintext thread descriptions (`FMOD (WASAPI) feeder thread`, etc.).
-  - **Godot Engine & Unnamed WASAPI**: Scans return addresses on the thread call stack to inspect instructions near `[rip + disp32]` relative references, identifying core engine symbols like `"audio_driver_wasapi"` or `"AudioDriverWASAPI"` directly (instantly isolated as Rank 95 on the first turn).
-- **Enhanced 10-Second Heuristics Sampling (Unrestricted Modules / Top-Delta Exclusion)**:
-  - Completely eliminates restrictive module whitelists, scanning all threads including external sound modules (`DSOUND.dll`, `WINMM.dll`, `pxtoneWin32.dll`, etc.).
-  - Samples all threads over a 10-second observation window (20 turns at 500ms intervals) to accumulate delta CPU times.
-  - **Excludes the #1 highest delta thread** (typically the main game logic / rendering loop).
-  - **Evaluates candidates ranking #2 to #10**, verifying audio module signatures and steady polling cycles (10ms–15ms range) to reliably isolate true audio threads.
-- **Priority Throttling for Unmigratable Co-existing Threads (Graphics Drivers, etc.) & Thread Protection**:
-  - After migrating normal threads to the eviction core mask, ATI physically verifies their thread affinities. It detects threads that remain locked to the dedicated audio core due to driver-level design (e.g., NVIDIA graphics driver threads that resist affinity reassignment).
-  - Normal threads (main engine, rendering, input) that successfully migrate retain their original OS/application priority completely untouched (preventing unintended priority degradation).
-  - When such an unmigratable thread co-exists on the dedicated audio core (Half-Isolated), the audio thread is automatically elevated if set to `Idle (-15)` (`-15` ➔ `-2` Lowest), while the co-existing driver thread is throttled to one tier below (`-15`), maintaining audio thread scheduling priority and preventing dropouts.
+### 3. CPU Cycle Delta Sampling
+- When threads cannot be identified by name alone, ATI samples thread CPU cycle consumption (`QueryThreadCycleTime`) over polling intervals to evaluate active playback threads.
 
-### 4. Windows Audio Engine (`audiodg.exe`) Dedicated Detection
-- When the Windows Audio Device Graph Isolation process (`audiodg.exe`, stored with `AppType:0` in `ATI.ini`) is registered for monitoring, ATI bypasses 4KB call stack scanning and `CyclesDelta` thresholds, directly identifying and isolating the thread with the **highest context switch count** (`ContextSwitches` via `NtQuerySystemInformation`). *(Note: Because `audiodg.exe` runs under `LOCAL SERVICE`, ATI must be launched as Administrator to apply affinity and priority settings to it.)*
+### 4. Application-Specific Profiles
+- **Windows Audio Engine (`audiodg.exe`)**:
+  - Because internal threads change dynamically, ATI applies the dedicated audio core mask, process priority class, and HighQoS to the entire process (PID), enforcing designated thread priority across all active TIDs (requires Administrator mode due to `LOCAL SERVICE` privilege).
+- **Chromium Browsers**:
+  - Automatically identifies the dedicated Audio Service utility process and isolates its playback thread.
+- **Voicemeeter**:
+  - Automatically expands and manages both network I/O and main audio engine threads across dedicated rows.
+- **Roon**:
+  - Directly identifies and isolates the core PCM streaming thread in a single slot.
 
-### PID/TID Tracking Mechanism for Previously Detected Sessions
-- Once an audio playback thread (TID) or process (PID) is identified and isolated, ATI caches and maintains the entry within its active tracking table and INI configuration.
-- In addition to enabling near-instant isolation recovery upon subsequent launches, the engine maintains continuous tracking within the active process even after priority modifications (e.g., set to `Idle (-15)`), preventing detection oscillation.
 ---
 
 ## Usage & Recommended Setup
@@ -120,6 +111,11 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
   - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
   - **Renderer PC (Endpoint / Roon Bridge)**: Register `RAATServer.exe` in the ATI instance running on the endpoint machine (registering `RoonBridge.exe` will automatically fall back to `RAATServer.exe`).
   - (*Note: `Roon.exe` handles GUI and `RoonServer.exe` manages system services; neither performs real-time audio streaming.)
+- **Voicemeeter + VBAN Receptor (Network Audio Configuration)**:
+  - Recommended environment when running Voicemeeter on the server PC and VBAN Receptor on the renderer PC with both threads executing at low priority:
+    - **Network Connection**: Direct Ethernet LAN cable connection between Server PC and Renderer PC
+    - **NIC Advanced Properties**: Enable all hardware offloads, disable Flow Control, set Speed & Duplex to "10M FULL"
+    - **ATI Core Allocation**: The recommended number of assigned Audio Cores for Voicemeeter's `VAIO/AUX & DSP` slot is 4 cores or more (e.g. multi-core allocation via hex mask).
 
 ---
 

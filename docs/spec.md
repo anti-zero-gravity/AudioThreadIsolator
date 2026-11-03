@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v1.0.7 - Specification & User Manual (spec.md)
+# Audio Thread Isolator (ATI) v1.0.8 - Specification & User Manual (spec.md)
 
 ## 1. Application Overview
 
@@ -7,7 +7,7 @@
 - **Purpose**:
   Automatically identifies the audio playback thread from running audio and multimedia processes, isolating it onto designated audio CPU core(s) while evicting all other non-audio threads to separate excluded cores. By preventing high-load threads from sharing cores with audio threads, the waiting time between a thread being queued in the ready queue and actually being executed is eliminated, minimizing micro-jitter in thread processing timing.
 - **Automatic HighQoS (Power Throttling OFF) Enforcement**:
-  For all processes registered for monitoring, ATI automatically disables Windows Power Throttling (EcoQoS) upon detection, enforcing HighQoS (maximum execution speed and timer resolution preservation). This ensures all threads run at full clock speed without power-saving latency or audio dropouts.
+  For all processes registered for monitoring, ATI automatically disables Windows Power Throttling (EcoQoS / Efficiency Mode) upon detection, enforcing HighQoS. This removes Windows' artificial execution speed capping and timer coalescing (15.625ms relaxation), preserving high-resolution timers (1ms) and ensuring normal dynamic frequency scaling according to workload demand to prevent audio dropouts and latency.
 
 ---
 
@@ -32,7 +32,7 @@
 | 1 | **`Process Name`** | Application executable name without `.exe`.<br>When multi-row expansion is active for Voicemeeter (`AppType: 5`), displays each thread's role label and draws an L-shaped tree line (`└`) on child rows. For Roon (`AppType: 4`), displays the original process name (`RoonAppliance` / `RAATServer`) as a single row. | Double-click to open edit dialog.<br>Click header to sort ascending ("SORT?" prompt). |
 | 2 | **`Thread Priority`** | Thread priority level and effective Base Priority (e.g., `Below 9`, `Time Critical 15`, or `Below FG 8 - BG 6` when Process Priority is `Normal` with Foreground/Background variation).<br>When multi-thread expansion is active, each row can independently select priority via the 2D Priority Matrix Picker. | Click cell to select via 2D Priority Matrix Picker |
 | 3 | **`Process Priority`** | Priority class applied to the process (PID) hosting the audio thread (e.g., `Normal`, `Above Normal`, `High`). Automatically reads and displays the live process priority upon registration. | Click cell to select via 2D Priority Matrix Picker |
-| 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the genuine playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>For `audiodg.exe`, suspends and resumes the entire process (all threads) at once.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
+| 4 | **`❚❚`** | Verification pause feature. Suspends the target audio thread to stop audio, confirming if it is the actual playback thread.<br>When multi-thread expansion is active, each row (TID) can be suspended independently.<br>For `audiodg.exe`, suspends and resumes the entire process (all threads) at once.<br>**(WARNING: Strictly prohibited to use as mute due to risk of app deadlocks)** | Click to toggle suspension |
 | 5 | **`Audio Core PID/TID`** | Displays detection state, isolated PID, and TID. | Click operation: Restarts search when sleeping; toggles Bypass when running. |
 | 6 | **`TIDs`** | Monitored thread count. Shows `1` for standard confirmed apps, total process thread count during search or for Chromium / `audiodg.exe`, and `0` when sleeping. | Double-click to open edit dialog. |
 | 7 | **`Chgs`** | Count of times audio thread was detected and priorities were applied. | Double-click to open edit dialog. |
@@ -181,7 +181,7 @@ Saved per registered process under the executable name as key, with comma-separa
 ## 5. Limitations & Notes
 
 1. **Usage of Pause (`❚❚`) Feature**:
-   - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the genuine playback thread. Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
+   - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the actual playback thread. Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
 2. **Behavior on Temporary Bypass (`!` / Bypass)**:
    - Entering Bypass stops ATI monitoring and active affinity adjustments for that process. Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling (as an exception, `audiodg.exe` automatically restores to standard settings upon Bypass, rule removal, or application exit).
 3. **Single-Instance Enforcement & Self-Protection**:
@@ -198,3 +198,27 @@ Saved per registered process under the executable name as key, with comma-separa
    - **Antimalware**: `MsMpEng.exe` (Microsoft Defender), `NisSrv.exe`
    - **Graphics, Font, & Driver Isolation Hosts**: `dwm.exe`, `fontdrvhost.exe`, `WUDFHost.exe`
    - **Protected System `svchost.exe` Instances**: Protected instances hosting security/system events (e.g., RPCSS, DcomLaunch, BrokerInfrastructure)
+6. **Normal Thread Ideal CPU Auto-Distribution Scope & Triggers**:
+   When multiple cores are assigned to `NormalCores`, normal threads maintain their multi-core affinity mask while their Ideal CPU (preferred core) is distributed in round-robin order sorted by `Cycles Delta` descending.
+   - **Difference between Affinity Mask and Ideal CPU**:
+     - **Affinity Mask (Hard Constraint)**: The set of CPU cores on which the thread is permitted to run. The thread cannot execute outside these cores.
+     - **Ideal CPU (Scheduling Hint)**: The preferred single core among the permitted cores where the OS scheduler prioritizes running the thread.
+   - **Distribution Example**:
+     If cores `#0` to `#3` (4 cores) are assigned to `NormalCores`, all normal threads share the affinity mask for `#0` to `#3`, while Ideal CPUs are sequentially assigned starting from the thread with the highest CPU load: `#0 -> #1 -> #2 -> #3 -> #0 -> #1...`. This prevents heavy background threads from clustering onto a single core.
+   - **Applicable Targets**: Registered processes possessing standard normal-thread eviction logic, including Standard Audio (`AppType: 1`), High-load DAWs (`AppType: 3`), Roon (`AppType: 4`), and Voicemeeter (`AppType: 5`).
+   - **Excluded Targets**:
+     - **`audiodg.exe` (`AppType: 0`)**: Excluded because all threads in the process are isolated onto the dedicated audio core mask.
+     - **Chromium Browsers (`AppType: 2`)**: Excluded from bulk sorting due to its dedicated isolation path; newly spawned threads are simply assigned to available normal cores sequentially.
+     - **Unlisted Processes**: Only process-level affinity masks are applied; per-thread Ideal CPU scheduling is not performed.
+   - **Rebalance Triggers**:
+     To avoid CPU cache invalidation penalties, each thread's Ideal CPU is kept stable during steady states. Re-sorting and redistribution only occur when newly spawned threads are detected, when the active audio thread changes or is confirmed, or when rules/configurations are modified by the user (thread termination alone does not trigger rebalance).
+7. **Nature of Periodically Spawned Background Processes and the Importance of Eviction**:
+   The `Unmonitored Processes Masked` counter on the main window gradually increases over time even while the PC is idle. This occurs because Windows and background utilities routinely spawn short-lived processes.
+   - **Identity and Purpose of Spawned Processes**:
+     - **Windows Maintenance & Diagnostic Tasks**: Programs like `CompatTelRunner.exe` (compatibility telemetry), `DeviceCensus.exe` (hardware inventory), and `taskhostw.exe` (Task Scheduler worker) briefly execute for OS self-diagnostics and servicing.
+     - **Automatic Updaters**: Updaters such as `GoogleUpdate.exe`, `MicrosoftEdgeUpdate.exe`, and `MpCmdRun.exe` (Defender signatures) periodically start to check for security updates and patches.
+     - **Tool and Subsystem Helpers**: Helper processes like `conhost.exe` and ephemeral worker tasks spawned during command execution or IDE background operations.
+   - **Why Eviction is Essential**:
+     Under default Windows behavior, any newly spawned process is granted permission to execute across all CPU cores, including dedicated audio cores. If left unchecked, unexpected bursts of telemetry or maintenance tasks will consume cycles on audio cores, causing jitter and buffer underruns. ATI detects these and immediately evicts them to normal cores.
+   - **Soft Eviction (Glitch-Free Protection)**:
+     To prevent process eviction from interfering with time-critical audio playback, ATI implements pre-flight affinity verification (skipping redundant API calls on child processes that have already inherited the mask) combined with temporal rate-limiting across turns.
