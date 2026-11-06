@@ -2447,6 +2447,8 @@ bool ThreadIsolator::ScanAndIsolate() {
           m_samplingStates.erase(rule.activePid);
           m_audioDgAppliedTids.erase(rule.activePid);
           m_audioDgLastPrio.erase(rule.activePid);
+          m_cachedProcessTids.erase(rule.activePid);
+          m_lastProcessThreadCount.erase(rule.activePid);
         }
         rule.isRunning = false;
         rule.activePid = 0;
@@ -2499,6 +2501,8 @@ bool ThreadIsolator::ScanAndIsolate() {
         m_samplingStates.erase(pid);
         m_audioDgAppliedTids.erase(pid);
         m_audioDgLastPrio.erase(pid);
+        m_cachedProcessTids.erase(pid);
+        m_lastProcessThreadCount.erase(pid);
       }
       continue;
     }
@@ -3467,38 +3471,108 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      // 1. 各スレッドの基本情報を収集 & 検出済みPID/TIDトラッキングを判定
+      bool isMultiSlot = IsMultiSlotRule(rule);
+      size_t targetCount = GetRuleSlotCount(rule);
+
+      // スレッド増減・構成変化の判定
+      std::vector<DWORD> currentTids;
+      currentTids.reserve(ptIt->second.size());
       for (const auto &te : ptIt->second) {
-        totalThreadCount++;
-        aliveTids.insert(te.th32ThreadID);
+        currentTids.push_back(te.th32ThreadID);
+      }
 
-        HANDLE hThread =
-            OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
-                       te.th32ThreadID);
-        if (!hThread)
-          continue;
+      bool threadsChanged = true;
+      auto cntIt = m_lastProcessThreadCount.find(pid);
+      auto cacheIt = m_cachedProcessTids.find(pid);
+      if (cntIt != m_lastProcessThreadCount.end() &&
+          cntIt->second == static_cast<int>(currentTids.size()) &&
+          cacheIt != m_cachedProcessTids.end() &&
+          cacheIt->second == currentTids) {
+        threadsChanged = false;
+      }
 
-        int priority = GetThreadPriority(hThread);
-        DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
+      // オーディオ確定スロットがすべて現在の生存スレッドに含まれているか判定
+      bool allSlotsReady = false;
+      if (rule.isAudioIsolated) {
+        std::unordered_set<DWORD> curTidSet(currentTids.begin(), currentTids.end());
+        if (isMultiSlot) {
+          size_t satisfied = 0;
+          for (size_t s = 0; s < targetCount; ++s) {
+            bool bypassed = (s < rule.slotBypassed.size() && rule.slotBypassed[s]);
+            bool hasAliveTid = (s < rule.activeAudioTids.size() &&
+                                rule.activeAudioTids[s] != 0 &&
+                                curTidSet.count(rule.activeAudioTids[s]) > 0);
+            if (bypassed || hasAliveTid) satisfied++;
+          }
+          allSlotsReady = (satisfied >= targetCount);
+        } else {
+          allSlotsReady = (rule.activeAudioTid != 0 &&
+                           curTidSet.count(rule.activeAudioTid) > 0);
+        }
+      }
 
-        threadInfos.push_back(
-            {te.th32ThreadID, te.tpBasePri, priority, "", hThread, currentAff});
+      bool canSkipNormalThreads = (!threadsChanged && allSlotsReady);
 
-        // (A) 検出済みPID/TIDトラッキングチェック
-        auto trackPidIt = m_trackedAudioThreads.find(pid);
-        if (trackPidIt != m_trackedAudioThreads.end()) {
-          auto tIt = trackPidIt->second.find(te.th32ThreadID);
-          if (tIt != trackPidIt->second.end()) {
-            if (identifiedAudioTid == 0) {
-              identifiedAudioTid = te.th32ThreadID;
-              identifiedAudioLabel = tIt->second;
+      // 1. スレッド情報収集 (定常時は通常スレッドの走査をスキップし、確定オーディオスレッドのみ最小限維持)
+      if (canSkipNormalThreads) {
+        totalThreadCount += static_cast<int>(currentTids.size());
+        for (DWORD t : currentTids) {
+          aliveTids.insert(t);
+        }
+
+        std::unordered_set<DWORD> audioTargetTids;
+        for (DWORD at : rule.activeAudioTids) {
+          if (at != 0 && aliveTids.count(at) > 0) {
+            audioTargetTids.insert(at);
+          }
+        }
+        if (audioTargetTids.empty() && identifiedAudioTid != 0 &&
+            aliveTids.count(identifiedAudioTid) > 0) {
+          audioTargetTids.insert(identifiedAudioTid);
+        }
+
+        for (DWORD at : audioTargetTids) {
+          HANDLE hThread =
+              OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                         FALSE, at);
+          if (hThread) {
+            int priority = GetThreadPriority(hThread);
+            DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
+            threadInfos.push_back({at, 0, priority, "", hThread, currentAff});
+          }
+        }
+      } else {
+        for (const auto &te : ptIt->second) {
+          totalThreadCount++;
+          aliveTids.insert(te.th32ThreadID);
+
+          HANDLE hThread =
+              OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                         FALSE, te.th32ThreadID);
+          if (!hThread)
+            continue;
+
+          int priority = GetThreadPriority(hThread);
+          DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
+
+          threadInfos.push_back(
+              {te.th32ThreadID, te.tpBasePri, priority, "", hThread, currentAff});
+
+          // (A) 検出済みPID/TIDトラッキングチェック
+          auto trackPidIt = m_trackedAudioThreads.find(pid);
+          if (trackPidIt != m_trackedAudioThreads.end()) {
+            auto tIt = trackPidIt->second.find(te.th32ThreadID);
+            if (tIt != trackPidIt->second.end()) {
+              if (identifiedAudioTid == 0) {
+                identifiedAudioTid = te.th32ThreadID;
+                identifiedAudioLabel = tIt->second;
+              }
             }
           }
         }
       }
 
       // 消滅したTIDを activeAudioTids / suspendedAudioTids から即座に除去
-      bool isMultiSlot = IsMultiSlotRule(rule);
       if (isMultiSlot) {
         bool anyAlive = false;
         for (DWORD &at : rule.activeAudioTids) {
@@ -3581,7 +3655,6 @@ bool ThreadIsolator::ScanAndIsolate() {
       };
 
       // 2. スレッド探索フロー
-      size_t targetCount = GetRuleSlotCount(rule);
       auto &sampleState = m_samplingStates[pid];
       bool scannedCyclesInTurn = false;
 
@@ -4015,6 +4088,11 @@ bool ThreadIsolator::ScanAndIsolate() {
             ++itCpu;
           }
         }
+      }
+
+      if (!canSkipNormalThreads) {
+        m_lastProcessThreadCount[pid] = static_cast<int>(currentTids.size());
+        m_cachedProcessTids[pid] = currentTids;
       }
 
       CloseHandle(hProcess);
