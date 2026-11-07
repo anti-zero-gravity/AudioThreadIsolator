@@ -2,6 +2,7 @@
 #undef _UNICODE
 
 #include "isolator.h"
+#include "priority_matrix_data.h"
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -111,6 +112,11 @@ typedef NTSTATUS(NTAPI *pfnNtQueryInformationThread)(
     ULONG ThreadInformationLength, PULONG ReturnLength);
 static pfnNtQueryInformationThread s_pfnNtQueryInformationThread = nullptr;
 
+typedef NTSTATUS(NTAPI *pfnNtSetInformationThread)(
+    HANDLE ThreadHandle, ULONG ThreadInformationClass, PVOID ThreadInformation,
+    ULONG ThreadInformationLength);
+static pfnNtSetInformationThread s_pfnNtSetInformationThread = nullptr;
+
 typedef NTSTATUS(NTAPI *pfnNtGetNextThread)(HANDLE ProcessHandle,
                                             HANDLE ThreadHandle,
                                             ACCESS_MASK DesiredAccess,
@@ -219,6 +225,11 @@ static void EnsureNtLoaded() {
           reinterpret_cast<pfnNtQueryInformationThread>(
               GetProcAddress(hNtdll, "NtQueryInformationThread"));
     }
+    if (!s_pfnNtSetInformationThread) {
+      s_pfnNtSetInformationThread =
+          reinterpret_cast<pfnNtSetInformationThread>(
+              GetProcAddress(hNtdll, "NtSetInformationThread"));
+    }
     if (!s_pfnNtGetNextThread) {
       s_pfnNtGetNextThread = reinterpret_cast<pfnNtGetNextThread>(
           GetProcAddress(hNtdll, "NtGetNextThread"));
@@ -301,21 +312,6 @@ static std::unordered_map<DWORD, ULONG> QueryProcessThreadsContextSwitches(
   return result;
 }
 
-static void *QueryThreadStartAddress(HANDLE hThread) {
-  EnsureNtLoaded();
-  if (!s_pfnNtQueryInformationThread)
-    return nullptr;
-
-  void *startAddr = nullptr;
-  ULONG retLen = 0;
-  NTSTATUS status = s_pfnNtQueryInformationThread(
-      hThread, 9 /* ThreadQuerySetWin32StartAddress */, &startAddr,
-      sizeof(startAddr), &retLen);
-  if (status == 0)
-    return startAddr;
-  return nullptr;
-}
-
 struct THREAD_BASIC_INFO_RAW {
   NTSTATUS ExitStatus;
   PVOID TebBaseAddress;
@@ -341,6 +337,35 @@ static DWORD_PTR QueryThreadAffinityMask(HANDLE hThread) {
   return 0;
 }
 
+static int QueryThreadDynamicPriority(HANDLE hThread) {
+  EnsureNtLoaded();
+  if (!s_pfnNtQueryInformationThread)
+    return 0;
+
+  THREAD_BASIC_INFO_RAW tbi = {0};
+  ULONG retLen = 0;
+  NTSTATUS status = s_pfnNtQueryInformationThread(
+      hThread, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), &retLen);
+  if (status == 0 && tbi.Priority > 0) {
+    return static_cast<int>(tbi.Priority);
+  }
+  return 0;
+}
+
+static bool ApplyAbsoluteThreadPriority(HANDLE hThread, int absPrio) {
+  EnsureNtLoaded();
+  if (!s_pfnNtSetInformationThread || absPrio < 1 || absPrio > 31)
+    return false;
+  LONG kprio = static_cast<LONG>(absPrio);
+  if (absPrio < 16) {
+    s_pfnNtSetInformationThread(hThread, 25 /* ThreadActualBasePriority */,
+                                &kprio, sizeof(kprio));
+  }
+  NTSTATUS st = s_pfnNtSetInformationThread(
+      hThread, 2 /* ThreadPriority */, &kprio, sizeof(kprio));
+  return (st == 0);
+}
+
 static PVOID QueryThreadTebBaseAddress(HANDLE hThread) {
   EnsureNtLoaded();
   if (!s_pfnNtQueryInformationThread)
@@ -354,83 +379,6 @@ static PVOID QueryThreadTebBaseAddress(HANDLE hThread) {
     return tbi.TebBaseAddress;
   }
   return nullptr;
-}
-
-static std::string QueryFmodOrUnityThreadName(HANDLE hProcess, HANDLE hThread) {
-  EnsureNtLoaded();
-  if (!s_pfnNtQueryInformationThread)
-    return "";
-
-  THREAD_BASIC_INFO_RAW tbi = {0};
-  ULONG retLen = 0;
-  NTSTATUS status = s_pfnNtQueryInformationThread(
-      hThread, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), &retLen);
-  if (status != 0 || !tbi.TebBaseAddress) {
-    return "";
-  }
-
-  // 64bit Windows: TEB + 0x08 is StackBase
-  DWORD_PTR stackBase = 0;
-  SIZE_T bytesRead = 0;
-  if (!ReadProcessMemory(
-          hProcess,
-          reinterpret_cast<LPCVOID>(
-              reinterpret_cast<uintptr_t>(tbi.TebBaseAddress) + 8),
-          &stackBase, sizeof(stackBase), &bytesRead) ||
-      bytesRead != sizeof(stackBase)) {
-    return "";
-  }
-  if (stackBase < 0x10000)
-    return "";
-
-  // Read 512 bytes near bottom of stack: [stackBase - 0x200, stackBase)
-  const DWORD scanSize = 0x200;
-  BYTE stackBuf[scanSize] = {0};
-  LPCVOID scanAddr = reinterpret_cast<LPCVOID>(stackBase - scanSize);
-  if (!ReadProcessMemory(hProcess, scanAddr, stackBuf, scanSize, &bytesRead) ||
-      bytesRead < 64) {
-    return "";
-  }
-
-  size_t u64Count = bytesRead / sizeof(DWORD_PTR);
-  const DWORD_PTR *ptrs = reinterpret_cast<const DWORD_PTR *>(stackBuf);
-
-  for (size_t i = 0; i < u64Count; ++i) {
-    DWORD_PTR p = ptrs[i];
-    if (p < 0x10000 || p > 0x7FFFFFFFFFFFULL)
-      continue;
-
-    char objBuf[64] = {0};
-    if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(p), objBuf,
-                          sizeof(objBuf), &bytesRead) &&
-        bytesRead >= 16) {
-      for (size_t off = 0; off + 4 <= sizeof(objBuf); ++off) {
-        if (memcmp(&objBuf[off], "FMOD", 4) == 0) {
-          const char *strStart = &objBuf[off];
-          size_t len = strnlen(strStart, sizeof(objBuf) - off);
-          return std::string(strStart, len);
-        }
-      }
-
-      const DWORD_PTR *objPtrs = reinterpret_cast<const DWORD_PTR *>(objBuf);
-      DWORD_PTR argPtr = objPtrs[1];
-      if (argPtr >= 0x10000 && argPtr <= 0x7FFFFFFFFFFFULL) {
-        char argBuf[64] = {0};
-        if (ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(argPtr),
-                              argBuf, sizeof(argBuf), &bytesRead) &&
-            bytesRead >= 16) {
-          for (size_t off = 0; off + 4 <= sizeof(argBuf); ++off) {
-            if (memcmp(&argBuf[off], "FMOD", 4) == 0) {
-              const char *strStart = &argBuf[off];
-              size_t len = strnlen(strStart, sizeof(argBuf) - off);
-              return std::string(strStart, len);
-            }
-          }
-        }
-      }
-    }
-  }
-  return "";
 }
 
 typedef DWORD(WINAPI *pfnGetMappedFileNameA)(HANDLE, LPVOID, LPSTR, DWORD);
@@ -894,18 +842,26 @@ void ThreadIsolator::Initialize(const GlobalConfig &config) {
   m_chromiumAudioStates.clear();
   m_chromiumEvictedPids.clear();
   m_nonChromiumMaskedPids.clear();
+  m_highQosAppliedPids.clear();
   m_audioDgAppliedTids.clear();
   m_audioDgLastPrio.clear();
+  m_cachedProcessTids.clear();
+  m_lastProcessThreadCount.clear();
 }
 
 void ThreadIsolator::UpdateConfig(const GlobalConfig &config) {
   std::lock_guard<std::mutex> lock(m_mutex);
   m_config = config;
+  for (auto &r : m_config.rules) {
+    WakeUpSteadyRule(r, 2);
+  }
   m_appliedThreads.clear();
   m_appliedIdealCores.clear();
   m_prevThreadCpuTimes.clear();
   m_samplingStates.clear();
   m_nonChromiumMaskedPids.clear();
+  m_cachedProcessTids.clear();
+  m_lastProcessThreadCount.clear();
   // 注意: 設定更新（優先度変更やコア変更等）時に Chromium
   // の追従情報や確定状態を破棄してはならない
   // 破棄すると定常確定スレッドが見失われ、長時間のサンプリングに逆戻りしてしまうため維持する
@@ -920,12 +876,15 @@ void ThreadIsolator::AddRule(const ProcessRule &rule) {
   std::lock_guard<std::mutex> lock(m_mutex);
   ProcessRule norm = rule;
   NormalizeSpecialRule(norm);
+  WakeUpSteadyRule(norm, 2);
   m_config.rules.push_back(norm);
   if (m_config.unlistedMaskMode != 0 || m_hasUnlistedMaskInOs) {
     RestoreAffinityForProcessNamesLocked({ToLowerA(norm.processName)});
   }
   m_appliedThreads.clear();
   m_appliedIdealCores.clear();
+  m_cachedProcessTids.clear();
+  m_lastProcessThreadCount.clear();
 }
 
 void ThreadIsolator::RemoveRule(size_t index) {
@@ -936,6 +895,14 @@ void ThreadIsolator::RemoveRule(size_t index) {
     if (IsAudioDgProcess(rule.processName)) {
       RestoreAudioDgProcessLocked(rule.activePid);
     }
+    if (rule.activePid != 0) {
+      m_cachedProcessTids.erase(rule.activePid);
+      m_lastProcessThreadCount.erase(rule.activePid);
+      m_highQosAppliedPids.erase(rule.activePid);
+    }
+    if (rule.audioServicePid != 0) {
+      m_highQosAppliedPids.erase(rule.audioServicePid);
+    }
     m_config.rules.erase(m_config.rules.begin() + index);
   }
 }
@@ -943,13 +910,109 @@ void ThreadIsolator::RemoveRule(size_t index) {
 void ThreadIsolator::UpdateRule(size_t index, const ProcessRule &rule) {
   std::lock_guard<std::mutex> lock(m_mutex);
   if (index < m_config.rules.size()) {
+    ProcessRule oldRule = m_config.rules[index];
     ProcessRule norm = rule;
     NormalizeSpecialRule(norm);
+
+    DWORD targetPid =
+        (norm.audioServicePid != 0) ? norm.audioServicePid : norm.activePid;
+
+    bool affinityConfigChanged =
+        (oldRule.audioCore != norm.audioCore ||
+         oldRule.audioAffinityMask != norm.audioAffinityMask ||
+         oldRule.normalAffinityMask != norm.normalAffinityMask ||
+         oldRule.audioCores != norm.audioCores ||
+         oldRule.audioSlotMasks != norm.audioSlotMasks ||
+         oldRule.isBypassed != norm.isBypassed ||
+         oldRule.slotBypassed != norm.slotBypassed);
+
+    bool procPrioChanged =
+        norm.processPriorityModified &&
+        (!oldRule.processPriorityModified ||
+         oldRule.processPriorityClass != norm.processPriorityClass);
+
+    if (procPrioChanged) {
+      if (targetPid != 0) {
+        HANDLE hProc = OpenProcess(
+            PROCESS_SET_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION, FALSE,
+            targetPid);
+        if (hProc) {
+          bool setOk = (SetPriorityClass(hProc, norm.processPriorityClass) != 0);
+          if (!setOk && norm.processPriorityClass == REALTIME_PRIORITY_CLASS) {
+            setOk = (SetPriorityClass(hProc, HIGH_PRIORITY_CLASS) != 0);
+          }
+          DWORD actualCls = GetPriorityClass(hProc);
+          if (actualCls != 0) {
+            norm.actualProcessPriorityClass = actualCls;
+          }
+          CloseHandle(hProc);
+
+          // Col 3 変更直後: Fixed 指定スロットには無条件で NtSetInformationThread を再適用
+          if (IsAudioDgProcess(norm.processName)) {
+            int p0 = (!norm.audioPriorities.empty()) ? norm.audioPriorities[0]
+                                                     : norm.audioPriority;
+            if (IsFixedThreadPriority(p0)) {
+              int absPrio = DecodeFixedThreadPriority(p0);
+              auto itDg = m_audioDgAppliedTids.find(targetPid);
+              if (itDg != m_audioDgAppliedTids.end()) {
+                for (DWORD tid : itDg->second) {
+                  HANDLE hTh = OpenThread(
+                      THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+                      tid);
+                  if (hTh) {
+                    ApplyAbsoluteThreadPriority(hTh, absPrio);
+                    CloseHandle(hTh);
+                  }
+                }
+              }
+            }
+          } else {
+            for (size_t s = 0; s < norm.activeAudioTids.size(); ++s) {
+              DWORD aTid = norm.activeAudioTids[s];
+              if (aTid == 0)
+                continue;
+              int sPrio = (s < norm.audioPriorities.size())
+                              ? norm.audioPriorities[s]
+                              : norm.audioPriority;
+              if (IsFixedThreadPriority(sPrio)) {
+                HANDLE hTh = OpenThread(
+                    THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE,
+                    aTid);
+                if (hTh) {
+                  ApplyAbsoluteThreadPriority(
+                      hTh, DecodeFixedThreadPriority(sPrio));
+                  CloseHandle(hTh);
+                }
+              }
+            }
+          }
+        }
+      }
+      ResetDynamicPriorityFetch(norm, -1);
+    } else if (oldRule.processPriorityModified !=
+                   norm.processPriorityModified ||
+               oldRule.audioPriority != norm.audioPriority ||
+               oldRule.audioPriorities != norm.audioPriorities ||
+               oldRule.normalPrioForceApplied !=
+                   norm.normalPrioForceApplied ||
+               oldRule.resetPriorityToZeroRequested !=
+                   norm.resetPriorityToZeroRequested) {
+      ResetDynamicPriorityFetch(norm, -1);
+    }
+
+    WakeUpSteadyRule(norm, 2);
     m_config.rules[index] = norm;
-    m_appliedThreads.clear();
-    m_appliedIdealCores.clear();
-    m_prevThreadCpuTimes.clear();
-    m_nonChromiumMaskedPids.clear();
+    if (oldRule.isBypassed && !norm.isBypassed && targetPid != 0) {
+      m_highQosAppliedPids.erase(targetPid);
+    }
+    if (affinityConfigChanged) {
+      m_appliedThreads.clear();
+      m_appliedIdealCores.clear();
+      m_prevThreadCpuTimes.clear();
+      m_nonChromiumMaskedPids.clear();
+      m_cachedProcessTids.clear();
+      m_lastProcessThreadCount.clear();
+    }
   }
 }
 
@@ -966,19 +1029,6 @@ void ThreadIsolator::SortRulesByName() {
             });
 }
 
-void ThreadIsolator::ToggleProcessHeuristics(size_t index) {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  if (index < m_config.rules.size()) {
-    m_config.rules[index].enableHeuristics =
-        !m_config.rules[index].enableHeuristics;
-    if (!m_config.rules[index].enableHeuristics) {
-      if (!m_config.rules[index].isAudioIsolated) {
-        m_config.rules[index].detectedThreadName = "Standby";
-      }
-    }
-  }
-}
-
 void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
   std::lock_guard<std::mutex> lock(m_mutex);
   if (index < m_config.rules.size()) {
@@ -990,8 +1040,21 @@ void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
       }
       if (slot < slotCount) {
         rule.slotBypassed[slot] = !rule.slotBypassed[slot];
+        if (slot < rule.normalPrioForceApplied.size()) {
+          rule.normalPrioForceApplied[slot] = false;
+        }
+        if (slot < rule.actualAudioBasePriorities.size()) {
+          rule.actualAudioBasePriorities[slot] = 0;
+        }
+        if (slot < rule.actualThreadRelativePrios.size()) {
+          rule.actualThreadRelativePrios[slot] = 0;
+        }
+        ResetDynamicPriorityFetch(rule, static_cast<int>(slot));
+        WakeUpSteadyRule(rule, 2);
         m_appliedThreads.clear();
         m_appliedIdealCores.clear();
+        m_cachedProcessTids.clear();
+        m_lastProcessThreadCount.clear();
         if (rule.slotBypassed[slot]) {
           if (slot < rule.activeAudioTids.size() &&
               rule.activeAudioTids[slot] != 0) {
@@ -1028,6 +1091,22 @@ void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
     }
 
     rule.isBypassed = !rule.isBypassed;
+    rule.processPriorityModified = false;
+    WakeUpSteadyRule(rule, 2);
+    m_appliedThreads.clear();
+    m_appliedIdealCores.clear();
+    m_cachedProcessTids.clear();
+    m_lastProcessThreadCount.clear();
+    for (size_t s = 0; s < rule.normalPrioForceApplied.size(); ++s) {
+      rule.normalPrioForceApplied[s] = false;
+    }
+    for (size_t s = 0; s < rule.actualAudioBasePriorities.size(); ++s) {
+      rule.actualAudioBasePriorities[s] = 0;
+    }
+    for (size_t s = 0; s < rule.actualThreadRelativePrios.size(); ++s) {
+      rule.actualThreadRelativePrios[s] = 0;
+    }
+    ResetDynamicPriorityFetch(rule, -1);
     if (rule.audioServicePid != 0) {
       ClearChromiumTrackingState(rule.audioServicePid);
       rule.audioServicePid = 0;
@@ -1035,6 +1114,7 @@ void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
     if (rule.activePid != 0) {
       m_chromiumMaskedPids.erase(rule.activePid);
       m_chromiumScannedPids.erase(rule.activePid);
+      m_highQosAppliedPids.erase(rule.activePid);
     }
     rule.chromiumScanAttempted = false;
     rule.wasHalfAutoPromoted = false;
@@ -1045,6 +1125,8 @@ void ThreadIsolator::ToggleProcessBypass(size_t index, size_t slot) {
       }
       rule.isAudioIsolated = false;
       rule.hasIntruderThreads = false;
+      rule.steadyWaitTurns = 0;
+      rule.postIsolationGraceTurns = 0;
       rule.activeAudioTid = 0;
       rule.activeAudioTids.clear();
       rule.detectedThreadName = "Bypassed";
@@ -1089,6 +1171,8 @@ void ThreadIsolator::RestartSearch(size_t index) {
   rule.multiSearchTurns = 10 * turnsPerSec;
   rule.multiSearchSleeping = false;
   rule.lastIdentifiedCount = 0;
+  rule.steadyWaitTurns = 0;
+  rule.postIsolationGraceTurns = 0;
   if (rule.audioServicePid != 0) {
     rule.detectedThreadName =
         "PID " + std::to_string(rule.audioServicePid) + " / Searching...";
@@ -1097,6 +1181,7 @@ void ThreadIsolator::RestartSearch(size_t index) {
     rule.detectedThreadName = "Searching...";
   }
   rule.isAudioIsolated = false;
+  rule.hasIntruderThreads = false;
   rule.activeAudioTid = 0;
   rule.activeAudioTids.clear();
   rule.chromiumScanAttempted = false;
@@ -1108,6 +1193,8 @@ void ThreadIsolator::RestartSearch(size_t index) {
   m_trackedAudioThreads.erase(rule.activePid);
   m_audioDgAppliedTids.erase(rule.activePid);
   m_audioDgLastPrio.erase(rule.activePid);
+  m_cachedProcessTids.erase(rule.activePid);
+  m_lastProcessThreadCount.erase(rule.activePid);
 }
 
 void ThreadIsolator::ResumeMultiSearch(size_t index) {
@@ -1121,6 +1208,7 @@ void ThreadIsolator::ResumeMultiSearch(size_t index) {
     turnsPerSec = 1;
   rule.multiSearchSleeping = false;
   rule.multiSearchTurns = 10 * turnsPerSec;
+  WakeUpSteadyRule(rule, 2);
 }
 
 bool ThreadIsolator::CheckAndClearInitialNeedSave() {
@@ -1418,6 +1506,7 @@ void ThreadIsolator::ClearChromiumTrackingState(DWORD pid) {
   m_chromiumThreadTracks.erase(pid);
   m_chromiumAudioStates.erase(pid);
   m_chromiumScannedPids.erase(pid);
+  m_highQosAppliedPids.erase(pid);
 }
 
 // audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF /
@@ -1588,6 +1677,93 @@ void ThreadIsolator::LogRuleStateChange(const ProcessRule &rule) {
   LogDebug(rLog);
 }
 
+// 定常状態 (AppType 0, 2 以外) の 3 秒周期監視ゲート判定
+bool ThreadIsolator::IsRuleInSteadyState(const ProcessRule &rule) const {
+  if (rule.appType == 0 || rule.appType == 2)
+    return false;
+  if (!rule.isRunning || rule.isBypassed)
+    return false;
+  if (rule.postIsolationGraceTurns > 0)
+    return false;
+  for (bool req : rule.resetPriorityToZeroRequested) {
+    if (req)
+      return false;
+  }
+  if (!rule.isAudioIsolated) {
+    // RAATServer.exe は Delta 不要の 1 ショット特定 (WaitReason == 4) のため、
+    // 未特定待機中も共通 3 秒ゲートでカーネル API 呼び出しを間引く
+    return IsRaatServerProcess(rule.processName);
+  }
+  if (IsMultiSlotRule(rule)) {
+    size_t targetCount = GetRuleSlotCount(rule);
+    size_t satisfied = 0;
+    for (size_t s = 0; s < targetCount; ++s) {
+      bool bypassed = (s < rule.slotBypassed.size() && rule.slotBypassed[s]);
+      bool hasTid =
+          (s < rule.activeAudioTids.size() && rule.activeAudioTids[s] != 0);
+      if (bypassed || hasTid) {
+        satisfied++;
+      }
+    }
+    if (satisfied < targetCount && !rule.multiSearchSleeping) {
+      return false;
+    }
+    return true;
+  }
+  return rule.activeAudioTid != 0;
+}
+
+void ThreadIsolator::WakeUpSteadyRule(ProcessRule &rule, int graceTurns) {
+  rule.steadyWaitTurns = 0;
+  if (graceTurns > rule.postIsolationGraceTurns) {
+    rule.postIsolationGraceTurns = graceTurns;
+  }
+}
+
+void ThreadIsolator::ResetDynamicPriorityFetch(ProcessRule &rule,
+                                               int targetSlot) {
+  if (targetSlot < 0) {
+    for (size_t s = 0; s < rule.prioPollTurns.size(); ++s) {
+      rule.prioPollTurns[s] = 0;
+    }
+    for (size_t s = 0; s < rule.prioRefetchTicks.size(); ++s) {
+      rule.prioRefetchTicks[s] = 0;
+    }
+  } else {
+    size_t slot = static_cast<size_t>(targetSlot);
+    if (rule.prioPollTurns.size() <= slot) {
+      rule.prioPollTurns.resize(slot + 1, 0);
+    }
+    if (rule.prioRefetchTicks.size() <= slot) {
+      rule.prioRefetchTicks.resize(slot + 1, 0);
+    }
+    rule.prioPollTurns[slot] = 0;
+    rule.prioRefetchTicks[slot] = 0;
+  }
+}
+
+bool ThreadIsolator::ShouldFetchDynamicPriority(ProcessRule &rule,
+                                                size_t slot) {
+  if (rule.prioPollTurns.size() <= slot) {
+    rule.prioPollTurns.resize(slot + 1, 0);
+  }
+  if (rule.prioRefetchTicks.size() <= slot) {
+    rule.prioRefetchTicks.resize(slot + 1, 0);
+  }
+  int stage = rule.prioPollTurns[slot];
+  ULONGLONG now = GetTickCount64();
+  if (stage <= 0) {
+    rule.prioPollTurns[slot] = 1;
+    rule.prioRefetchTicks[slot] = now + 3000ULL;
+    return true;
+  }
+  if (stage == 1 && now >= rule.prioRefetchTicks[slot]) {
+    rule.prioPollTurns[slot] = 2;
+    return true;
+  }
+  return false;
+}
+
 // 共通ヘルパー: オーディオスレッドへの優先度・Ideal
 // Processor・アフィニティマスク適用 (Type 1 & Type 2 共通)
 bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
@@ -1597,22 +1773,41 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
                                               ProcessRule &rule) {
   bool changed = false;
 
-  // 1. スレッド優先度設定 (現在の相対優先度と異なる場合のみ更新)
-  int curPrio = GetThreadPriority(hThread);
-  if (curPrio != targetAudioPrio) {
-    if (SetThreadPriority(hThread, targetAudioPrio)) {
-      char pLog[128];
-      snprintf(pLog, sizeof(pLog),
-               "ApplyAudioThreadSettings: Priority TID=%lu, %d -> %d (Success)",
-               tid, curPrio, targetAudioPrio);
-      LogDebug(pLog);
+  // 1. スレッド優先度設定 (現在の優先度と異なる場合のみ更新)
+  // 新仕様 (Plan 107): targetAudioPrio == 0 (Normal) の場合は PID 優先度のままとみなし、
+  // TID に一切アタッチしない（GetThreadPriority / SetThreadPriority をスキップ）。
+  // Fixed (101..131) の場合は NtSetInformationThread で絶対優先度 (KPRIORITY 1..31) を適用。
+  if (targetAudioPrio != 0) {
+    if (IsFixedThreadPriority(targetAudioPrio)) {
+      int absPrio = DecodeFixedThreadPriority(targetAudioPrio);
+      int curDyn = QueryThreadDynamicPriority(hThread);
+      if (curDyn != absPrio) {
+        if (ApplyAbsoluteThreadPriority(hThread, absPrio)) {
+          char pLog[128];
+          snprintf(pLog, sizeof(pLog),
+                   "ApplyAudioThreadSettings: Fixed KPRIORITY TID=%lu, %d -> %d (Success)",
+                   tid, curDyn, absPrio);
+          LogDebug(pLog);
+        }
+      }
     } else {
-      char pLog[128];
-      snprintf(pLog, sizeof(pLog),
-               "ApplyAudioThreadSettings: SetThreadPriority FAILED: TID=%lu, "
-               "err=%lu",
-               tid, GetLastError());
-      LogDebug(pLog);
+      int curPrio = GetThreadPriority(hThread);
+      if (curPrio != targetAudioPrio) {
+        if (SetThreadPriority(hThread, targetAudioPrio)) {
+          char pLog[128];
+          snprintf(pLog, sizeof(pLog),
+                   "ApplyAudioThreadSettings: Priority TID=%lu, %d -> %d (Success)",
+                   tid, curPrio, targetAudioPrio);
+          LogDebug(pLog);
+        } else {
+          char pLog[128];
+          snprintf(pLog, sizeof(pLog),
+                   "ApplyAudioThreadSettings: SetThreadPriority FAILED: TID=%lu, "
+                   "err=%lu",
+                   tid, GetLastError());
+          LogDebug(pLog);
+        }
+      }
     }
   }
 
@@ -1781,33 +1976,10 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     }
   } else if (IsRaatServerProcess(rule.processName)) {
     // === AppType: 4 (RAATServer 単一スロットモード):
-    // WaitReason == 4 (DelayExecution) かつ d > 0 の最大 Delta を選出 ===
-    double effectiveRuleDelta =
-        (rule.cyclesDelta > 0.0) ? rule.cyclesDelta : 2.0;
-    ULONG64 deltaThreshold = CalculateDeltaThreshold(
-        effectiveRuleDelta, m_config.defaultCyclesDelta, intervalMs);
-
-    auto waitReasons = QueryProcessThreadsWaitReason(pid);
-    std::unordered_map<DWORD, ULONG64> threadDeltas;
+    // WaitReason == 4 (DelayExecution) のスレッドを直接選出 (Delta無視・3秒周期は共通ゲートで制御) ===
     std::unordered_set<DWORD> curAliveSet;
     for (const auto &ti : threadInfos) {
       curAliveSet.insert(ti.tid);
-      ULONG64 curCycle = 0;
-      if (QueryThreadCycleTime(ti.hThread, &curCycle)) {
-        auto prevIt = sampleState.lastCycles.find(ti.tid);
-        ULONG64 d = 0;
-        if (prevIt != sampleState.lastCycles.end() && prevIt->second > 0) {
-          d = (curCycle >= prevIt->second) ? (curCycle - prevIt->second) : 0;
-        }
-        sampleState.lastCycles[ti.tid] = curCycle;
-        sampleState.latestDelta[ti.tid] = d;
-        threadDeltas[ti.tid] = d;
-
-        auto wrIt = waitReasons.find(ti.tid);
-        if (wrIt != waitReasons.end() && wrIt->second == 4 && d > 0) {
-          sampleState.delayExecTids.insert(ti.tid);
-        }
-      }
     }
 
     DWORD prevSlot0 =
@@ -1820,33 +1992,22 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     bool slot0Paused =
         (prevSlot0 != 0 && rule.suspendedAudioTids.count(prevSlot0) > 0);
 
-    // WaitReason == 4 (DelayExecution) の最大 Delta を選出
     DWORD nextSlot0 = prevSlot0;
-    ULONG64 maxSlot0Delta = 0;
-    if (!slot0Paused) {
-      DWORD bestSlot0 = 0;
+    if (!slot0Paused && prevSlot0 == 0) {
+      auto waitReasons = QueryProcessThreadsWaitReason(pid);
       for (const auto &ti : threadInfos) {
         auto wrIt = waitReasons.find(ti.tid);
-        bool isDelayExec = (wrIt != waitReasons.end() && wrIt->second == 4) ||
-                           (sampleState.delayExecTids.count(ti.tid) > 0);
-        ULONG64 d = threadDeltas[ti.tid];
-        if (isDelayExec && d > 0) {
-          if (d > maxSlot0Delta) {
-            maxSlot0Delta = d;
-            bestSlot0 = ti.tid;
-          }
+        if (wrIt != waitReasons.end() &&
+            wrIt->second == 4 /* DelayExecution */) {
+          nextSlot0 = ti.tid;
+          break; // Delta無視、WaitReason == 4 のスレッドを1本即特定
         }
-      }
-      if (bestSlot0 != 0 && (prevSlot0 == 0 || maxSlot0Delta > 0 ||
-                             threadDeltas[prevSlot0] == 0)) {
-        nextSlot0 = bestSlot0;
       }
     }
 
     if (nextSlot0 != 0) {
       rule.activeAudioTids = {nextSlot0};
       candTid = nextSlot0;
-      maxDelta = threadDeltas[candTid];
     }
   } else if (IsVoicemeeterProcess(rule.processName)) {
     // === AppType: 5 (Voicemeeter 全エディション 2行モード):
@@ -2056,11 +2217,12 @@ bool ThreadIsolator::TryIdentifyAudioThread(
     rule.detectedThreadName = identifiedAudioLabel;
     rule.searchPhase = 0;
     rule.searchTurns = 0;
-
     bool isDynamic = (phaseName && strcmp(phaseName, "DynamicTracking") == 0);
     if (!isDynamic || !wasIsolated || prevPid != pid ||
         prevActiveTid != identifiedAudioTid ||
         prevActiveTids != rule.activeAudioTids) {
+      ResetDynamicPriorityFetch(rule, -1);
+      WakeUpSteadyRule(rule, 3);
       for (const auto &ti : threadInfos) {
         m_appliedIdealCores.erase(ti.tid);
       }
@@ -2088,7 +2250,6 @@ bool ThreadIsolator::ScanAndIsolate() {
 
   bool stateChanged = false;
   int coreCount = GetSystemCoreCount();
-  std::string heuristicsStatus = "";
 
   // 1. 実行中の全プロセスを取得 (動的スキップ制御 & 低速ポーリング)
   // (A) 監視有効な登録アプリがすべて起動中の場合は SNAPPROCESS をスキップ (0
@@ -2185,7 +2346,7 @@ bool ThreadIsolator::ScanAndIsolate() {
     auto whitelist = BuildUnlistedWhitelist(true);
     DWORD myPid = GetCurrentProcessId();
     int changedBatchCount = 0;
-    const int kMaxUnlistedChangesPerTurn = 2; // 1ターンあたり最大2プロセスまで変更 (時間分散)
+    const int kMaxUnlistedChangesPerTurn = 1; // 1ターンあたり最大1プロセスまで変更 (時間分散)
     bool anyRemaining = false;
 
     for (const auto &kv : runningProcesses) {
@@ -2205,7 +2366,6 @@ bool ThreadIsolator::ScanAndIsolate() {
           m_unlistedApplyCount++;
           stateChanged = true;
           changedBatchCount++;
-          Sleep(5); // オーディオスレッドへ CPU 時間を譲渡し IPI 集中を緩和
         }
       }
       if (anyRemaining) {
@@ -2218,14 +2378,35 @@ bool ThreadIsolator::ScanAndIsolate() {
   if (m_config.rules.empty())
     return stateChanged;
 
+  // 1 秒あたりのターン数および定常 3 秒周期ターン数計算 (500ms設定時は steadyPeriodTurns = 6)
+  int intervalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
+  int turnsPerSec = 1000 / intervalMs;
+  if (turnsPerSec < 1)
+    turnsPerSec = 1;
+  const int steadyPeriodTurns = std::max(1, 3000 / intervalMs);
+
   // 登録ルールのうち現在実行中かつ監視有効 (!isBypassed) の対象 PID を抽出
+  // ※定常状態 (AppType 0, 2 以外) のスキップターンでは対象 PID を除外し、カーネル API 呼び出しをゼロにする
+  std::vector<bool> ruleSteadySkipped(m_config.rules.size(), false);
   std::unordered_set<DWORD> activeTargetPids;
-  for (const auto &r : m_config.rules) {
+  for (size_t ri = 0; ri < m_config.rules.size(); ++ri) {
+    auto &r = m_config.rules[ri];
     if (r.isBypassed)
       continue; // 監視除外プロセスのスレッドスキャン誘発を防止
 
     auto rIt = runningProcesses.find(ToLowerA(r.processName));
-    if (rIt != runningProcesses.end()) {
+    if (rIt != runningProcesses.end() && !rIt->second.empty()) {
+      if (IsRuleInSteadyState(r)) {
+        if (r.steadyWaitTurns > 0) {
+          r.steadyWaitTurns--;
+          ruleSteadySkipped[ri] = true;
+          continue;
+        }
+        r.steadyWaitTurns = (steadyPeriodTurns > 1) ? (steadyPeriodTurns - 1) : 0;
+      } else {
+        r.steadyWaitTurns = 0;
+      }
+
       if (r.appType == 2) {
         // Chromium 系: スレッド走査が必要なのは特定済みの AudioService PID のみ
         if (r.audioServicePid != 0) {
@@ -2240,10 +2421,12 @@ bool ThreadIsolator::ScanAndIsolate() {
   }
 
   std::unordered_map<DWORD, std::vector<THREADENTRY32>> processThreads;
+  std::unordered_map<DWORD, std::unordered_map<DWORD, DWORD_PTR>>
+      processThreadAffinities;
 
-  // 全件 Not running の時はスレッド走査をスキップ
-  // NtGetNextThread (ローレベル API) により、特定済み PID
-  // のスレッドのみを直接取得 (SNAPTHREAD 全廃)
+  // 全件 Not running または定常スキップの時はスレッド走査をスキップ
+  // NtGetNextThread + NtQueryInformationThread(ThreadBasicInformation) により、
+  // 対象 PID のスレッド TID と AffinityMask を 1 パスで同時取得
   if (!activeTargetPids.empty()) {
     EnsureNtLoaded();
     if (s_pfnNtGetNextThread) {
@@ -2260,16 +2443,32 @@ bool ThreadIsolator::ScanAndIsolate() {
             }
             hCurThread = hNextThread;
 
-            DWORD exitCode = 0;
-            if (GetExitCodeThread(hCurThread, &exitCode) &&
-                exitCode == STILL_ACTIVE) {
-              DWORD tid = GetThreadId(hCurThread);
-              if (tid != 0) {
-                THREADENTRY32 te = {0};
-                te.dwSize = sizeof(te);
-                te.th32OwnerProcessID = pid;
-                te.th32ThreadID = tid;
-                processThreads[pid].push_back(te);
+            DWORD tid = 0;
+            DWORD_PTR affMask = 0;
+            LONG basePri = 0;
+            if (s_pfnNtQueryInformationThread) {
+              THREAD_BASIC_INFO_RAW tbi = {0};
+              ULONG retLen = 0;
+              if (s_pfnNtQueryInformationThread(
+                      hCurThread, 0 /* ThreadBasicInformation */, &tbi,
+                      sizeof(tbi), &retLen) == 0) {
+                tid = static_cast<DWORD>(tbi.UniqueThreadId);
+                affMask = tbi.AffinityMask;
+                basePri = tbi.BasePriority;
+              }
+            }
+            if (tid == 0) {
+              tid = GetThreadId(hCurThread);
+            }
+            if (tid != 0) {
+              THREADENTRY32 te = {0};
+              te.dwSize = sizeof(te);
+              te.th32OwnerProcessID = pid;
+              te.th32ThreadID = tid;
+              te.tpBasePri = basePri;
+              processThreads[pid].push_back(te);
+              if (affMask != 0) {
+                processThreadAffinities[pid][tid] = affMask;
               }
             }
           }
@@ -2284,12 +2483,6 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
     }
   }
-
-  // 1 秒あたりのターン数計算 (100ms=10, 200ms=5, 500ms=2, 1000ms=1)
-  int intervalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
-  int turnsPerSec = 1000 / intervalMs;
-  if (turnsPerSec < 1)
-    turnsPerSec = 1;
 
   // 初回起動時: 前回の終了時ステータス記録と照合 (起動時引き継ぎ)
   static bool s_initialMatchDone = false;
@@ -2384,6 +2577,7 @@ bool ThreadIsolator::ScanAndIsolate() {
                   rule.activeAudioTid = rule.lastAudioTids[0];
                   rule.isAudioIsolated = true;
                   rule.isRunning = true;
+                  WakeUpSteadyRule(rule, 2);
                   rule.detectedThreadName =
                       "PID " + std::to_string(rule.lastAudioPid) + " / TID " +
                       std::to_string(rule.activeAudioTid);
@@ -2434,9 +2628,11 @@ bool ThreadIsolator::ScanAndIsolate() {
   EraseDeadPidKeys(m_lastProcessThreadCount, allActivePids);
   EraseDeadPidKeys(m_audioDgAppliedTids, allActivePids);
   EraseDeadPidKeys(m_audioDgLastPrio, allActivePids);
+  EraseDeadPidSet(m_highQosAppliedPids, allActivePids);
 
   // 2. 各登録ルールのプロセスを検査・アフィニティ制御
-  for (auto &rule : m_config.rules) {
+  for (size_t ruleIdx = 0; ruleIdx < m_config.rules.size(); ++ruleIdx) {
+    auto &rule = m_config.rules[ruleIdx];
     std::string targetLower = ToLowerA(rule.processName);
     auto it = runningProcesses.find(targetLower);
 
@@ -2456,15 +2652,35 @@ bool ThreadIsolator::ScanAndIsolate() {
         rule.activeAudioTids.clear();
         rule.detectedThreadName = rule.isBypassed ? "Bypassed" : "";
         rule.isAudioIsolated = false;
+        rule.hasIntruderThreads = false;
         rule.wasHalfAutoPromoted = false;
         rule.chromiumScanAttempted = false;
         rule.searchPhase = 0;
         rule.searchTurns = 0;
+        rule.steadyWaitTurns = 0;
+        rule.postIsolationGraceTurns = 0;
+        for (size_t s = 0; s < rule.normalPrioForceApplied.size(); ++s) {
+          rule.normalPrioForceApplied[s] = false;
+        }
+        for (size_t s = 0; s < rule.actualAudioBasePriorities.size(); ++s) {
+          rule.actualAudioBasePriorities[s] = 0;
+        }
+        for (size_t s = 0; s < rule.actualThreadRelativePrios.size(); ++s) {
+          rule.actualThreadRelativePrios[s] = 0;
+        }
+        ResetDynamicPriorityFetch(rule, -1);
         if (rule.audioServicePid != 0) {
           ClearChromiumTrackingState(rule.audioServicePid);
           rule.audioServicePid = 0;
         }
         stateChanged = true;
+      } else {
+        for (size_t s = 0; s < rule.normalPrioForceApplied.size(); ++s) {
+          if (rule.normalPrioForceApplied[s]) {
+            rule.normalPrioForceApplied[s] = false;
+            stateChanged = true;
+          }
+        }
       }
       continue;
     }
@@ -2487,8 +2703,20 @@ bool ThreadIsolator::ScanAndIsolate() {
       rule.chromiumScanAttempted = false;
       rule.searchPhase = 0;
       rule.searchTurns = 0;
+      rule.steadyWaitTurns = 0;
+      rule.postIsolationGraceTurns = 0;
       rule.activeAudioTid = 0;
       rule.activeAudioTids.clear();
+      for (size_t s = 0; s < rule.normalPrioForceApplied.size(); ++s) {
+        rule.normalPrioForceApplied[s] = false;
+      }
+      for (size_t s = 0; s < rule.actualAudioBasePriorities.size(); ++s) {
+        rule.actualAudioBasePriorities[s] = 0;
+      }
+      for (size_t s = 0; s < rule.actualThreadRelativePrios.size(); ++s) {
+        rule.actualThreadRelativePrios[s] = 0;
+      }
+      ResetDynamicPriorityFetch(rule, -1);
       if (rule.audioServicePid != 0) {
         ClearChromiumTrackingState(rule.audioServicePid);
         rule.audioServicePid = 0;
@@ -2504,6 +2732,12 @@ bool ThreadIsolator::ScanAndIsolate() {
         m_cachedProcessTids.erase(pid);
         m_lastProcessThreadCount.erase(pid);
       }
+      continue;
+    }
+
+    // 定常状態 (AppType 0, 2 以外) の 3 秒周期スキップターン:
+    // プロセス生存確認 (Not running) と Bypass 判定のみ終えた状態でカーネル API 操作を全スキップ
+    if (ruleIdx < ruleSteadySkipped.size() && ruleSteadySkipped[ruleIdx]) {
       continue;
     }
 
@@ -2604,8 +2838,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
 
         if (hProc) {
-          // 1. HighQoS 適用
-          ApplyProcessHighQoS(hProc);
+          // 1. HighQoS 適用 (新規検出PIDに対し初回1回のみ)
+          if (m_highQosAppliedPids.insert(pid).second) {
+            ApplyProcessHighQoS(hProc);
+          }
 
           // 2. PID に audioMask を適用
           DWORD_PTR currentProcMask = 0, sysMask = 0;
@@ -2619,27 +2855,86 @@ bool ThreadIsolator::ScanAndIsolate() {
             SetProcessAffinityMask(hProc, audioMask);
           }
 
-          // 3. PID にプロセス優先度クラスを適用
-          if (rule.processPriorityClass != 0) {
-            DWORD curPrioClass = GetPriorityClass(hProc);
+          // 3. PID にプロセス優先度クラスを適用 (Col 3 明示変更時のみ SetPriorityClass を実行)
+          int targetAudioPrio = (!rule.audioPriorities.empty())
+                                    ? rule.audioPriorities[0]
+                                    : rule.audioPriority;
+          DWORD curPrioClass = GetPriorityClass(hProc);
+          bool procPrioSet = false;
+          if (rule.processPriorityModified && rule.processPriorityClass != 0) {
             if (curPrioClass != 0 &&
                 curPrioClass != rule.processPriorityClass) {
               if (SetPriorityClass(hProc, rule.processPriorityClass)) {
+                procPrioSet = true;
                 stateChanged = true;
               } else if (rule.processPriorityClass == REALTIME_PRIORITY_CLASS) {
                 if (SetPriorityClass(hProc, HIGH_PRIORITY_CLASS)) {
+                  procPrioSet = true;
                   stateChanged = true;
                 }
               }
+              if (procPrioSet) {
+                curPrioClass = GetPriorityClass(hProc);
+              }
+            }
+          }
+          if (curPrioClass != 0) {
+            if (rule.actualProcessPriorityClass != curPrioClass) {
+              rule.actualProcessPriorityClass = curPrioClass;
+              stateChanged = true;
+            }
+            if (!rule.processPriorityModified) {
+              rule.processPriorityClass = curPrioClass;
             }
           }
 
           CloseHandle(hProc);
 
+          // Col 3 変更直後かつ Fixed 指定時は全 TID に無条件で NtSetInformationThread を再適用
+          if (procPrioSet && IsFixedThreadPriority(targetAudioPrio) &&
+              ptIt != processThreads.end()) {
+            int absPrio = DecodeFixedThreadPriority(targetAudioPrio);
+            for (const auto &te : ptIt->second) {
+              HANDLE hThFix = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
+                                         FALSE, te.th32ThreadID);
+              if (hThFix) {
+                ApplyAbsoluteThreadPriority(hThFix, absPrio);
+                CloseHandle(hThFix);
+              }
+            }
+          }
+
           // 4. 全 TID の監視 & 新規 TID へのスレッド優先度適用
-          int targetAudioPrio = (!rule.audioPriorities.empty())
-                                    ? rule.audioPriorities[0]
-                                    : rule.audioPriority;
+          // 新仕様 (Plan 107): targetAudioPrio == 0 (Normal) の場合は PID 優先度のままとみなし、
+          // TID に一切アタッチしない（SetThreadPriority ループをスキップ）。
+          // ワンショットリセット要求 (ピッカー Normal 選択) の処理
+          if (!rule.resetPriorityToZeroRequested.empty() &&
+              rule.resetPriorityToZeroRequested[0]) {
+            if (ptIt != processThreads.end()) {
+              for (const auto &te : ptIt->second) {
+                HANDLE hTh = OpenThread(THREAD_SET_INFORMATION, FALSE,
+                                        te.th32ThreadID);
+                if (hTh) {
+                  SetThreadPriority(hTh, THREAD_PRIORITY_NORMAL);
+                  CloseHandle(hTh);
+                }
+              }
+            }
+            rule.audioPriority = 0;
+            if (!rule.audioPriorities.empty())
+              rule.audioPriorities[0] = 0;
+            targetAudioPrio = 0;
+            rule.resetPriorityToZeroRequested[0] = false;
+            ResetDynamicPriorityFetch(rule, 0);
+            if (!rule.actualAudioBasePriorities.empty()) {
+              rule.actualAudioBasePriorities[0] = 0;
+            }
+            if (!rule.actualThreadRelativePrios.empty()) {
+              rule.actualThreadRelativePrios[0] = 0;
+            }
+            stateChanged = true;
+          }
+
           auto &appliedTids = m_audioDgAppliedTids[pid];
           bool isInitialPid = appliedTids.empty();
           bool prioChanged =
@@ -2656,7 +2951,7 @@ bool ThreadIsolator::ScanAndIsolate() {
             for (const auto &te : ptIt->second) {
               DWORD tid = te.th32ThreadID;
               bool isNewTid = (appliedTids.find(tid) == appliedTids.end());
-              if (isNewTid || prioChanged) {
+              if (targetAudioPrio != 0 && (isNewTid || prioChanged)) {
                 HANDLE hTh = OpenThread(THREAD_SET_INFORMATION |
                                             THREAD_QUERY_INFORMATION,
                                         FALSE, tid);
@@ -2669,16 +2964,21 @@ bool ThreadIsolator::ScanAndIsolate() {
                   hTh = OpenThread(THREAD_SET_INFORMATION, FALSE, tid);
                 }
                 if (hTh) {
-                  SetThreadPriority(hTh, targetAudioPrio);
+                  if (IsFixedThreadPriority(targetAudioPrio)) {
+                    ApplyAbsoluteThreadPriority(
+                        hTh, DecodeFixedThreadPriority(targetAudioPrio));
+                  } else {
+                    SetThreadPriority(hTh, targetAudioPrio);
+                  }
                   CloseHandle(hTh);
                 }
-                if (isNewTid) {
-                  appliedTids.insert(tid);
-                  if (!isInitialPid) {
-                    rule.applyCount++;
-                    stateChanged = true;
-                  }
+                if (isNewTid && !isInitialPid) {
+                  rule.applyCount++;
+                  stateChanged = true;
                 }
+              }
+              if (isNewTid) {
+                appliedTids.insert(tid);
               }
             }
           }
@@ -2687,7 +2987,64 @@ bool ThreadIsolator::ScanAndIsolate() {
             rule.applyCount++;
             stateChanged = true;
           }
+          if (isInitialPid || prioChanged || procPrioSet) {
+            ResetDynamicPriorityFetch(rule, 0);
+          }
           m_audioDgLastPrio[pid] = targetAudioPrio;
+          // audiodg.exe は PPL 保護のため WalkSystemProcessThreads で ContextSwitches 最上位 (音声本体) の Dyn Pri を取得
+          // (確定・変更直後 + 3秒後に1回のみ再取得し完了)
+          if (ShouldFetchDynamicPriority(rule, 0)) {
+            int bestDp = 0;
+            ULONG bestCtxSw = 0;
+            DWORD bestTid = 0;
+            bool foundAny = false;
+            WalkSystemProcessThreads(
+                pid, [&](DWORD tid, const SYSTEM_THREAD_INFORMATION_RAW &th) {
+                  if (th.Priority > 0) {
+                    if (!foundAny || th.ContextSwitches > bestCtxSw) {
+                      foundAny = true;
+                      bestCtxSw = th.ContextSwitches;
+                      bestDp = static_cast<int>(th.Priority);
+                      bestTid = tid;
+                    }
+                  }
+                });
+            int bestRel = 0;
+            if (bestTid != 0) {
+              HANDLE hThRel = OpenThread(THREAD_QUERY_LIMITED_INFORMATION,
+                                         FALSE, bestTid);
+              if (hThRel) {
+                int r = GetThreadPriority(hThRel);
+                if (r != THREAD_PRIORITY_ERROR_RETURN) {
+                  bestRel = r;
+                }
+                CloseHandle(hThRel);
+              }
+            }
+            int actualDynPri = bestDp;
+            if (actualDynPri <= 0) {
+              if (IsFixedThreadPriority(targetAudioPrio)) {
+                actualDynPri = DecodeFixedThreadPriority(targetAudioPrio);
+              } else {
+                DWORD effClass = (rule.processPriorityClass != 0)
+                                     ? rule.processPriorityClass
+                                     : NORMAL_PRIORITY_CLASS;
+                int rank = ati::FindRankByPrio(effClass, targetAudioPrio);
+                const auto *entry = ati::GetMatrixEntryByRank(rank);
+                actualDynPri =
+                    entry ? entry->basePriority : (targetAudioPrio + 8);
+              }
+            }
+            if (rule.actualAudioBasePriorities.empty()) {
+              rule.actualAudioBasePriorities.resize(1, 0);
+            }
+            if (rule.actualThreadRelativePrios.empty()) {
+              rule.actualThreadRelativePrios.resize(1, 0);
+            }
+            rule.actualAudioBasePriorities[0] = actualDynPri;
+            rule.actualThreadRelativePrios[0] = bestRel;
+            stateChanged = true;
+          }
           latestIsolatedPid = pid;
         }
       }
@@ -2864,9 +3221,11 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
 
       // Audio Service プロセスに対して HighQoS (Power Throttling / EcoQoS 解除)
-      // を適用 (親プロセスの HighQoS
+      // を新規検出PIDに初回1回のみ適用 (親プロセスの HighQoS
       // 状態はカーネルの自動継承機構により配下の全オーディオスレッドに波及)
-      ApplyProcessHighQoS(hAsProc);
+      if (m_highQosAppliedPids.insert(audioServicePid).second) {
+        ApplyProcessHighQoS(hAsProc);
+      }
 
       totalThreadCount = static_cast<int>(ptIt->second.size());
       auto &tracks = m_chromiumThreadTracks[audioServicePid];
@@ -3027,6 +3386,9 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
         activeAudioCount = 1;
         lastAudioTid = audioTid;
+        if (rule.activeAudioTid != audioTid) {
+          ResetDynamicPriorityFetch(rule, -1);
+        }
         rule.isAudioIsolated = true;
         rule.activePid = audioServicePid;
         rule.activeAudioTid = audioTid;
@@ -3275,16 +3637,57 @@ bool ThreadIsolator::ScanAndIsolate() {
             size_t slotIdx = chromiumAudioSlot;
             chromiumAudioSlot++;
 
-            int assignedPrio = (slotIdx < rule.audioPriorities.size())
-                                   ? rule.audioPriorities[slotIdx]
-                                   : rule.audioPriority;
             // 共通ルーチンで優先度・アフィニティを常時検証・即時反映
             HANDLE hTh =
                 OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION,
                            FALSE, te.th32ThreadID);
             if (hTh) {
+              // ワンショットリセット要求 (長押し / ピッカー Normal 選択) の処理
+              if (slotIdx < rule.resetPriorityToZeroRequested.size() &&
+                  rule.resetPriorityToZeroRequested[slotIdx]) {
+                SetThreadPriority(hTh, THREAD_PRIORITY_NORMAL);
+                rule.resetPriorityToZeroRequested[slotIdx] = false;
+                if (slotIdx < rule.audioPriorities.size()) {
+                  rule.audioPriorities[slotIdx] = 0;
+                }
+                if (slotIdx == 0) {
+                  rule.audioPriority = 0;
+                }
+                ResetDynamicPriorityFetch(rule, static_cast<int>(slotIdx));
+                if (slotIdx < rule.actualAudioBasePriorities.size()) {
+                  rule.actualAudioBasePriorities[slotIdx] = 0;
+                }
+                stateChanged = true;
+              }
+
+              int assignedPrio = (slotIdx < rule.audioPriorities.size())
+                                     ? rule.audioPriorities[slotIdx]
+                                     : rule.audioPriority;
               if (ApplyAudioThreadSettings(hTh, te.th32ThreadID, assignedPrio,
                                            assignedCore, assignedMask, rule)) {
+                stateChanged = true;
+              }
+
+              // 実測 Dynamic Priority (Dyn Pri) の更新 (確定・変更直後 + 3秒後に1回のみ再取得し完了)
+              if (ShouldFetchDynamicPriority(rule, slotIdx)) {
+                int curRel = GetThreadPriority(hTh);
+                int actualDynPri = QueryThreadDynamicPriority(hTh);
+                if (actualDynPri <= 0) {
+                  DWORD effClass = (rule.processPriorityClass != 0)
+                                       ? rule.processPriorityClass
+                                       : NORMAL_PRIORITY_CLASS;
+                  int rank = ati::FindRankByPrio(effClass, curRel);
+                  const auto *entry = ati::GetMatrixEntryByRank(rank);
+                  actualDynPri = entry ? entry->basePriority : (curRel + 8);
+                }
+                if (rule.actualAudioBasePriorities.size() <= slotIdx) {
+                  rule.actualAudioBasePriorities.resize(slotIdx + 1, 0);
+                }
+                if (rule.actualThreadRelativePrios.size() <= slotIdx) {
+                  rule.actualThreadRelativePrios.resize(slotIdx + 1, 0);
+                }
+                rule.actualAudioBasePriorities[slotIdx] = actualDynPri;
+                rule.actualThreadRelativePrios[slotIdx] = curRel;
                 stateChanged = true;
               }
               CloseHandle(hTh);
@@ -3343,10 +3746,11 @@ bool ThreadIsolator::ScanAndIsolate() {
           stateChanged = true;
         }
 
-        // プロセス優先度クラスの動的適用 (Chromium Audio Service PID)
-        if (rule.processPriorityClass != 0) {
-          DWORD curPrioClass = GetPriorityClass(hAsProc);
+        // プロセス優先度クラスの動的適用 (Chromium Audio Service PID: Col 3 明示変更時のみ SetPriorityClass)
+        DWORD curPrioClass = GetPriorityClass(hAsProc);
+        if (rule.processPriorityModified && rule.processPriorityClass != 0) {
           if (curPrioClass != 0 && curPrioClass != rule.processPriorityClass) {
+            bool procPrioSet = false;
             if (SetPriorityClass(hAsProc, rule.processPriorityClass)) {
               char pLog[128];
               snprintf(pLog, sizeof(pLog),
@@ -3354,14 +3758,41 @@ bool ThreadIsolator::ScanAndIsolate() {
                        "PID=%lu, class=0x%lX",
                        audioServicePid, rule.processPriorityClass);
               LogDebug(pLog);
+              procPrioSet = true;
               stateChanged = true;
             } else if (rule.processPriorityClass == REALTIME_PRIORITY_CLASS) {
               if (SetPriorityClass(hAsProc, HIGH_PRIORITY_CLASS)) {
                 LogDebug("SetPriorityClass fallback to High applied to "
                          "Chromium Audio Service");
+                procPrioSet = true;
                 stateChanged = true;
               }
             }
+            if (procPrioSet) {
+              curPrioClass = GetPriorityClass(hAsProc);
+              ResetDynamicPriorityFetch(rule, -1);
+              for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
+                DWORD aTid = rule.activeAudioTids[s];
+                if (aTid == 0) continue;
+                int sPrio = (s < rule.audioPriorities.size()) ? rule.audioPriorities[s] : rule.audioPriority;
+                if (IsFixedThreadPriority(sPrio)) {
+                  HANDLE hThFix = OpenThread(THREAD_SET_INFORMATION | THREAD_QUERY_INFORMATION, FALSE, aTid);
+                  if (hThFix) {
+                    ApplyAbsoluteThreadPriority(hThFix, DecodeFixedThreadPriority(sPrio));
+                    CloseHandle(hThFix);
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (curPrioClass != 0) {
+          if (rule.actualProcessPriorityClass != curPrioClass) {
+            rule.actualProcessPriorityClass = curPrioClass;
+            stateChanged = true;
+          }
+          if (!rule.processPriorityModified) {
+            rule.processPriorityClass = curPrioClass;
           }
         }
       }
@@ -3376,6 +3807,7 @@ bool ThreadIsolator::ScanAndIsolate() {
     }
 
     // ── 既存パス（Firefox, foobar2000, ゲーム等）──
+    bool wasIsolatedBeforeScan = rule.isAudioIsolated;
 
     // 死亡PIDのクリーンアップ
     EraseDeadPidSet(m_nonChromiumMaskedPids, allActivePids);
@@ -3432,18 +3864,17 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
 
       // 全登録プロセスに対して HighQoS (Power Throttling / EcoQoS 解除)
-      // を先行適用 (親プロセスの HighQoS
+      // を新規検出PIDに初回1回のみ適用 (親プロセスの HighQoS
       // 状態はカーネルの自動継承機構により配下の全スレッドに波及)
-      ApplyProcessHighQoS(hProcess);
+      if (m_highQosAppliedPids.insert(pid).second) {
+        ApplyProcessHighQoS(hProcess);
+      }
 
       std::unordered_set<DWORD> aliveTids;
       std::vector<LocalThreadInfo> threadInfos;
 
       DWORD identifiedAudioTid = 0;
       std::string identifiedAudioLabel = "";
-
-      DWORD mainThreadTid =
-          ptIt->second.empty() ? 0 : ptIt->second[0].th32ThreadID;
 
       // 前回セッション／キャッシュ済みPID/TIDトラッキングから事前解決
       // (ループ前にオーディオTIDを確定させ、重い走査をスキップ)
@@ -3511,7 +3942,71 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
       }
 
-      bool canSkipNormalThreads = (!threadsChanged && allSlotsReady);
+      // AppType == 1 のみ: NtGetNextThread 走査時に同時取得した AffinityMask を参照し、
+      // 同一 PID の非オーディオスレッドがオーディオコア群に同居しているかを直接判定
+      auto affMapIt = processThreadAffinities.find(pid);
+      bool anyOtherThreadOnAudioCore = false;
+      if (rule.appType == 1 && allSlotsReady) {
+        DWORD_PTR checkAudioMask = isMultiSlot ? 0 : audioMask;
+        if (isMultiSlot) {
+          for (size_t s = 0; s < targetCount; ++s) {
+            if (s < rule.slotBypassed.size() && rule.slotBypassed[s])
+              continue;
+            if (s < rule.audioSlotMasks.size() && rule.audioSlotMasks[s] != 0) {
+              checkAudioMask |= rule.audioSlotMasks[s];
+            } else if (s < rule.audioCores.size() && rule.audioCores[s] >= 0 &&
+                       rule.audioCores[s] < 64) {
+              checkAudioMask |= (1ULL << rule.audioCores[s]);
+            }
+          }
+        } else {
+          for (int c : rule.audioCores) {
+            if (c >= 0 && c < 64)
+              checkAudioMask |= (1ULL << c);
+          }
+        }
+
+        if (checkAudioMask != 0) {
+          std::unordered_set<DWORD> audioCheckSet;
+          for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
+            if (rule.activeAudioTids[s] != 0) {
+              audioCheckSet.insert(rule.activeAudioTids[s]);
+            }
+          }
+          if (audioCheckSet.empty() && identifiedAudioTid != 0) {
+            audioCheckSet.insert(identifiedAudioTid);
+          }
+
+          for (const auto &te : ptIt->second) {
+            if (audioCheckSet.count(te.th32ThreadID) > 0)
+              continue;
+            DWORD_PTR tAff = 0;
+            if (affMapIt != processThreadAffinities.end()) {
+              auto tAffIt = affMapIt->second.find(te.th32ThreadID);
+              if (tAffIt != affMapIt->second.end()) {
+                tAff = tAffIt->second;
+              }
+            }
+            if (tAff == 0) {
+              HANDLE hCheck =
+                  OpenThread(THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+              if (hCheck) {
+                tAff = QueryThreadAffinityMask(hCheck);
+                CloseHandle(hCheck);
+              }
+            }
+            if ((tAff & checkAudioMask) != 0) {
+              anyOtherThreadOnAudioCore = true;
+              break;
+            }
+          }
+        }
+      }
+
+      bool canSkipNormalThreads =
+          (!threadsChanged && allSlotsReady &&
+           !(rule.appType == 1 &&
+             (rule.hasIntruderThreads || anyOtherThreadOnAudioCore)));
 
       // 1. スレッド情報収集 (定常時は通常スレッドの走査をスキップし、確定オーディオスレッドのみ最小限維持)
       if (canSkipNormalThreads) {
@@ -3537,7 +4032,16 @@ bool ThreadIsolator::ScanAndIsolate() {
                          FALSE, at);
           if (hThread) {
             int priority = GetThreadPriority(hThread);
-            DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
+            DWORD_PTR currentAff = 0;
+            if (affMapIt != processThreadAffinities.end()) {
+              auto tAffIt = affMapIt->second.find(at);
+              if (tAffIt != affMapIt->second.end()) {
+                currentAff = tAffIt->second;
+              }
+            }
+            if (currentAff == 0) {
+              currentAff = QueryThreadAffinityMask(hThread);
+            }
             threadInfos.push_back({at, 0, priority, "", hThread, currentAff});
           }
         }
@@ -3553,7 +4057,16 @@ bool ThreadIsolator::ScanAndIsolate() {
             continue;
 
           int priority = GetThreadPriority(hThread);
-          DWORD_PTR currentAff = QueryThreadAffinityMask(hThread);
+          DWORD_PTR currentAff = 0;
+          if (affMapIt != processThreadAffinities.end()) {
+            auto tAffIt = affMapIt->second.find(te.th32ThreadID);
+            if (tAffIt != affMapIt->second.end()) {
+              currentAff = tAffIt->second;
+            }
+          }
+          if (currentAff == 0) {
+            currentAff = QueryThreadAffinityMask(hThread);
+          }
 
           threadInfos.push_back(
               {te.th32ThreadID, te.tpBasePri, priority, "", hThread, currentAff});
@@ -3750,6 +4263,7 @@ bool ThreadIsolator::ScanAndIsolate() {
       // 3. アフィニティおよび優先度の適用
       // (オーディオスレッド特定時またはスロットBypass制御時のみ退避・適用を実行)
       std::vector<DWORD> intruderTids;
+      bool sawOverlapOnFirstEvac = false;
       DWORD_PTR effectiveNormal = normalMask;
 
       std::unordered_set<DWORD> audioTidSet;
@@ -3862,7 +4376,8 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
 
         // まず非オーディオスレッド (通常スレッド群およびスロットBypass対象スレッド)
-        // を通常コア群へ退避し、真の侵入者を物理検出
+        // を通常コア群へ退避し、AppType == 1 のみ同一PID内の侵入スレッド群を物理検出
+        bool anyFirstTimeEvac = false;
         for (const auto &ti : threadInfos) {
           if (audioTidSet.count(ti.tid) > 0)
             continue;
@@ -3883,19 +4398,20 @@ bool ThreadIsolator::ScanAndIsolate() {
             continue;
           }
 
+          bool wasPreviouslyEvacuated =
+              (m_appliedThreads.find(ti.tid) != m_appliedThreads.end());
+          if (!wasPreviouslyEvacuated) {
+            anyFirstTimeEvac = true;
+          }
 
-
-          // スキャン時点 (退避前) の物理アフィニティを検査:
-          // オーディオコア群 (combinedAudioMask) を実行対象に含んでおり、かつ
+          // AppType == 1 のみスキャン時点 (退避前) の物理アフィニティを検査:
+          // 同一PID内の非オーディオスレッドがオーディオコア群 (combinedAudioMask) と重なっており、
           // (A) オーディオコア単独に自己バインドしている、または
-          // (B)
-          // 以前のサイクルで通常コア群へ退避させたにもかかわらず自らオーディオコアへ再バインドして居座るスレッド
-          if (combinedAudioMask != 0 &&
+          // (B) 退避適用済みであるにもかかわらず再びオーディオコアへ戻って居座っているスレッドを全件収集
+          if (rule.appType == 1 && combinedAudioMask != 0 &&
               (ti.currentAffinity & combinedAudioMask) != 0) {
             bool isSpecificToAudio =
                 ((ti.currentAffinity & ~combinedAudioMask) == 0);
-            bool wasPreviouslyEvacuated =
-                (m_appliedThreads.find(ti.tid) != m_appliedThreads.end());
             if (isSpecificToAudio || wasPreviouslyEvacuated) {
               intruderTids.push_back(ti.tid);
               char dbgBuf[256];
@@ -3906,6 +4422,8 @@ bool ThreadIsolator::ScanAndIsolate() {
                        (unsigned long long)combinedAudioMask, isSpecificToAudio,
                        wasPreviouslyEvacuated);
               LogDebug(dbgBuf);
+            } else {
+              sawOverlapOnFirstEvac = true;
             }
           }
 
@@ -3915,23 +4433,56 @@ bool ThreadIsolator::ScanAndIsolate() {
             stateChanged = true;
           }
         }
+        // 新規生成スレッドの初回退避が発生した場合 (AppType == 1):
+        // 次ターン (0.5秒後) に 1 回確認走査を実行してから 3 秒定常周期へ戻す
+        if (anyFirstTimeEvac && rule.appType == 1) {
+          if (rule.postIsolationGraceTurns < 2) {
+            rule.postIsolationGraceTurns = 2;
+          }
+          rule.steadyWaitTurns = 0;
+        }
       }
 
-      bool hasIntruders = !intruderTids.empty();
-      rule.hasIntruderThreads = hasIntruders;
-      if (hasIntruders) {
-        char hLog[128];
-        snprintf(hLog, sizeof(hLog),
-                 "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d", pid,
-                 intruderTids.size(), hasIntruders);
-        LogDebug(hLog);
+      bool hasIntruders = false;
+      if (rule.appType == 1) {
+        hasIntruders = rule.hasIntruderThreads;
+        if (!canSkipNormalThreads) {
+          if (!(rule.hasIntruderThreads && intruderTids.empty() &&
+                sawOverlapOnFirstEvac)) {
+            hasIntruders = !intruderTids.empty();
+            if (rule.hasIntruderThreads != hasIntruders) {
+              rule.hasIntruderThreads = hasIntruders;
+              stateChanged = true;
+            }
+          }
+          if (hasIntruders && !intruderTids.empty()) {
+            char hLog[128];
+            snprintf(hLog, sizeof(hLog),
+                     "IntrudersSummary: PID=%lu, count=%zu, hasIntruders=%d",
+                     pid, intruderTids.size(), hasIntruders);
+            LogDebug(hLog);
+          }
+        }
+      } else if (rule.hasIntruderThreads) {
+        rule.hasIntruderThreads = false;
+        stateChanged = true;
       }
 
-      // Half判定時の自動昇格
-      if (!audioTidSet.empty() && hasIntruders) {
+      int curAudioPrio = (!rule.audioPriorities.empty())
+                             ? rule.audioPriorities[0]
+                             : rule.audioPriority;
+
+      // Half判定時の自動昇格 (AppType == 1 のみ)
+      if (rule.appType == 1 && !audioTidSet.empty() && hasIntruders) {
         if (!rule.wasHalfAutoPromoted) {
-          if (rule.audioPriority <= THREAD_PRIORITY_IDLE) {
+          if (!IsFixedThreadPriority(curAudioPrio) &&
+              curAudioPrio <= THREAD_PRIORITY_IDLE) {
+            curAudioPrio = THREAD_PRIORITY_LOWEST;
             rule.audioPriority = THREAD_PRIORITY_LOWEST;
+            if (!rule.audioPriorities.empty()) {
+              rule.audioPriorities[0] = THREAD_PRIORITY_LOWEST;
+            }
+            ResetDynamicPriorityFetch(rule, 0);
             stateChanged = true;
             char pLog[128];
             snprintf(pLog, sizeof(pLog),
@@ -3945,14 +4496,61 @@ bool ThreadIsolator::ScanAndIsolate() {
       }
 
       // オーディオスレッドの適用優先度 (targetAudioPrio) の決定
-      int targetAudioPrio = rule.audioPriority;
-
-      // 侵入者スレッドの適用優先度 (オーディオスレッドの 1段階下に常に連動)
-      int intruderPrio = GetOneStepLowerPriority(targetAudioPrio);
+      int targetAudioPrio = curAudioPrio;
 
       // オーディオスレッド群への適用
       // (スロットごとに個別コア・個別サスペンド・個別Bypass制御)
       if (!audioTidSet.empty() || !bypassedSlotTidSet.empty()) {
+        // プロセス優先度クラスの動的適用をスレッド優先度適用・Dyn Pri取得より先行実行
+        DWORD curPrioClass = GetPriorityClass(hProcess);
+        if (rule.processPriorityModified && rule.processPriorityClass != 0) {
+          if (curPrioClass != 0 && curPrioClass != rule.processPriorityClass) {
+            bool procPrioSet = false;
+            if (SetPriorityClass(hProcess, rule.processPriorityClass)) {
+              char pLog[128];
+              snprintf(pLog, sizeof(pLog),
+                       "SetPriorityClass applied: PID=%lu, class=0x%lX", pid,
+                       rule.processPriorityClass);
+              LogDebug(pLog);
+              procPrioSet = true;
+              stateChanged = true;
+            } else if (rule.processPriorityClass == REALTIME_PRIORITY_CLASS) {
+              if (SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS)) {
+                LogDebug("SetPriorityClass fallback to High applied");
+                procPrioSet = true;
+                stateChanged = true;
+              }
+            }
+            if (procPrioSet) {
+              curPrioClass = GetPriorityClass(hProcess);
+              ResetDynamicPriorityFetch(rule, -1);
+              // Col 3 変更直後: Fixed 指定スロットには無条件で NtSetInformationThread を再適用
+              for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
+                DWORD aTid = rule.activeAudioTids[s];
+                if (aTid == 0) continue;
+                int sPrio = (s < rule.audioPriorities.size()) ? rule.audioPriorities[s] : rule.audioPriority;
+                if (IsFixedThreadPriority(sPrio)) {
+                  for (const auto &ti : threadInfos) {
+                    if (ti.tid == aTid && ti.hThread) {
+                      ApplyAbsoluteThreadPriority(ti.hThread, DecodeFixedThreadPriority(sPrio));
+                      break;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (curPrioClass != 0) {
+          if (rule.actualProcessPriorityClass != curPrioClass) {
+            rule.actualProcessPriorityClass = curPrioClass;
+            stateChanged = true;
+          }
+          if (!rule.processPriorityModified) {
+            rule.processPriorityClass = curPrioClass;
+          }
+        }
+
         for (size_t s = 0; s < rule.activeAudioTids.size(); ++s) {
           DWORD aTid = rule.activeAudioTids[s];
           if (aTid == 0)
@@ -4007,6 +4605,25 @@ bool ThreadIsolator::ScanAndIsolate() {
                 primaryAudioTid = ti.tid;
               }
               if (!isSlotBypassed) {
+                // ワンショットリセット要求 (長押し / ピッカー Normal 選択) の処理
+                if (s < rule.resetPriorityToZeroRequested.size() &&
+                    rule.resetPriorityToZeroRequested[s]) {
+                  SetThreadPriority(ti.hThread, THREAD_PRIORITY_NORMAL);
+                  rule.resetPriorityToZeroRequested[s] = false;
+                  if (s < rule.audioPriorities.size()) {
+                    rule.audioPriorities[s] = 0;
+                  }
+                  if (s == 0) {
+                    rule.audioPriority = 0;
+                    targetAudioPrio = 0;
+                  }
+                  ResetDynamicPriorityFetch(rule, static_cast<int>(s));
+                  if (s < rule.actualAudioBasePriorities.size()) {
+                    rule.actualAudioBasePriorities[s] = 0;
+                  }
+                  stateChanged = true;
+                }
+
                 int slotAudioPrio = (s < rule.audioPriorities.size())
                                         ? rule.audioPriorities[s]
                                         : targetAudioPrio;
@@ -4014,48 +4631,97 @@ bool ThreadIsolator::ScanAndIsolate() {
                                              assignedCore, assignedMask, rule)) {
                   stateChanged = true;
                 }
+
+                // 実測 Dynamic Priority (Dyn Pri) の更新 (確定・変更直後 + 3秒後に1回のみ再取得し完了)
+                if (ShouldFetchDynamicPriority(rule, s)) {
+                  int curRel = GetThreadPriority(ti.hThread);
+                  int actualDynPri = QueryThreadDynamicPriority(ti.hThread);
+                  if (actualDynPri <= 0) {
+                    DWORD effClass = (rule.processPriorityClass != 0)
+                                         ? rule.processPriorityClass
+                                         : NORMAL_PRIORITY_CLASS;
+                    int rank = ati::FindRankByPrio(effClass, curRel);
+                    const auto *entry = ati::GetMatrixEntryByRank(rank);
+                    actualDynPri = entry ? entry->basePriority : (curRel + 8);
+                  }
+                  if (rule.actualAudioBasePriorities.size() <= s) {
+                    rule.actualAudioBasePriorities.resize(s + 1, 0);
+                  }
+                  if (rule.actualThreadRelativePrios.size() <= s) {
+                    rule.actualThreadRelativePrios.resize(s + 1, 0);
+                  }
+                  rule.actualAudioBasePriorities[s] = actualDynPri;
+                  rule.actualThreadRelativePrios[s] = curRel;
+                  stateChanged = true;
+                }
               }
               break;
             }
           }
         }
-
-        // プロセス優先度クラスの動的適用
-        if (rule.processPriorityClass != 0) {
-          DWORD curPrioClass = GetPriorityClass(hProcess);
-          if (curPrioClass != 0 && curPrioClass != rule.processPriorityClass) {
-            if (SetPriorityClass(hProcess, rule.processPriorityClass)) {
-              char pLog[128];
-              snprintf(pLog, sizeof(pLog),
-                       "SetPriorityClass applied: PID=%lu, class=0x%lX", pid,
-                       rule.processPriorityClass);
-              LogDebug(pLog);
-              stateChanged = true;
-            } else if (rule.processPriorityClass == REALTIME_PRIORITY_CLASS) {
-              if (SetPriorityClass(hProcess, HIGH_PRIORITY_CLASS)) {
-                LogDebug("SetPriorityClass fallback to High applied");
-                stateChanged = true;
-              }
-            }
-          }
-        }
       }
 
-      // 真の侵入者スレッドにのみ降格優先度 (intruderPrio) を適用
+      // 侵入スレッド群すべてに -1 段階優先度を適用 (AppType == 1 のみ)
       // ※通常コア群へ正常退避できた通常スレッドの優先度には一切手を触れない！
-      for (DWORD intTid : intruderTids) {
-        for (const auto &ti : threadInfos) {
-          if (ti.tid == intTid) {
-            if (ti.priority != intruderPrio) {
-              SetThreadPriority(ti.hThread, intruderPrio);
-              char iLog[128];
-              snprintf(iLog, sizeof(iLog),
-                       "Adjusted true intruder thread priority to %d (audio is "
-                       "%d): PID=%lu, TID=%lu",
-                       intruderPrio, targetAudioPrio, pid, ti.tid);
-              LogDebug(iLog);
+      if (rule.appType == 1) {
+        for (DWORD intTid : intruderTids) {
+          for (const auto &ti : threadInfos) {
+            if (ti.tid == intTid) {
+              int effAudioPrio = (!rule.audioPriorities.empty())
+                                     ? rule.audioPriorities[0]
+                                     : targetAudioPrio;
+              if (isMultiSlot) {
+                for (size_t s = 0; s < targetCount; ++s) {
+                  if (s < rule.slotBypassed.size() && rule.slotBypassed[s])
+                    continue;
+                  DWORD_PTR sMask = 0;
+                  if (s < rule.audioSlotMasks.size() &&
+                      rule.audioSlotMasks[s] != 0) {
+                    sMask = rule.audioSlotMasks[s];
+                  } else if (s < rule.audioCores.size() &&
+                             rule.audioCores[s] >= 0 &&
+                             rule.audioCores[s] < 64) {
+                    sMask = (1ULL << rule.audioCores[s]);
+                  }
+                  if ((ti.currentAffinity & sMask) != 0) {
+                    effAudioPrio = (s < rule.audioPriorities.size())
+                                       ? rule.audioPriorities[s]
+                                       : targetAudioPrio;
+                    break;
+                  }
+                }
+              }
+
+              if (IsFixedThreadPriority(effAudioPrio)) {
+                int audioAbs = DecodeFixedThreadPriority(effAudioPrio);
+                int intruderAbs = (audioAbs > 1) ? (audioAbs - 1) : 1;
+                int curDyn = QueryThreadDynamicPriority(ti.hThread);
+                if (curDyn != intruderAbs) {
+                  bool ok = ApplyAbsoluteThreadPriority(ti.hThread, intruderAbs);
+                  if (!ok && intruderAbs >= 16) {
+                    SetThreadPriority(ti.hThread, THREAD_PRIORITY_HIGHEST);
+                  }
+                  char iLog[160];
+                  snprintf(iLog, sizeof(iLog),
+                           "Adjusted intruder thread Fixed KPRIORITY to %d "
+                           "(audio Fixed %d): PID=%lu, TID=%lu",
+                           intruderAbs, audioAbs, pid, ti.tid);
+                  LogDebug(iLog);
+                }
+              } else {
+                int stepLowerPrio = GetOneStepLowerPriority(effAudioPrio);
+                if (ti.priority != stepLowerPrio) {
+                  SetThreadPriority(ti.hThread, stepLowerPrio);
+                  char iLog[160];
+                  snprintf(iLog, sizeof(iLog),
+                           "Adjusted true intruder thread priority to %d (audio "
+                           "is %d): PID=%lu, TID=%lu",
+                           stepLowerPrio, effAudioPrio, pid, ti.tid);
+                  LogDebug(iLog);
+                }
+              }
+              break;
             }
-            break;
           }
         }
       }
@@ -4099,9 +4765,16 @@ bool ThreadIsolator::ScanAndIsolate() {
     }
 
     if (audioDetectedInAny) {
-      if (!rule.isAudioIsolated) {
+      if (!wasIsolatedBeforeScan || !rule.isAudioIsolated) {
         rule.isAudioIsolated = true;
+        WakeUpSteadyRule(rule, 2);
         stateChanged = true;
+      } else if (rule.postIsolationGraceTurns > 0) {
+        rule.postIsolationGraceTurns--;
+        if (rule.postIsolationGraceTurns == 0 && IsRuleInSteadyState(rule)) {
+          rule.steadyWaitTurns =
+              (steadyPeriodTurns > 1) ? (steadyPeriodTurns - 1) : 0;
+        }
       }
       if (rule.activePid != primaryAudioPid) {
         rule.activePid = primaryAudioPid;
@@ -4121,6 +4794,20 @@ bool ThreadIsolator::ScanAndIsolate() {
       if (rule.isAudioIsolated) {
         rule.isAudioIsolated = false;
         stateChanged = true;
+      }
+      if (rule.hasIntruderThreads) {
+        rule.hasIntruderThreads = false;
+        stateChanged = true;
+      }
+      if (wasIsolatedBeforeScan) {
+        rule.steadyWaitTurns = 0;
+        rule.postIsolationGraceTurns = 0;
+      } else if (rule.postIsolationGraceTurns > 0) {
+        rule.postIsolationGraceTurns--;
+        if (rule.postIsolationGraceTurns == 0 && IsRuleInSteadyState(rule)) {
+          rule.steadyWaitTurns =
+              (steadyPeriodTurns > 1) ? (steadyPeriodTurns - 1) : 0;
+        }
       }
       if (rule.activeAudioTid != 0) {
         ResumeAudioThreadIfSuspended(rule);
@@ -4203,12 +4890,8 @@ bool ThreadIsolator::ScanAndIsolate() {
       LogRuleStateChange(rule);
   }
 
-  m_heuristicsStatusText = heuristicsStatus;
-
   return stateChanged;
 }
-
-std::string ThreadIsolator::GetHeuristicsStatusText() const { return ""; }
 
 bool ThreadIsolator::IsAudioDgProcess(const std::string &name) {
   return _stricmp(name.c_str(), "audiodg.exe") == 0 ||
@@ -4317,6 +5000,24 @@ void ThreadIsolator::NormalizeSpecialRule(ProcessRule &rule) {
   } else if (slotCount > 1 && rule.slotBypassed.size() < slotCount) {
     rule.slotBypassed.resize(slotCount, false);
   }
+  if (rule.actualAudioBasePriorities.size() < slotCount) {
+    rule.actualAudioBasePriorities.resize(slotCount, 0);
+  }
+  if (rule.actualThreadRelativePrios.size() < slotCount) {
+    rule.actualThreadRelativePrios.resize(slotCount, 0);
+  }
+  if (rule.resetPriorityToZeroRequested.size() < slotCount) {
+    rule.resetPriorityToZeroRequested.resize(slotCount, false);
+  }
+  if (rule.normalPrioForceApplied.size() < slotCount) {
+    rule.normalPrioForceApplied.resize(slotCount, false);
+  }
+  if (rule.prioPollTurns.size() < slotCount) {
+    rule.prioPollTurns.resize(slotCount, 0);
+  }
+  if (rule.prioRefetchTicks.size() < slotCount) {
+    rule.prioRefetchTicks.resize(slotCount, 0);
+  }
 }
 
 size_t ThreadIsolator::GetRuleSlotCount(const ProcessRule &rule) {
@@ -4413,7 +5114,6 @@ bool ThreadIsolator::ApplyUnlistedMaskLocked(int mode, DWORD_PTR targetMask) {
       m_unlistedMaskedPids.insert(pe.th32ProcessID);
       if (SetProcessAffinityByPid(pe.th32ProcessID, targetMask)) {
         m_unlistedApplyCount++;
-        Sleep(2);
       }
     } while (Process32Next(hSnap, &pe));
   }
@@ -4489,32 +5189,6 @@ void ThreadIsolator::UpdateUnlistedExclusions(
 DWORD ThreadIsolator::GetUnlistedApplyCount() const {
   std::lock_guard<std::mutex> lock(m_mutex);
   return m_unlistedApplyCount;
-}
-
-bool ThreadIsolator::IsHeuristicsActive() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  for (const auto &r : m_config.rules) {
-    if (r.isRunning && !r.isBypassed) {
-      if (r.searchPhase == 1 || r.searchPhase == 3) {
-        return true;
-      }
-      if (IsMultiSlotRule(r) && !r.multiSearchSleeping &&
-          r.multiSearchTurns > 0) {
-        return true;
-      }
-    }
-  }
-  return false;
-}
-
-bool ThreadIsolator::IsFastPollingRequired() const {
-  std::lock_guard<std::mutex> lock(m_mutex);
-  for (const auto &pair : m_chromiumAudioStates) {
-    if (pair.second.samplingActive && !pair.second.isDecline) {
-      return true;
-    }
-  }
-  return false;
 }
 
 UINT ThreadIsolator::GetDesiredPollingIntervalMs() const {

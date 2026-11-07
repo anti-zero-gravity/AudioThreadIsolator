@@ -15,6 +15,13 @@
 
 namespace ati {
 
+#ifndef ATI_FIXED_PRIO_HELPERS
+#define ATI_FIXED_PRIO_HELPERS
+inline bool IsFixedThreadPriority(int v) { return v >= 101 && v <= 131; }
+inline int DecodeFixedThreadPriority(int v) { return v - 100; }
+inline int EncodeFixedThreadPriority(int p) { return 100 + p; }
+#endif
+
 // コアトポロジー情報 (QITuner 準拠)
 struct CoreInfo {
   int logicalIndex;
@@ -84,6 +91,14 @@ struct ProcessRule {
       false; // Half-Isolated判定によるLowest(-2)への自動昇格が実行済みか
   bool chromiumScanAttempted =
       false; // Chromium起動時/Bypass復帰時のAudioService特定走査を試行済みか(未特定時はStandbyへ移行し毎秒走査を抑止)
+  std::vector<int> actualAudioBasePriorities; // 各スロットの実際の物理 Dynamic Priority (Dyn Pri)
+  std::vector<int> actualThreadRelativePrios; // 各スロットの実測相対優先度 (GetThreadPriority)
+  std::vector<bool> resetPriorityToZeroRequested; // 相対0 (Normal) へのワンショットリセット要求
+  std::vector<bool> normalPrioForceApplied; // ピッカーにより相対0 (Normal) を明示適用済みか (true時は淡緑背景を解除し白に戻す)
+  std::vector<int> prioPollTurns; // 実prio取得ステージ (0:未取得->確定直後1回目, 1:3秒後2回目待ち, 2:完了)
+  std::vector<ULONGLONG> prioRefetchTicks; // 2回目再取得予定時刻 (GetTickCount64() + 3000ms)
+  bool processPriorityModified = false; // Col 3 (Process Priority) が明示変更済みか (false時は淡緑背景・OS未アタッチ)
+  DWORD actualProcessPriorityClass = NORMAL_PRIORITY_CLASS; // 実測プロセス優先度クラス (GetPriorityClass)
 
   // 前回終了時ステータス記録と照合 (起動時引き継ぎ用)
   DWORD lastAudioPid = 0; // 前回終了時ステータス記録: オーディオPID
@@ -95,6 +110,10 @@ struct ProcessRule {
                        // カウントダウン(Standby 10..3), 3:
                        // 終盤再確定(Standby 2..1), 4: sleeping...
   int searchTurns = 0; // 各フェーズでの残りターン数 (500ms単位)
+
+  // 定常状態の 3 秒周期監視ゲート管理 (AppType 0, 2 以外)
+  int steadyWaitTurns = 0;         // 定常時の残りスキップターン数
+  int postIsolationGraceTurns = 0; // 隔離直後・UI操作直後の 500ms 即応維持ターン数
 };
 
 // 全体設定
@@ -102,8 +121,8 @@ struct GlobalConfig {
   int defaultAudioCore; // デフォルト隔離コア (代表コア #0 始まり)
   DWORD_PTR defaultAudioAffinityMask; // デフォルト隔離オーディオコアマスク (0:
                                       // defaultAudioCoreから単一生成)
-  int defaultAudioPriority;     // デフォルトオーディオ優先度 (-15:
-                                // THREAD_PRIORITY_IDLE)
+  DWORD defaultProcessPriorityClass =
+      IDLE_PRIORITY_CLASS; // デフォルトプロセス優先度クラス (初期値: Idle 0x40)
   DWORD_PTR normalAffinityMask; // 通常スレッド退避先マスク (0:
                                 // 隔離コア以外の全コア自動)
   int pollingIntervalMs;        // 監視周期 (デフォルト 1000ms)
@@ -139,7 +158,6 @@ public:
   void AddRule(const ProcessRule &rule);
   void RemoveRule(size_t index);
   void UpdateRule(size_t index, const ProcessRule &rule);
-  void ToggleProcessHeuristics(size_t index);
   void ToggleProcessBypass(size_t index, size_t slot = 0);
   void RestartSearch(size_t index);
   void ResumeMultiSearch(size_t index);
@@ -166,13 +184,9 @@ public:
   // Chromium判定: exe ファイルから "chromeos" 文字列を検索
   static bool DetectChromiumExe(HANDLE hProcess);
 
-  // ヒューリスティック状態テキスト取得 (GUI ステータスバー表示用)
-  std::string GetHeuristicsStatusText() const;
-
 private:
   mutable std::mutex m_mutex;
   GlobalConfig m_config;
-  std::string m_heuristicsStatusText;
   bool m_initialNeedSave = false;
 
   // ── リファクタリング: 共通ヘルパーメソッド ──
@@ -186,6 +200,11 @@ private:
   static bool UpdateDisplayThreadCount(ProcessRule &rule, int totalThreadCount);
   // ルール状態変更ログ出力
   static void LogRuleStateChange(const ProcessRule &rule);
+  // 定常状態 (AppType 0, 2 以外) の 3 秒周期監視ゲート判定・即時起床ヘルパー
+  bool IsRuleInSteadyState(const ProcessRule &rule) const;
+  static void WakeUpSteadyRule(ProcessRule &rule, int graceTurns = 2);
+  static void ResetDynamicPriorityFetch(ProcessRule &rule, int targetSlot = -1);
+  static bool ShouldFetchDynamicPriority(ProcessRule &rule, size_t slot);
 
   // オーディオスレッドへの優先度・Ideal
   // Processor・アフィニティマスク適用共通ルーチン (Type 1 & Type 2 共通)
@@ -211,6 +230,9 @@ private:
   // 非Chromium: 親プロセスマスク拡張済み PID セット
   // (差分検出・定常時API呼び出し削減用)
   std::unordered_set<DWORD> m_nonChromiumMaskedPids;
+
+  // 全種別共通: HighQoS 初回適用済み PID セット (新規検出PIDに1回のみ発行)
+  std::unordered_set<DWORD> m_highQosAppliedPids;
 
   // Chromium モード: コマンドライン走査済み子プロセス PID セット
   // (毎秒総当たり走査防止)
@@ -323,9 +345,6 @@ public:
   static void NormalizeSpecialRule(ProcessRule &rule);
   static size_t GetRuleSlotCount(const ProcessRule &rule);
   static bool IsMultiSlotRule(const ProcessRule &rule);
-  bool IsHeuristicsActive() const;
-  // 250ms 高速検証タイマー要求中かどうか判定
-  bool IsFastPollingRequired() const;
   // 動的タイマー要求周期 (ms) を取得
   UINT GetDesiredPollingIntervalMs() const;
 };

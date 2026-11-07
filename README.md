@@ -6,36 +6,36 @@
 
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-Support-F16061?style=flat-square&logo=ko-fi&logoColor=white)](https://ko-fi.com/antizerogravity)
 
-**Audio Thread Isolator (ATI)** is a lightweight Windows background utility that automatically detects, isolates, and optimizes real-time audio playback threads (WASAPI, ASIO, etc.) to dedicated CPU cores.
+**Audio Thread Isolator (ATI)** is a lightweight Windows background utility that automatically scans, identifies, and isolates audio output threads of music players, video players, web browsers, DAWs, and games onto dedicated CPU cores designated by the user.
 
-By isolating critical audio threads onto dedicated cores and migrating heavy background threads (UI rendering, decoding, network I/O, etc.) to other cores, ATI effectively minimizes buffer underruns, audio dropouts, and micro-jitter caused by CPU core contention.
+ATI was designed to evacuate heavy, noisy regular threads—such as UI rendering, decoding, and network communication—away from dedicated audio cores to keep contention and interference away from the audio thread, allowing listeners to enjoy the distinctive sound quality achieved when lowering the audio thread priority as far as possible.
+By preparing an environment coordinated with device AffinityMask and priority settings via MSI Affinity V9 alongside MMCSS registry priority tuning, ATI reduces interrupts both to and from the audio thread, improving PC music playback sound quality across web browsing, gaming, and every other scenario.
 
 ---
 
 ## Key Features
 
-- **Ultra-Lightweight Native Architecture**:
-  - Implemented in modern C++17 using pure Win32 API and Common Controls.
-  - Zero external dependencies or runtime requirements (no .NET or VC++ runtimes).
-  - Single compact binary (~1.15 MB) with negligible memory footprint (~1–2 MB) and near-zero CPU usage.
-- **Audio Thread Detection Engine**:
-  - Automatically identifies real-time playback threads across media players, browsers (Chromium / Vivaldi / Chrome), DAWs, and audio applications via thread descriptions, module inspection, and application-specific profiles.
+- **Low-Resource Background Operation**
+- **Automatic Playback Thread Detection & Dynamic Priority Display**:
+  - Identifies and remembers the audio thread as the configuration target, acquiring and displaying its dynamic priority upon identification.
 - **Multi-Core Affinity Support**:
-  - Assign playback threads to one or multiple dedicated CPU cores (e.g., `#1` or `#1, #2`) to handle heavy real-time audio workloads without dropouts.
-- **Always on Top & Window Resizing**:
-  - Compact right-side controls with an instant `Always on Top` checkbox.
-  - Fully resizable window layout (`WS_THICKFRAME`) with automatic DPI scaling (Per-Monitor V2).
-- **System Tray Integration**:
-  - Seamlessly minimize or close (`×`) to the system notification area (system tray).
-  - Supports auto-start on Windows boot via registry integration.
-- **Realtime Priority (Base 16–31) & Expanded Control Scope via Administrator Launch**:
-  - Elevate seamlessly via the taskbar system tray context menu (`Restart as Administrator`).
-  - Automatically enables `SeIncreaseBasePriorityPrivilege` and `SeDebugPrivilege`, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) in the 2D Priority Matrix Picker (silently falls back to High priority when not running as Administrator).
-  - **Control Scope by Launch Mode**: Launching in Administrator mode grants access to system services and elevated processes, increasing the number of processes eligible for Unlisted Hard Affinity masking and reducing processes (such as `audiodg.exe` or elevated games/apps) that would otherwise fall into `sleeping...` due to insufficient thread inspection permissions.
-- **Automatic Hard Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
-  - Checking either mutually exclusive `Apply` checkbox in Global Settings (Exclude `Default Audio Core` or Apply `Excluded` mask) applies `SetProcessAffinityMask` to all non-monitored processes and automatically masks newly spawned PIDs at `INI×10` polling intervals (displaying `● <count> Unmonitored Processes Masked` at the head of the main window legend).
-  - Processes checked in the leading red `!` column of `Select Process` (`[Add]`) are individually excluded from unlisted polling mask targets (`UnlistedExclusions`).
-  - Unchecking `Apply` stops polling for new processes while keeping existing masks; clicking the green `Unmask All` button explicitly restores OS default full-core affinity across all non-monitored processes.
+  - Identified threads can be assigned across multiple CPU cores.
+- **Intuitive Priority Control via 2D Priority Matrix Picker**
+- **Always on Top & Window Resizing**
+- **Intuitive GUI & System Tray Integration**:
+  - Add target applications via checkboxes from the running process list.
+  - Minimize or close (`×`) to the system notification area (system tray).
+  - Supports auto-start on Windows boot.
+- **Realtime Priority & `audiodg.exe` Management via Restart as Administrator**:
+  - Elevate with one click from the system tray right-click menu (`Restart as Administrator`).
+  - Automatically enables OS privileges, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) normally restricted under standard user launch.
+  - **Control Scope Differences by Launch Mode**:
+    - Enables priority configuration and core isolation for the PPL (Protected Process Light) protected `audiodg.exe` process.
+    - Increases the number of processes eligible for Unlisted affinity masking.
+- **Automatic Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
+  - Checking either mutually exclusive checkbox in Global Settings (Exclude `Default Audio Core` / Apply `Excluded` mask) applies `SetProcessAffinityMask` across all processes not registered in ATI and automatically applies it to newly launched processes at `INI×10` intervals. The cumulative count is displayed at the bottom-left as `● <count> Unmonitored Processes Masked`.
+  - Processes checked in the leading `!` column of `[Add]` (`Select Process`) are excluded from unlisted all-process masking.
+  - Stopping unlisted all-process monitoring lights up `Unmask All` in green; clicking it clears masks across all processes at once.
 
 ---
 
@@ -66,7 +66,7 @@ ATI inspects threads within registered processes using the following detection m
 - **Chromium Browsers**:
   - Automatically identifies the dedicated Audio Service utility process and isolates its playback thread.
 - **Voicemeeter**:
-  - Automatically expands and manages both network I/O and main audio engine threads across dedicated rows.
+  - Automatically expands and manages both network I/O and main audio engine threads across 2 dedicated rows.
 - **Roon**:
   - Directly identifies and isolates the core PCM streaming thread in a single slot.
 
@@ -99,11 +99,10 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 
 ### 3. Thread Priority & Sound Quality Philosophy
 - **Advantages of Low Priority Operation (Idle)**:
-  - Guided by the design philosophy that "Priority 1 (Idle) yields the highest sound fidelity by minimizing jitter and CPU contention," ATI sets `Idle (-15)` as the default audio thread priority. Setting the processor quantum to ["Short / Variable / 1:1"](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/BkMrmGLqMx#2-3-Quantum-Length-Table-and-Tuning-Quick-Reference-by-Use-Case) is strongly recommended.
-- **Flexible Per-Process Customization**:
-  - Depending on your specific Windows system configuration and background load, audio dropouts may occur. In addition to global default settings, ATI allows independent per-process adjustment of both process priority and audio thread priority.
-- **Catering to Diverse Listening Preferences**:
-  - While ATI's core philosophy centers on "the lowest priority that guarantees dropout-free playback achieves the highest audio quality," the 2D Priority Matrix Picker also enables instant elevation up to `Realtime (31)`. This allows users to audition and compare subtle sound quality characteristics across the entire priority spectrum in real time.
+  - Following the tuning policy that "Priority 1 achieves the best sound quality," stutters or audio dropouts can be expected as a result of thread execution being deferred. Setting the processor quantum to ["Short / Variable / 1:1"](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/BkMrmGLqMx#2-3-Quantum-Length-Table-and-Tuning-Quick-Reference-by-Use-Case) is strongly recommended.
+- **Flexibility for Diverse Needs**:
+  - While ATI is built on the philosophy that "the lowest priority free of audio dropouts delivers superior sound quality," extreme configurations are also possible—such as keeping the process priority at Idle while setting only the audio thread to Priority 31, or conversely setting the process to Realtime while setting the audio thread priority to 1.
+  - You can also create unallocated CPU cores left unchecked in both the Audio mask and the Excluded (all other threads) mask. These spare cores are intended for signal paths spanning multiple processes, enabling dedicated 1-process-per-core isolation such as `#4 Playback App → #5 Voicemeeter → #6 audiodg → #7 LAN Device → Remote PC`.
 
 ### 4. Tips (Application-Specific Configuration)
 - **Roon**:

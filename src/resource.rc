@@ -8,26 +8,26 @@ LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
 IDI_APP_ICON ICON "app.ico"
 
 // Main Dialog
-IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 102
+IDD_MAIN_DIALOG DIALOGEX 0, 0, 470, 110
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME | WS_CLIPCHILDREN
 EXSTYLE WS_EX_APPWINDOW
-CAPTION "Audio Thread Isolator v1.0.8"
+CAPTION "Audio Thread Isolator v2.0.0"
 FONT 9, "Segoe UI", 400, 0, 0x0
 BEGIN
     CONTROL         "", IDC_LIST_PROCESSES, "SysListView32", 
                     LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | WS_BORDER | WS_TABSTOP | WS_CLIPSIBLINGS, 
-                    6, 6, 404, 82
+                    6, 6, 404, 88
 
     CONTROL         "Always on Top", IDC_CHK_ALWAYS_ON_TOP, "Button", 
                     BS_AUTOCHECKBOX | WS_TABSTOP | WS_CLIPSIBLINGS, 415, 6, 65, 9
 
-    PUSHBUTTON      "&Edit", IDC_BTN_EDIT, 420, 24, 52, 10, WS_CLIPSIBLINGS
-    PUSHBUTTON      "&Add", IDC_BTN_ADD, 420, 36, 52, 10, WS_CLIPSIBLINGS
-    PUSHBUTTON      "&Remove", IDC_BTN_REMOVE, 420, 48, 52, 10, WS_CLIPSIBLINGS
+    PUSHBUTTON      "&Edit", IDC_BTN_EDIT, 420, 22, 52, 11, WS_CLIPSIBLINGS
+    PUSHBUTTON      "&Add", IDC_BTN_ADD, 420, 36, 52, 11, WS_CLIPSIBLINGS
+    PUSHBUTTON      "&Remove", IDC_BTN_REMOVE, 420, 50, 52, 11, WS_CLIPSIBLINGS
     
-    PUSHBUTTON      "&Settings", IDC_BTN_SETTINGS, 420, 72, 52, 10, WS_CLIPSIBLINGS
+    PUSHBUTTON      "&Settings", IDC_BTN_SETTINGS, 420, 64, 52, 11, WS_CLIPSIBLINGS
 
-    PUSHBUTTON      "E&xit", IDC_BTN_EXIT, 420, 96, 52, 10, WS_CLIPSIBLINGS
+    PUSHBUTTON      "E&xit", IDC_BTN_EXIT, 420, 78, 52, 11, WS_CLIPSIBLINGS
 END
 
 
@@ -48,7 +48,7 @@ BEGIN
 END
 
 // Global Settings Dialog
-IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 320, 170
+IDD_SETTINGS_DIALOG DIALOGEX 0, 0, 320, 150
 STYLE DS_SETFONT | DS_MODALFRAME | WS_POPUP | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE
 CAPTION "Global Settings"
 FONT 9, "Segoe UI", 400, 0, 0x0
@@ -69,15 +69,12 @@ BEGIN
     RTEXT           "to ALL unlisted processes ->", IDC_STATIC_NORMAL_DESC2, 150, 85, 120, 8
     CONTROL         "Apply", IDC_BTN_APPLY_NORMAL_MASK, "Button", BS_AUTOCHECKBOX | WS_TABSTOP, 272, 75, 36, 18
 
-    LTEXT           "Audio Thread Priority:", -1, 14, 102, 106, 10
-    COMBOBOX        IDC_COMBO_AUDIO_PRIORITY, 122, 100, 85, 100, CBS_DROPDOWNLIST | CBS_OWNERDRAWFIXED | CBS_HASSTRINGS | WS_VSCROLL | WS_TABSTOP
+    LTEXT           "Polling Interval (ms):", -1, 14, 102, 106, 10
+    EDITTEXT        IDC_EDIT_POLLING_MS, 122, 100, 24, 12, ES_AUTOHSCROLL | ES_NUMBER | ES_CENTER
 
-    LTEXT           "Polling Interval (ms):", -1, 14, 122, 106, 10
-    EDITTEXT        IDC_EDIT_POLLING_MS, 122, 120, 24, 12, ES_AUTOHSCROLL | ES_NUMBER | ES_CENTER
-
-    CONTROL         "Unmask All", IDC_BTN_RELEASE_MASK, "Button", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, 12, 146, 62, 15
-    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 216, 146, 45, 15
-    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 265, 146, 45, 15
+    CONTROL         "Unmask All", IDC_BTN_RELEASE_MASK, "Button", BS_OWNERDRAW | WS_TABSTOP | WS_DISABLED, 12, 126, 62, 15
+    DEFPUSHBUTTON   "OK", IDC_BTN_SETTINGS_OK, 216, 126, 45, 15
+    PUSHBUTTON      "Cancel", IDC_BTN_SETTINGS_CANCEL, 265, 126, 45, 15
 END
 
 // Process Rule Edit Dialog
@@ -146,8 +143,8 @@ END
 
 // Version Information
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,0,8,0
-PRODUCTVERSION  1,0,8,0
+FILEVERSION     2,0,0,0
+PRODUCTVERSION  2,0,0,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -159,11 +156,11 @@ BEGIN
         BLOCK "040904b0"
         BEGIN
             VALUE "FileDescription",  "Audio Thread Isolator\0"
-            VALUE "FileVersion",      "1.0.8.0\0"
+            VALUE "FileVersion",      "2.0.0.0\0"
             VALUE "InternalName",     "ATI\0"
             VALUE "OriginalFilename", "ATI.exe\0"
             VALUE "ProductName",      "Audio Thread Isolator\0"
-            VALUE "ProductVersion",   "1.0.8\0"
+            VALUE "ProductVersion",   "2.0.0\0"
         END
     END
     BLOCK "VarFileInfo"
@@ -172,7 +169,7 @@ BEGIN
     END
 END
 
-// Priority Matrix Embedded Assets (Standalone Single EXE: 42 Rank/Pair PNGs + Base + HitMap)
+// Priority Matrix Embedded Assets (Standalone Single EXE: 42 Rank/Pair PNGs + 6 Row PNGs + Base + HitMap)
 3000 RCDATA "ui_parts/hit_map.bin"
 3001 RCDATA "ui_parts/base_dark_layer.png"
 3101 RCDATA "ui_parts/full_composites/matrix_rank_01.png"
@@ -217,4 +214,10 @@ END
 3204 RCDATA "ui_parts/full_composites/matrix_normal_col_4.png"
 3205 RCDATA "ui_parts/full_composites/matrix_normal_col_5.png"
 3206 RCDATA "ui_parts/full_composites/matrix_normal_col_6.png"
+3300 RCDATA "ui_parts/full_composites/matrix_row_0.png"
+3301 RCDATA "ui_parts/full_composites/matrix_row_1.png"
+3302 RCDATA "ui_parts/full_composites/matrix_row_2.png"
+3303 RCDATA "ui_parts/full_composites/matrix_row_3.png"
+3304 RCDATA "ui_parts/full_composites/matrix_row_4.png"
+3305 RCDATA "ui_parts/full_composites/matrix_row_5.png"
 

@@ -236,9 +236,20 @@ static std::string GetThreadShortName(int prio) {
   }
 }
 
-static std::string FormatThreadPriorityDisplay(DWORD pClass, int threadPrio) {
+static std::string FormatThreadPriorityDisplay(DWORD pClass, int threadPrio,
+                                               int actualBasePri = 0) {
+  if (ati::IsFixedThreadPriority(threadPrio)) {
+    int fixedVal = ati::DecodeFixedThreadPriority(threadPrio);
+    return "Fixed " + std::to_string((actualBasePri > 0) ? actualBasePri : fixedVal);
+  }
+
   DWORD effectiveClass = (pClass != 0) ? pClass : NORMAL_PRIORITY_CLASS;
   std::string name = GetThreadShortName(threadPrio);
+
+  // 実測物理 Base Priority が取得できている場合は実測値を反映
+  if (actualBasePri > 0) {
+    return name + " " + std::to_string(actualBasePri);
+  }
 
   if (effectiveClass == NORMAL_PRIORITY_CLASS) {
     int fgBase = 9;
@@ -258,6 +269,58 @@ static std::string FormatThreadPriorityDisplay(DWORD pClass, int threadPrio) {
     return name + " " + std::to_string(entry->basePriority);
   }
   return GetPriorityString(threadPrio);
+}
+
+static std::string FormatRuleThreadPriorityDisplay(const ati::ProcessRule &r,
+                                                   size_t slot) {
+  DWORD effClass = (!r.processPriorityModified && r.isRunning &&
+                    r.actualProcessPriorityClass != 0)
+                       ? r.actualProcessPriorityClass
+                       : r.processPriorityClass;
+  if (effClass == 0)
+    effClass = NORMAL_PRIORITY_CLASS;
+
+  int rowPrio =
+      (slot < r.audioPriorities.size()) ? r.audioPriorities[slot] : r.audioPriority;
+  int actBase = (slot < r.actualAudioBasePriorities.size())
+                    ? r.actualAudioBasePriorities[slot]
+                    : 0;
+  bool isForceZero = (slot < r.normalPrioForceApplied.size() &&
+                      r.normalPrioForceApplied[slot]);
+
+  if (ati::IsFixedThreadPriority(rowPrio)) {
+    return FormatThreadPriorityDisplay(effClass, rowPrio, actBase);
+  }
+
+  // Col 2 未操作 (淡緑) かつ実測 Dyn Pri がある場合:
+  // プロセスクラスの7段階相対優先度に一致すれば <RelativeName> <DynPri>、一致しなければ Fixed <DynPri>
+  if (rowPrio == 0 && !isForceZero && actBase > 0) {
+    if (slot < r.actualThreadRelativePrios.size()) {
+      int actRel = r.actualThreadRelativePrios[slot];
+      for (int i = 0; i < 49; ++i) {
+        if (ati::kPriorityMatrixEntries[i].processPriorityClass == effClass &&
+            ati::kPriorityMatrixEntries[i].threadPriority == actRel &&
+            ati::kPriorityMatrixEntries[i].basePriority == actBase) {
+          return GetThreadShortName(actRel) + " " + std::to_string(actBase);
+        }
+      }
+    }
+    int matchedRel = 999;
+    for (int i = 0; i < 49; ++i) {
+      if (ati::kPriorityMatrixEntries[i].processPriorityClass == effClass &&
+          ati::kPriorityMatrixEntries[i].basePriority == actBase) {
+        matchedRel = ati::kPriorityMatrixEntries[i].threadPriority;
+        if (matchedRel == 0)
+          break;
+      }
+    }
+    if (matchedRel != 999) {
+      return GetThreadShortName(matchedRel) + " " + std::to_string(actBase);
+    }
+    return "Fixed " + std::to_string(actBase);
+  }
+
+  return FormatThreadPriorityDisplay(effClass, rowPrio, actBase);
 }
 
 // --- コア番号・マスク変換ヘルパー (ANSI) ---
@@ -463,8 +526,23 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
   }
   config.defaultAudioCore = firstCore;
 
-  config.defaultAudioPriority = GetPrivateProfileIntA(
-      "Global", "DefaultAudioPriority", THREAD_PRIORITY_IDLE, iniPath.c_str());
+  char procPrioBuf[64] = {0};
+  GetPrivateProfileStringA("Global", "DefaultProcessPriority", "Idle",
+                           procPrioBuf, sizeof(procPrioBuf), iniPath.c_str());
+  std::string ppStr(procPrioBuf);
+  if (ppStr == "Realtime") {
+    config.defaultProcessPriorityClass = REALTIME_PRIORITY_CLASS;
+  } else if (ppStr == "High") {
+    config.defaultProcessPriorityClass = HIGH_PRIORITY_CLASS;
+  } else if (ppStr == "Above Normal" || ppStr == "AboveNormal") {
+    config.defaultProcessPriorityClass = ABOVE_NORMAL_PRIORITY_CLASS;
+  } else if (ppStr == "Normal") {
+    config.defaultProcessPriorityClass = NORMAL_PRIORITY_CLASS;
+  } else if (ppStr == "Below Normal" || ppStr == "BelowNormal") {
+    config.defaultProcessPriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+  } else {
+    config.defaultProcessPriorityClass = IDLE_PRIORITY_CLASS;
+  }
 
   char normalMaskBuf[64] = {0};
   GetPrivateProfileStringA("Global", "NormalCores", "0", normalMaskBuf, 64,
@@ -634,9 +712,10 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
         rule.processName = isVmProc ? baseProcName : procName;
         rule.audioCore = config.defaultAudioCore;
         rule.audioAffinityMask = config.defaultAudioAffinityMask;
-        rule.audioPriority = config.defaultAudioPriority;
+        rule.audioPriority = 0;
         rule.targetPriority = 0;
         rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
+        rule.processPriorityModified = false;
         rule.applyCount = 0;
         rule.currentThreadCount = 0;
         rule.detectedThreadName = "";
@@ -737,6 +816,15 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
               }
             }
           } else if (k == "AudioPriority" || k == "Priority") {
+            auto parsePrioTok = [](const std::string &s) -> int {
+              if (!s.empty() && (s[0] == 'F' || s[0] == 'f')) {
+                int fp = atoi(s.c_str() + 1);
+                if (fp >= 1 && fp <= 31) {
+                  return ati::EncodeFixedThreadPriority(fp);
+                }
+              }
+              return atoi(s.c_str());
+            };
             rule.audioPriorities.clear();
             std::stringstream ss(v);
             std::string ptok;
@@ -748,13 +836,13 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
                      isspace(static_cast<unsigned char>(ptok.back())))
                 ptok.pop_back();
               if (!ptok.empty()) {
-                rule.audioPriorities.push_back(atoi(ptok.c_str()));
+                rule.audioPriorities.push_back(parsePrioTok(ptok));
               }
             }
             if (!rule.audioPriorities.empty()) {
               rule.audioPriority = rule.audioPriorities[0];
             } else {
-              rule.audioPriority = atoi(v.c_str());
+              rule.audioPriority = parsePrioTok(v);
               rule.audioPriorities.push_back(rule.audioPriority);
             }
           } else if (k == "NormalCores" || k == "OtherThanAudio" ||
@@ -800,26 +888,37 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
           } else if (k == "Decline") {
             rule.isDeclineBoost = (atoi(v.c_str()) != 0);
           } else if (k == "ProcessPriority" || k == "ProcessPriorityClass") {
-            if (v.length() > 2 &&
-                (v.substr(0, 2) == "0x" || v.substr(0, 2) == "0X")) {
+            if (v == "Default" || v == "Untouched" || v == "0" || v.empty()) {
+              rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
+              rule.processPriorityModified = false;
+            } else if (v.length() > 2 &&
+                       (v.substr(0, 2) == "0x" || v.substr(0, 2) == "0X")) {
               rule.processPriorityClass =
                   static_cast<DWORD>(_strtoui64(v.c_str(), nullptr, 16));
+              rule.processPriorityModified = (rule.processPriorityClass != 0);
             } else if (v == "Realtime") {
               rule.processPriorityClass = REALTIME_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else if (v == "High") {
               rule.processPriorityClass = HIGH_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else if (v == "Above Normal" || v == "AboveNormal") {
               rule.processPriorityClass = ABOVE_NORMAL_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else if (v == "Normal") {
               rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else if (v == "Below Normal" || v == "BelowNormal") {
               rule.processPriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else if (v == "Idle") {
               rule.processPriorityClass = IDLE_PRIORITY_CLASS;
+              rule.processPriorityModified = true;
             } else {
               DWORD parsedPrio = static_cast<DWORD>(atoi(v.c_str()));
               rule.processPriorityClass =
                   (parsedPrio != 0) ? parsedPrio : NORMAL_PRIORITY_CLASS;
+              rule.processPriorityModified = (parsedPrio != 0);
             }
           }
         }
@@ -872,7 +971,7 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
       merged.isBypassed = false;
       merged.audioSlotMasks.resize(2, 0);
       merged.audioCores.resize(2, config.defaultAudioCore);
-      merged.audioPriorities.resize(2, config.defaultAudioPriority);
+      merged.audioPriorities.resize(2, 0);
       merged.slotBypassed.resize(2, false);
 
       for (int s = 0; s < 2; ++s) {
@@ -902,6 +1001,14 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
         merged.slotBypassed[s] = sr.isBypassed;
       }
       merged.audioPriority = merged.audioPriorities[0];
+      merged.processPriorityModified =
+          (vm.slotRules[0].processPriorityModified ||
+           vm.slotRules[1].processPriorityModified);
+      if (vm.slotRules[0].processPriorityModified) {
+        merged.processPriorityClass = vm.slotRules[0].processPriorityClass;
+      } else if (vm.slotRules[1].processPriorityModified) {
+        merged.processPriorityClass = vm.slotRules[1].processPriorityClass;
+      }
       ati::ThreadIsolator::NormalizeSpecialRule(merged);
 
       bool dupRule = false;
@@ -929,9 +1036,8 @@ static void SaveConfig(const ati::GlobalConfig &config,
                              FormatMaskToCoreList(defaultAudioMask).c_str(),
                              iniPath.c_str());
 
-  WritePrivateProfileStringA(
-      "Global", "DefaultAudioPriority",
-      std::to_string(config.defaultAudioPriority).c_str(), iniPath.c_str());
+  WritePrivateProfileStringA("Global", "DefaultProcessPriority", nullptr,
+                             iniPath.c_str());
 
   char hexBuf[32] = {0};
   snprintf(hexBuf, sizeof(hexBuf), "0x%llX",
@@ -1028,8 +1134,13 @@ static void SaveConfig(const ati::GlobalConfig &config,
           coreStr = std::to_string(rule.audioCores[s]);
         }
         val += ", AudioCore:" + coreStr;
-        val += ", AudioPriority:" + std::to_string(rule.audioPriorities[s]);
-        if (rule.processPriorityClass != 0) {
+        int pVal = rule.audioPriorities[s];
+        val += ", AudioPriority:" +
+               (ati::IsFixedThreadPriority(pVal)
+                    ? ("F" +
+                       std::to_string(ati::DecodeFixedThreadPriority(pVal)))
+                    : std::to_string(pVal));
+        if (rule.processPriorityModified && rule.processPriorityClass != 0) {
           val += ", ProcessPriority:" +
                  GetProcessPriorityString(rule.processPriorityClass);
         }
@@ -1118,13 +1229,21 @@ static void SaveConfig(const ati::GlobalConfig &config,
       for (size_t pi = 0; pi < rule.audioPriorities.size(); ++pi) {
         if (pi > 0)
           prioListStr += ", ";
-        prioListStr += std::to_string(rule.audioPriorities[pi]);
+        int pVal = rule.audioPriorities[pi];
+        prioListStr += ati::IsFixedThreadPriority(pVal)
+                           ? ("F" + std::to_string(
+                                        ati::DecodeFixedThreadPriority(pVal)))
+                           : std::to_string(pVal);
       }
       val += ", AudioPriority:" + prioListStr;
     } else {
-      val += ", AudioPriority:" + std::to_string(rule.audioPriority);
+      int pVal = rule.audioPriority;
+      val += ", AudioPriority:" +
+             (ati::IsFixedThreadPriority(pVal)
+                  ? ("F" + std::to_string(ati::DecodeFixedThreadPriority(pVal)))
+                  : std::to_string(pVal));
     }
-    if (rule.processPriorityClass != 0) {
+    if (rule.processPriorityModified && rule.processPriorityClass != 0) {
       val += ", ProcessPriority:" +
              GetProcessPriorityString(rule.processPriorityClass);
     }
@@ -1245,16 +1364,16 @@ static void RefreshListView(HWND hList,
                            const_cast<LPSTR>(displayName.c_str()));
 
       // 2: Thread Priority
-      int rowPrio = (s < r.audioPriorities.size()) ? r.audioPriorities[s]
-                                                   : r.audioPriority;
-      std::string prioStr =
-          FormatThreadPriorityDisplay(r.processPriorityClass, rowPrio);
+      std::string prioStr = FormatRuleThreadPriorityDisplay(r, s);
       ListView_SetItemText(hList, itemIdx, 2,
                            const_cast<LPSTR>(prioStr.c_str()));
 
       // 3: Process Priority
-      std::string procPrioStr =
-          GetProcessPriorityString(r.processPriorityClass);
+      DWORD dispProcClass = (!r.processPriorityModified && r.isRunning &&
+                             r.actualProcessPriorityClass != 0)
+                                ? r.actualProcessPriorityClass
+                                : r.processPriorityClass;
+      std::string procPrioStr = GetProcessPriorityString(dispProcClass);
       ListView_SetItemText(hList, itemIdx, 3,
                            const_cast<LPSTR>(procPrioStr.c_str()));
 
@@ -1426,15 +1545,15 @@ static void UpdateListViewDynamic(HWND hList,
                             FormatProcessSlotDisplayName(r, dr.subIndex));
 
     // 2: Thread Priority
-    int rowPrio = (dr.subIndex < r.audioPriorities.size())
-                      ? r.audioPriorities[dr.subIndex]
-                      : r.audioPriority;
-    std::string prioStr =
-        FormatThreadPriorityDisplay(r.processPriorityClass, rowPrio);
+    std::string prioStr = FormatRuleThreadPriorityDisplay(r, dr.subIndex);
     SetSubItemTextIfChanged(hList, item, 2, prioStr);
 
     // 3: Process Priority
-    std::string procPrioStr = GetProcessPriorityString(r.processPriorityClass);
+    DWORD dispProcClass = (!r.processPriorityModified && r.isRunning &&
+                           r.actualProcessPriorityClass != 0)
+                              ? r.actualProcessPriorityClass
+                              : r.processPriorityClass;
+    std::string procPrioStr = GetProcessPriorityString(dispProcClass);
     SetSubItemTextIfChanged(hList, item, 3, procPrioStr);
 
     // 4: Pause / Verify (カスタムドロー描画、テキストは空)
@@ -1900,14 +2019,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   static ati::GlobalConfig s_tmpConfig;
 
   switch (msg) {
-  case WM_MEASUREITEM: {
-    if (HandlePriorityComboMeasureItem(hDlg, lParam,
-                                       IDC_COMBO_AUDIO_PRIORITY)) {
-      return TRUE;
-    }
-    break;
-  }
-
   case WM_INITDIALOG: {
     s_tmpConfig = g_isolator.GetConfig();
     if (s_tmpConfig.defaultAudioAffinityMask == 0) {
@@ -1973,21 +2084,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     SetDlgItemHexMask(hDlg, IDC_EDIT_NORMAL_CORES,
                       s_tmpConfig.normalAffinityMask);
 
-    HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_AUDIO_PRIORITY);
-    if (hCombo) {
-      SendMessageA(hCombo, CB_RESETCONTENT, 0, 0);
-      int selectedIdx = 0;
-      for (int i = 0; i < PRIO_OPTIONS_COUNT; ++i) {
-        int itemIdx = static_cast<int>(SendMessageA(
-            hCombo, CB_ADDSTRING, 0, (LPARAM)PRIO_OPTIONS[i].label));
-        SendMessageA(hCombo, CB_SETITEMDATA, itemIdx, PRIO_OPTIONS[i].value);
-        if (PRIO_OPTIONS[i].value == s_tmpConfig.defaultAudioPriority) {
-          selectedIdx = itemIdx;
-        }
-      }
-      SendMessageA(hCombo, CB_SETCURSEL, selectedIdx, 0);
-    }
-
     SetDlgItemInt(hDlg, IDC_EDIT_POLLING_MS, s_tmpConfig.pollingIntervalMs,
                   FALSE);
 
@@ -2025,9 +2121,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   }
 
   case WM_DRAWITEM: {
-    if (HandlePriorityComboDrawItem(hDlg, lParam, IDC_COMBO_AUDIO_PRIORITY)) {
-      return TRUE;
-    }
     LPDRAWITEMSTRUCT pdis = reinterpret_cast<LPDRAWITEMSTRUCT>(lParam);
     if (pdis && pdis->CtlID == IDC_BTN_RELEASE_MASK) {
       HDC hdc = pdis->hDC;
@@ -2385,15 +2478,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     }
 
     if (cmdId == IDC_BTN_SETTINGS_OK) {
-      HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_AUDIO_PRIORITY);
-      if (hCombo) {
-        int sel = static_cast<int>(SendMessageA(hCombo, CB_GETCURSEL, 0, 0));
-        if (sel != CB_ERR) {
-          s_tmpConfig.defaultAudioPriority =
-              static_cast<int>(SendMessageA(hCombo, CB_GETITEMDATA, sel, 0));
-        }
-      }
-
       int fc = 0;
       DWORD_PTR m = ReadDlgItemCoreMask(hDlg, IDC_EDIT_AUDIO_CORE, &fc);
       if (m != 0) {
@@ -2577,7 +2661,7 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     HWND hCombo = GetDlgItem(hDlg, IDC_COMBO_RULE_PRIO);
     if (hCombo) {
       SendMessageA(hCombo, CB_RESETCONTENT, 0, 0);
-      int selectedIdx = 0;
+      int selectedIdx = 3; // Default Normal (0)
       int currentPrio = s_editRule.audioPriority;
       if (s_editMultiSlot &&
           s_editRuleSlot < s_editRule.audioPriorities.size()) {
@@ -2590,6 +2674,15 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         if (PRIO_OPTIONS[i].value == currentPrio) {
           selectedIdx = itemIdx;
         }
+      }
+      if (ati::IsFixedThreadPriority(currentPrio)) {
+        std::string fixedLbl =
+            "Fixed (" +
+            std::to_string(ati::DecodeFixedThreadPriority(currentPrio)) + ")";
+        int itemIdx = static_cast<int>(
+            SendMessageA(hCombo, CB_ADDSTRING, 0, (LPARAM)fixedLbl.c_str()));
+        SendMessageA(hCombo, CB_SETITEMDATA, itemIdx, currentPrio);
+        selectedIdx = itemIdx;
       }
       SendMessageA(hCombo, CB_SETCURSEL, selectedIdx, 0);
     }
@@ -2865,6 +2958,10 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         if (sel != CB_ERR) {
           int chosenPrio =
               static_cast<int>(SendMessageA(hCombo, CB_GETITEMDATA, sel, 0));
+          size_t targetSlot = s_editMultiSlot ? s_editRuleSlot : 0;
+          int prevPrio = (targetSlot < s_editRule.audioPriorities.size())
+                             ? s_editRule.audioPriorities[targetSlot]
+                             : s_editRule.audioPriority;
           s_editRule.audioPriority = chosenPrio;
           if (s_editMultiSlot) {
             if (s_editRuleSlot < s_editRule.audioPriorities.size()) {
@@ -2873,6 +2970,22 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           } else {
             if (!s_editRule.audioPriorities.empty()) {
               s_editRule.audioPriorities[0] = chosenPrio;
+            }
+          }
+          if (chosenPrio != prevPrio) {
+            size_t reqSlots = ati::ThreadIsolator::GetRuleSlotCount(s_editRule);
+            if (s_editRule.resetPriorityToZeroRequested.size() < reqSlots) {
+              s_editRule.resetPriorityToZeroRequested.resize(reqSlots, false);
+            }
+            if (s_editRule.normalPrioForceApplied.size() < reqSlots) {
+              s_editRule.normalPrioForceApplied.resize(reqSlots, false);
+            }
+            if (chosenPrio == 0) {
+              s_editRule.resetPriorityToZeroRequested[targetSlot] = true;
+              s_editRule.normalPrioForceApplied[targetSlot] = true;
+            } else {
+              s_editRule.resetPriorityToZeroRequested[targetSlot] = false;
+              s_editRule.normalPrioForceApplied[targetSlot] = false;
             }
           }
           s_editRule.wasHalfAutoPromoted = true; // ユーザー明示設定を保護
@@ -3147,9 +3260,21 @@ static LRESULT CALLBACK CustomHeaderProc(HWND hWnd, UINT msg, WPARAM wParam,
 // リストビューサブクラス化プロシージャ (Priority 列の直接クリック検知・2D
 // Matrix Picker ポップアップ)
 static WNDPROC s_pfnOriginalListProc = nullptr;
+static void SaveCurrentColumnWidths(HWND hDlg);
+static bool IsRunningAsAdmin();
 
 static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam,
                                        LPARAM lParam) {
+  if (msg == WM_NOTIFY) {
+    NMHDR *pnm = reinterpret_cast<NMHDR *>(lParam);
+    if (pnm && (pnm->code == HDN_ENDTRACKA || pnm->code == HDN_ENDTRACKW ||
+                pnm->code == HDN_ITEMCHANGEDA || pnm->code == HDN_ITEMCHANGEDW)) {
+      HWND hParent = GetParent(hWnd);
+      if (hParent) {
+        SaveCurrentColumnWidths(hParent);
+      }
+    }
+  }
   if (msg == WM_STYLECHANGING) {
     if (wParam == GWL_STYLE) {
       STYLESTRUCT *pSS = reinterpret_cast<STYLESTRUCT *>(lParam);
@@ -3171,6 +3296,9 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam,
     FillRect(hdc, &rcClient, GetSysColorBrush(COLOR_WINDOW));
     return 1;
   }
+  static int s_pressRow = -1;
+  static int s_pressSubItem = -1;
+
   if (msg == WM_LBUTTONDOWN) {
     LVHITTESTINFO lvhti = {0};
     lvhti.pt.x = static_cast<short>(LOWORD(lParam));
@@ -3178,81 +3306,245 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam,
     ListView_SubItemHitTest(hWnd, &lvhti);
 
     if (lvhti.iItem >= 0 && (lvhti.iSubItem == 2 || lvhti.iSubItem == 3)) {
-      // Col 2: Thread Priority または Col 3: Process Priority のクリックで新UI
-      // (2D Priority Matrix Picker) をポップアップ
+      s_pressRow = lvhti.iItem;
+      s_pressSubItem = lvhti.iSubItem;
+      SetCapture(hWnd);
+      return 0; // デフォルトの行選択を抑止
+    }
+  } else if (msg == WM_LBUTTONUP) {
+    int item = s_pressRow;
+    int subItem = s_pressSubItem;
+    s_pressRow = -1;
+    s_pressSubItem = -1;
+    if (GetCapture() == hWnd) {
+      ReleaseCapture();
+    }
+    if (item >= 0 && (subItem == 2 || subItem == 3)) {
+      // Col 2 (Thread Priority) または Col 3 (Process Priority) クリック時: マトリクスピッカーを起動
       HWND hDlg = GetParent(hWnd);
       auto rules = g_isolator.GetRulesSnapshot();
-      size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+      size_t rowIdx = static_cast<size_t>(item);
       if (rowIdx < g_displayRows.size()) {
         size_t ruleIdx = g_displayRows[rowIdx].ruleIndex;
         size_t subIdx = g_displayRows[rowIdx].subIndex;
         if (ruleIdx < rules.size()) {
           const auto &r = rules[ruleIdx];
+          DWORD effProcClass = (!r.processPriorityModified && r.isRunning &&
+                                r.actualProcessPriorityClass != 0)
+                                   ? r.actualProcessPriorityClass
+                                   : r.processPriorityClass;
+          if (effProcClass == 0)
+            effProcClass = NORMAL_PRIORITY_CLASS;
+
           int currentPrio = (subIdx < r.audioPriorities.size())
                                 ? r.audioPriorities[subIdx]
                                 : r.audioPriority;
-          int initialRank =
-              ati::FindRankByPrio(r.processPriorityClass, currentPrio);
-          if (initialRank <= 0)
-            initialRank = 25; // デフォルト (Normal/Normal)
+          bool isForceZero = (subIdx < r.normalPrioForceApplied.size() &&
+                              r.normalPrioForceApplied[subIdx]);
+
+          // Col 2 未操作 (淡緑) かつ実測 Dyn Pri がある場合は、実測値に対応する初期状態をピッカーへ渡す
+          int pickerInitThreadPrio = currentPrio;
+          if (currentPrio == 0 && !isForceZero &&
+              subIdx < r.actualAudioBasePriorities.size() &&
+              r.actualAudioBasePriorities[subIdx] > 0) {
+            int actBase = r.actualAudioBasePriorities[subIdx];
+            int matchedRel = 999;
+            for (int i = 0; i < 49; ++i) {
+              if (ati::kPriorityMatrixEntries[i].processPriorityClass ==
+                      effProcClass &&
+                  ati::kPriorityMatrixEntries[i].basePriority == actBase) {
+                matchedRel = ati::kPriorityMatrixEntries[i].threadPriority;
+                if (matchedRel == 0)
+                  break;
+              }
+            }
+            if (matchedRel != 999) {
+              pickerInitThreadPrio = matchedRel;
+            } else if (actBase >= 1 && actBase <= 31) {
+              pickerInitThreadPrio = ati::EncodeFixedThreadPriority(actBase);
+            }
+          }
+
+          ati::PickerMode mode = (subItem == 3)
+                                     ? ati::PickerMode::ProcessCol3
+                                     : ati::PickerMode::ThreadCol2;
 
           ati::ShowPriorityMatrixPicker(
-              hDlg, initialRank,
-              [hDlg, hWnd, ruleIdx, subIdx](int selectedRank) {
-                const auto *entry = ati::GetMatrixEntryByRank(selectedRank);
-                if (!entry)
+              hDlg, mode, effProcClass, pickerInitThreadPrio,
+              IsRunningAsAdmin(),
+              [hDlg, hWnd, ruleIdx, subIdx](
+                  const ati::PriorityPickerResult &res) {
+                auto rulesSnap = g_isolator.GetRulesSnapshot();
+                if (ruleIdx >= rulesSnap.size())
                   return;
 
-                auto config = g_isolator.GetConfig();
-                if (ruleIdx < config.rules.size()) {
-                  auto &targetRule = config.rules[ruleIdx];
-                  targetRule.processPriorityClass = entry->processPriorityClass;
+                ati::ProcessRule targetRule = rulesSnap[ruleIdx];
+                size_t requiredSlots =
+                    ati::ThreadIsolator::GetRuleSlotCount(targetRule);
 
-                  size_t requiredSlots =
-                      ati::ThreadIsolator::GetRuleSlotCount(targetRule);
+                if (res.resetToUnattached) {
+                  // 柱の外クリック・ホイールなし右ペインクリック時:
+                  // SetPriorityClass / SetThreadPriority は一切発行せず、
+                  // Thread / Process 両方の管理フラグのみ非アタッチ状態（淡緑背景）へ戻す
+                  targetRule.processPriorityModified = false;
+                  targetRule.wasHalfAutoPromoted = false;
+
                   if (targetRule.audioPriorities.size() < requiredSlots) {
                     targetRule.audioPriorities.resize(requiredSlots,
                                                       targetRule.audioPriority);
                   }
+                  if (targetRule.resetPriorityToZeroRequested.size() <
+                      requiredSlots) {
+                    targetRule.resetPriorityToZeroRequested.resize(
+                        requiredSlots, false);
+                  }
+                  if (targetRule.normalPrioForceApplied.size() <
+                      requiredSlots) {
+                    targetRule.normalPrioForceApplied.resize(requiredSlots,
+                                                             false);
+                  }
+                  if (targetRule.actualAudioBasePriorities.size() <
+                      requiredSlots) {
+                    targetRule.actualAudioBasePriorities.resize(requiredSlots,
+                                                                0);
+                  }
+                  if (targetRule.actualThreadRelativePrios.size() <
+                      requiredSlots) {
+                    targetRule.actualThreadRelativePrios.resize(requiredSlots,
+                                                                0);
+                  }
+                  if (targetRule.prioPollTurns.size() < requiredSlots) {
+                    targetRule.prioPollTurns.resize(requiredSlots, 0);
+                  }
+                  if (targetRule.prioRefetchTicks.size() < requiredSlots) {
+                    targetRule.prioRefetchTicks.resize(requiredSlots, 0);
+                  }
+
                   if (subIdx < targetRule.audioPriorities.size()) {
-                    targetRule.audioPriorities[subIdx] = entry->threadPriority;
+                    targetRule.audioPriorities[subIdx] = 0;
                   }
                   if (subIdx == 0) {
-                    targetRule.audioPriority = entry->threadPriority;
+                    targetRule.audioPriority = 0;
                   }
-                  g_isolator.UpdateConfig(config);
+                  targetRule.resetPriorityToZeroRequested[subIdx] = false;
+                  targetRule.normalPrioForceApplied[subIdx] = false;
 
-                  // 稼働中プロセスが存在する場合、即時 SetPriorityClass を発行
-                  if (targetRule.activePid != 0 &&
-                      entry->processPriorityClass != 0) {
-                    HANDLE hP = OpenProcess(PROCESS_SET_INFORMATION, FALSE,
-                                            targetRule.activePid);
-                    if (hP) {
-                      if (!SetPriorityClass(hP, entry->processPriorityClass) &&
-                          entry->processPriorityClass ==
-                              REALTIME_PRIORITY_CLASS) {
-                        SetPriorityClass(hP, HIGH_PRIORITY_CLASS);
-                      }
-                      CloseHandle(hP);
+                  for (size_t s = 0;
+                       s < targetRule.actualAudioBasePriorities.size(); ++s) {
+                    targetRule.actualAudioBasePriorities[s] = 0;
+                  }
+                  for (size_t s = 0;
+                       s < targetRule.actualThreadRelativePrios.size(); ++s) {
+                    targetRule.actualThreadRelativePrios[s] = 0;
+                  }
+                  for (size_t s = 0; s < targetRule.prioPollTurns.size(); ++s) {
+                    targetRule.prioPollTurns[s] = 0;
+                  }
+                  for (size_t s = 0; s < targetRule.prioRefetchTicks.size();
+                       ++s) {
+                    targetRule.prioRefetchTicks[s] = 0;
+                  }
+                } else {
+                  if (res.applyProcess) {
+                    targetRule.processPriorityClass = res.processPriorityClass;
+                    targetRule.processPriorityModified = true;
+                    if (targetRule.actualAudioBasePriorities.size() <
+                        requiredSlots) {
+                      targetRule.actualAudioBasePriorities.resize(requiredSlots,
+                                                                  0);
+                    }
+                    if (targetRule.prioPollTurns.size() < requiredSlots) {
+                      targetRule.prioPollTurns.resize(requiredSlots, 0);
+                    }
+                    if (targetRule.prioRefetchTicks.size() < requiredSlots) {
+                      targetRule.prioRefetchTicks.resize(requiredSlots, 0);
+                    }
+                    for (size_t s = 0;
+                         s < targetRule.actualAudioBasePriorities.size(); ++s) {
+                      targetRule.actualAudioBasePriorities[s] = 0;
+                    }
+                    for (size_t s = 0; s < targetRule.prioPollTurns.size();
+                         ++s) {
+                      targetRule.prioPollTurns[s] = 0;
+                    }
+                    for (size_t s = 0; s < targetRule.prioRefetchTicks.size();
+                         ++s) {
+                      targetRule.prioRefetchTicks[s] = 0;
                     }
                   }
 
-                  // 稼働中スレッド・プロセスへ即時反映
-                  g_isolator.ScanAndIsolate();
-
-                  // INI 保存
-                  SaveConfig(config, g_iniPath);
-
-                  // リストビュー表示を即時更新
-                  auto updated = g_isolator.GetRulesSnapshot();
-                  UpdateListViewDynamic(hWnd, updated);
-                  InvalidateRect(hWnd, nullptr, FALSE);
+                  if (res.applyThread) {
+                    if (targetRule.audioPriorities.size() < requiredSlots) {
+                      targetRule.audioPriorities.resize(
+                          requiredSlots, targetRule.audioPriority);
+                    }
+                    if (subIdx < targetRule.audioPriorities.size()) {
+                      targetRule.audioPriorities[subIdx] = res.threadPriority;
+                    }
+                    if (subIdx == 0) {
+                      targetRule.audioPriority = res.threadPriority;
+                    }
+                    if (targetRule.resetPriorityToZeroRequested.size() <
+                        requiredSlots) {
+                      targetRule.resetPriorityToZeroRequested.resize(
+                          requiredSlots, false);
+                    }
+                    if (targetRule.normalPrioForceApplied.size() <
+                        requiredSlots) {
+                      targetRule.normalPrioForceApplied.resize(requiredSlots,
+                                                               false);
+                    }
+                    if (res.threadPriority == 0) {
+                      targetRule.resetPriorityToZeroRequested[subIdx] = true;
+                      targetRule.normalPrioForceApplied[subIdx] = true;
+                    } else {
+                      targetRule.resetPriorityToZeroRequested[subIdx] = false;
+                      targetRule.normalPrioForceApplied[subIdx] = false;
+                    }
+                    if (targetRule.actualAudioBasePriorities.size() <
+                        requiredSlots) {
+                      targetRule.actualAudioBasePriorities.resize(requiredSlots,
+                                                                  0);
+                    }
+                    if (targetRule.actualThreadRelativePrios.size() <
+                        requiredSlots) {
+                      targetRule.actualThreadRelativePrios.resize(requiredSlots,
+                                                                  0);
+                    }
+                    if (targetRule.prioPollTurns.size() < requiredSlots) {
+                      targetRule.prioPollTurns.resize(requiredSlots, 0);
+                    }
+                    if (targetRule.prioRefetchTicks.size() < requiredSlots) {
+                      targetRule.prioRefetchTicks.resize(requiredSlots, 0);
+                    }
+                    targetRule.actualAudioBasePriorities[subIdx] = 0;
+                    targetRule.actualThreadRelativePrios[subIdx] = 0;
+                    targetRule.prioPollTurns[subIdx] = 0;
+                    targetRule.prioRefetchTicks[subIdx] = 0;
+                  }
                 }
+
+                // UpdateRule 内で Col 3 変更時の即時 SetPriorityClass + Fixed スレッド無条件再適用を実行
+                g_isolator.UpdateRule(ruleIdx, targetRule);
+
+                // 稼働中スレッド・プロセスへ即時反映
+                g_isolator.ScanAndIsolate();
+
+                // INI 保存
+                SaveConfig(g_isolator.GetConfig(), g_iniPath);
+
+                // リストビュー表示を即時更新
+                auto updated = g_isolator.GetRulesSnapshot();
+                UpdateListViewDynamic(hWnd, updated);
+                InvalidateRect(hWnd, nullptr, FALSE);
               });
-          return 0; // デフォルトの行選択を抑止しピッカー展開に専念
+          return 0;
         }
       }
     }
+  } else if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
+    s_pressRow = -1;
+    s_pressSubItem = -1;
   } else if (msg == WM_VSCROLL || msg == WM_HSCROLL || msg == WM_MOUSEWHEEL) {
     if (ati::IsPriorityMatrixPickerOpen()) {
       ati::ClosePriorityMatrixPicker();
@@ -3658,6 +3950,23 @@ static void UpdateDialogFonts(HWND hDlg, float scale) {
   s_hMainFont = hNewFont;
 }
 
+static void SaveCurrentColumnWidths(HWND hDlg) {
+  HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+  if (!hList)
+    return;
+  float scale = GetDpiScaleForWindow(hDlg);
+  if (scale <= 0.0f)
+    scale = 1.0f;
+  g_colWidths.clear();
+  for (int i = 0; i < kColCount; ++i) {
+    int curW = ListView_GetColumnWidth(hList, i);
+    int baseW = static_cast<int>(std::round(curW / scale));
+    if (baseW < 10)
+      baseW = kColDefaultWidths[i];
+    g_colWidths.push_back(baseW);
+  }
+}
+
 static void UpdateListViewColumnsDpi(HWND hDlg, float scale) {
   HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
   if (!hList)
@@ -3825,48 +4134,25 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     ShowWindow(hBtnHide, SW_HIDE);
   }
 
-  // 上部ボタングループ: EDIT -> ADD -> REMOVE
+  // 右パネルボタングループ: EDIT -> ADD -> REMOVE -> SETTINGS を等間隔で整列
   int btnSpacing = ScaleI(Layout::kBtnSpacing, scale);
   int yEdit = curY;
   int yAdd = yEdit + btnH + btnSpacing;
   int yRemove = yAdd + btnH + btnSpacing;
+  int ySettings = yRemove + btnH + btnSpacing;
 
   PlaceBtnAt(IDC_BTN_EDIT, yEdit);
   PlaceBtnAt(IDC_BTN_ADD, yAdd);
   PlaceBtnAt(IDC_BTN_REMOVE, yRemove);
+  PlaceBtnAt(IDC_BTN_SETTINGS, ySettings);
 
-  // 下部ボタングループ: EXIT は常にクライアント下端から margin 内側
+  // EXIT はウィンドウ下端に追従するが、ウィンドウを縮めた際も SETTINGS の直下で停止し絶対に重ならない
+  int minExitY = ySettings + btnH + btnSpacing;
   int exitY = cy - margin - btnH;
-  if (exitY < margin)
-    exitY = margin;
-
-  // SETTINGS ボタンの配置:
-  // 高さに余裕がある場合は従来の枠4（空きスペース）を保持し、
-  // ウィンドウ高さを縮めた際は EXIT
-  // と衝突しないよう空きスペースを自動圧縮して上に追従
-  int defaultSettingsY =
-      yRemove + btnH + btnSpacing + btnH + btnSpacing; // 従来の空き枠込み
-  int maxSettingsY = exitY - btnSpacing - btnH;        // EXIT 直上
-  int minSettingsY = yRemove + btnH + btnSpacing;      // REMOVE 直下
-
-  int settingsY = defaultSettingsY;
-  if (settingsY > maxSettingsY) {
-    settingsY = maxSettingsY;
+  if (exitY < minExitY) {
+    exitY = minExitY;
   }
-  if (settingsY < minSettingsY) {
-    settingsY = minSettingsY;
-  }
-  PlaceBtnAt(IDC_BTN_SETTINGS, settingsY);
-
-  // Exit
-  // ボタンは最下部に配置し、高さを縮めた場合でも画面外へ押し出されず最前面表示
-  HWND hBtnExit = GetDlgItem(hDlg, IDC_BTN_EXIT);
-  if (hBtnExit) {
-    SetWindowPos(hBtnExit, HWND_TOP, btnX, exitY, btnW, btnH,
-                 SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    BringWindowToTop(hBtnExit);
-    InvalidateRect(hBtnExit, nullptr, TRUE);
-  }
+  PlaceBtnAt(IDC_BTN_EXIT, exitY);
 }
 
 // --- メインダイアログ (ANSI) ---
@@ -3894,7 +4180,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v1.0.8");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.0");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -4029,7 +4315,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     LPMINMAXINFO lpMMI = reinterpret_cast<LPMINMAXINFO>(lParam);
     float scale = GetDpiScaleForWindow(hDlg);
     lpMMI->ptMinTrackSize.x = static_cast<LONG>(514 * scale);
-    lpMMI->ptMinTrackSize.y = static_cast<LONG>(180 * scale);
+    lpMMI->ptMinTrackSize.y = static_cast<LONG>(200 * scale);
     return 0;
   }
 
@@ -4080,7 +4366,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
 
     float scale = GetDpiScaleForWindow(hDlg);
     RelayoutMainDialog(hDlg, scale, cx, cy);
-    UpdateListViewColumnsDpi(hDlg, scale);
 
     // ウィンドウリサイズ時、親ダイアログの余白・凡例領域を背景消去付きで無効化（旧位置の残像を防止）
     InvalidateRect(hDlg, nullptr, TRUE);
@@ -4379,12 +4664,11 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           newRule.processName = sp.exeFileName;
           newRule.audioCore = config.defaultAudioCore;
           newRule.audioAffinityMask = config.defaultAudioAffinityMask;
-          newRule.audioPriority = config.defaultAudioPriority;
+          newRule.audioPriority = 0; // デフォルト Normal (0) -> TID非アタッチ (淡緑)
           newRule.currentThreadCount = 0;
           newRule.targetPriority = 0;
-          newRule.processPriorityClass = (sp.currentPriorityClass != 0)
-                                             ? sp.currentPriorityClass
-                                             : NORMAL_PRIORITY_CLASS;
+          newRule.processPriorityClass = NORMAL_PRIORITY_CLASS;
+          newRule.processPriorityModified = false; // デフォルト PID非アタッチ (淡緑)
           newRule.applyCount = 0;
           newRule.detectedThreadName = "";
           newRule.activePid = 0;
@@ -4458,6 +4742,15 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
 
   case WM_NOTIFY: {
     LPNMHDR pnm = reinterpret_cast<LPNMHDR>(lParam);
+
+    HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
+    HWND hHdr = hList ? ListView_GetHeader(hList) : nullptr;
+    if (pnm && (pnm->hwndFrom == hHdr || pnm->idFrom == IDC_LIST_PROCESSES || pnm->idFrom == 0)) {
+      if (pnm->code == HDN_ENDTRACKA || pnm->code == HDN_ENDTRACKW ||
+          pnm->code == HDN_ITEMCHANGEDA || pnm->code == HDN_ITEMCHANGEDW) {
+        SaveCurrentColumnWidths(hDlg);
+      }
+    }
 
     if (pnm && pnm->idFrom == IDC_LIST_PROCESSES) {
       if (pnm->code == NM_DBLCLK) {
@@ -4615,6 +4908,20 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               InvalidateRect(hList, nullptr, FALSE);
               return TRUE;
             }
+          }
+        } else if (lvhti.iItem >= 0 && (lvhti.iSubItem == 1 || lvhti.iSubItem == 6 ||
+                                       lvhti.iSubItem == 7 || lvhti.iSubItem == 8 ||
+                                       lvhti.iSubItem == 9)) {
+          // Col 1 (Process Name), 6 (TIDs), 7 (Chgs), 8 (Audio), 9 (Excluded):
+          // シングルクリックで即時 Edit ダイアログをポップアップ
+          if (ati::IsPriorityMatrixPickerOpen()) {
+            ati::ClosePriorityMatrixPicker();
+          }
+          size_t rowIdx = static_cast<size_t>(lvhti.iItem);
+          if (rowIdx < g_displayRows.size()) {
+            OpenRuleEditDialog(hDlg, g_displayRows[rowIdx].ruleIndex,
+                               g_displayRows[rowIdx].subIndex);
+            return TRUE;
           }
         } else {
           if (ati::IsPriorityMatrixPickerOpen()) {
@@ -4831,15 +5138,31 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
             if (row >= 0 && row < static_cast<int>(g_displayRows.size())) {
               const auto &dr = g_displayRows[row];
               if (dr.ruleIndex < rules.size()) {
+                const auto &r = rules[dr.ruleIndex];
+                int rowPrio = (dr.subIndex < r.audioPriorities.size())
+                                  ? r.audioPriorities[dr.subIndex]
+                                  : r.audioPriority;
                 RECT rcSub;
                 ListView_GetSubItemRect(hList, row, plvcd->iSubItem,
                                         LVIR_BOUNDS, &rcSub);
                 HDC hdc = plvcd->nmcd.hdc;
                 float scale = GetDpiScaleForWindow(hDlg);
 
+                // Col 2: 未操作 (rowPrio == 0 かつ Normal 明示適用でない) は淡い緑 (TID非アタッチ)
+                // Col 3: 未操作 (!r.processPriorityModified) は淡い緑 (PID非アタッチ)
+                bool isForceZero =
+                    (dr.subIndex < r.normalPrioForceApplied.size() &&
+                     r.normalPrioForceApplied[dr.subIndex]);
+                COLORREF cellBkCol = rowBkCol;
+                if (plvcd->iSubItem == 2 && rowPrio == 0 && !isForceZero) {
+                  cellBkCol = RGB(220, 245, 220);
+                } else if (plvcd->iSubItem == 3 && !r.processPriorityModified) {
+                  cellBkCol = RGB(220, 245, 220);
+                }
+
                 HBRUSH hBkBrush = (state & LVIS_SELECTED)
                                       ? GetSysColorBrush(COLOR_HIGHLIGHT)
-                                      : CreateSolidBrush(rowBkCol);
+                                      : CreateSolidBrush(cellBkCol);
                 FillRect(hdc, &rcSub, hBkBrush);
                 if (!(state & LVIS_SELECTED))
                   DeleteObject(hBkBrush);
@@ -5097,7 +5420,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     UINT uRestoreMsg = RegisterWindowMessageA("ATI_RestoreInstance");
 
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.8");
+    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.0");
+    if (!hExisting)
+      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.8");
     if (!hExisting)
       hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.7");
     if (!hExisting)
