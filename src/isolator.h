@@ -67,8 +67,6 @@ struct ProcessRule {
   size_t lastIdentifiedCount = 0; // 前回確認時の確定オーディオスレッド数
   bool multiSearchSleeping = false; // 10秒経過しても未確定枠が残る場合の休眠フラグ
   double cyclesDelta = 0.0; // 個別 Cycles Delta 走査閾値 (M/s, 0.0: Global継承)
-  bool isDeclineBoost =
-      false; // Decline:1 (ポーリングブーストを拒否し1000msで計測)
   DWORD audioServicePid =
       0; // Chromiumモード: 特定済み Audio Service の PID (ランタイムのみ)
 
@@ -126,7 +124,6 @@ struct GlobalConfig {
   DWORD_PTR normalAffinityMask; // 通常スレッド退避先マスク (0:
                                 // 隔離コア以外の全コア自動)
   int pollingIntervalMs;        // 監視周期 (デフォルト 1000ms)
-  int boostPollingIntervalMs = 250; // ブースト監視周期 (デフォルト 250ms)
   double defaultCyclesDelta =
       5.0; // 4KBスタック走査を発行する秒換算負荷閾値 (M/s, デフォルト 5.0)
   std::string rawDefaultCyclesDeltaStr =
@@ -253,9 +250,7 @@ private:
     int step = 1; // 1: 初期ベースライン, 2: 待機ループ, 3: サンプリング中
     int k = 0;    // サンプリングインデックス (1..9)
     std::vector<ThreadSamplingEntry> d; // d(n)
-    bool samplingActive =
-        false; // Step 3 サンプリング中 (タイマー加速/Decline制御用)
-    bool isDecline = false;
+    bool samplingActive = false; // Step 3 サンプリング中 (タイマー加速制御用)
     bool initialEvaluated = false;
   };
   std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>>

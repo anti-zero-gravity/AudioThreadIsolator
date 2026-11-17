@@ -169,7 +169,6 @@ Configuration is saved in `ATI.ini` in the same directory as the executable.
 | **`DefaultAudioCore`** | Default audio core (or comma-separated multi-core list) assigned to newly registered processes. | `0` to (Max Cores - 1) | `1` (`0` for single-core) |
 | **`NormalCores`** | Hexadecimal mask of cores allocated to normal threads. | Hex bitmask (e.g., `0x3F3`) | All cores excluding `DefaultAudioCore` |
 | **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
-| **`BoostPollingIntervalMs`** | Fast polling interval during thread search or state transitions. | `50`, `100`, `250` | `250` |
 | **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
 | **`ColumnWidths`** | Saved column widths of the main window process table (all 10 columns). | Comma-separated integers (10 values) | Default column widths |
 | **`WindowHeight`** | Saved vertical window height of the main window (in pixels). | Positive integer | Auto-calculated height |

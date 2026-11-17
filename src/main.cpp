@@ -561,11 +561,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
   config.pollingIntervalMs =
       ati::ThreadIsolator::NormalizePollingInterval(config.pollingIntervalMs);
 
-  config.boostPollingIntervalMs = GetPrivateProfileIntA(
-      "Global", "BoostPollingIntervalMs", 250, iniPath.c_str());
-  if (config.boostPollingIntervalMs <= 0)
-    config.boostPollingIntervalMs = 250;
-
   char deltaBuf[64] = {0};
   GetPrivateProfileStringA("Global", "DefaultCyclesDelta", "", deltaBuf,
                            sizeof(deltaBuf), iniPath.c_str());
@@ -885,8 +880,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
             }
             rule.lastAudioTid =
                 rule.lastAudioTids.empty() ? 0 : rule.lastAudioTids[0];
-          } else if (k == "Decline") {
-            rule.isDeclineBoost = (atoi(v.c_str()) != 0);
           } else if (k == "ProcessPriority" || k == "ProcessPriorityClass") {
             if (v == "Default" || v == "Untouched" || v == "0" || v.empty()) {
               rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
@@ -1048,13 +1041,6 @@ static void SaveConfig(const ati::GlobalConfig &config,
                              std::to_string(config.pollingIntervalMs).c_str(),
                              iniPath.c_str());
 
-  WritePrivateProfileStringA("Global", "BoostPollingIntervalMs",
-                             std::to_string(config.boostPollingIntervalMs > 0
-                                                ? config.boostPollingIntervalMs
-                                                : 250)
-                                 .c_str(),
-                             iniPath.c_str());
-
   WritePrivateProfileStringA("Global", "DefaultCyclesDelta",
                              config.rawDefaultCyclesDeltaStr.c_str(),
                              iniPath.c_str());
@@ -1110,9 +1096,6 @@ static void SaveConfig(const ati::GlobalConfig &config,
             snprintf(dBuf, sizeof(dBuf), "%.1f", rule.cyclesDelta);
           }
           val += ", Delta:" + std::string(dBuf);
-        }
-        if (rule.isDeclineBoost) {
-          val += ", Decline:1";
         }
         DWORD_PTR sm = rule.audioSlotMasks[s];
         std::string coreStr;
@@ -1183,11 +1166,6 @@ static void SaveConfig(const ati::GlobalConfig &config,
         snprintf(dBuf, sizeof(dBuf), "%.1f", rule.cyclesDelta);
       }
       val += "Delta:" + std::string(dBuf);
-    }
-    if (rule.isDeclineBoost) {
-      if (!val.empty())
-        val += ", ";
-      val += "Decline:1";
     }
     if (!val.empty())
       val += ", ";
@@ -4552,9 +4530,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
         SaveConfig(g_isolator.GetConfig(), g_iniPath);
       }
 
-      // タイマー設定 (通常周期、または高速検証要求時は 250ms)
+      // タイマー設定 (通常周期、または高速サンプリング要求時は INI / 4)
       static UINT s_currentInterval = 0;
-      auto cfg = g_isolator.GetConfig();
       UINT desiredInterval = g_isolator.GetDesiredPollingIntervalMs();
       if (s_currentInterval != desiredInterval) {
         SetTimer(hDlg, TIMER_POLLING_ID, desiredInterval, nullptr);

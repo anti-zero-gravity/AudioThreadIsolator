@@ -3494,7 +3494,6 @@ bool ThreadIsolator::ScanAndIsolate() {
 
           audioState.k = 1;
           audioState.samplingActive = true;
-          audioState.isDecline = rule.isDeclineBoost;
           audioState.step = 3;
         }
         if (!rule.isAudioIsolated) {
@@ -5195,9 +5194,6 @@ UINT ThreadIsolator::GetDesiredPollingIntervalMs() const {
   std::lock_guard<std::mutex> lock(m_mutex);
   for (const auto &pair : m_chromiumAudioStates) {
     if (pair.second.samplingActive) {
-      if (pair.second.isDecline) {
-        return 1000;
-      }
       int normalMs = NormalizePollingInterval(m_config.pollingIntervalMs);
       int boostMs = normalMs / 4;
       if (boostMs < 50) {
