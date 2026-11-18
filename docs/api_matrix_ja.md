@@ -96,7 +96,7 @@
 ### `AppType (0〜5)` の定義
 - **`Type 0`**: `audiodg.exe`（Windows オーディオエンジン専用）
 - **`Type 1`**: 一般非 Chromium アプリ（音楽プレイヤー、ゲーム等）
-- **`Type 2`**: Chromium 系アプリ（Chrome, Edge, Brave, Vivaldi, Discord 等）
+- **`Type 2`**: Chromium 系アプリ（Chrome, Edge, Brave, Vivaldi 等）
 - **`Type 3`**: DAW 型高負荷アプリ（Nuendo, Cubase 等 / `TimeCritical` スレッド 2 本以上）
 - **`Type 4`**: Roon 専用（`RoonAppliance.exe` / `RAATServer.exe`）
 - **`Type 5`**: Voicemeeter 全エディション（2スロット：Slot 0 `VBAN` / Slot 1 `VAIO/AUX & DSP`）

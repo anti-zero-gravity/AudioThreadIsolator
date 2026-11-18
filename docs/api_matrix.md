@@ -89,7 +89,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 ### `AppType (0..5)` Definitions
 - **`Type 0`**: `audiodg.exe` (Windows Audio Device Graph Isolation)
 - **`Type 1`**: General non-Chromium apps (media players, games, etc.)
-- **`Type 2`**: Chromium-based apps (Chrome, Edge, Brave, Vivaldi, Discord, etc.)
+- **`Type 2`**: Chromium-based apps (Chrome, Edge, Brave, Vivaldi, etc.)
 - **`Type 3`**: DAW / multi-priority apps (Nuendo, Cubase, etc. / >=2 `TimeCritical` threads)
 - **`Type 4`**: Roon suite (`RoonAppliance.exe` / `RAATServer.exe`)
 - **`Type 5`**: Voicemeeter editions (2 slots: Slot 0 `VBAN` / Slot 1 `VAIO/AUX & DSP`)
