@@ -575,7 +575,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
 
   g_alwaysOnTop =
       (GetPrivateProfileIntA("Global", "AlwaysOnTop", 0, iniPath.c_str()) != 0);
-  config.enableHeuristics = true;
 
   // ColumnWidths (または ColumnWidth) の読み込み
   char colBuf[256] = {0};
@@ -708,7 +707,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
         rule.audioCore = config.defaultAudioCore;
         rule.audioAffinityMask = config.defaultAudioAffinityMask;
         rule.audioPriority = 0;
-        rule.targetPriority = 0;
         rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
         rule.processPriorityModified = false;
         rule.applyCount = 0;
@@ -745,7 +743,7 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
             kvPairs.push_back({k, v});
           } else {
             // コロンを含まないトークンは直前のキーの値の続き (例: AudioCore:10,
-            // 11 や AudioTid:22220, 24500)
+            // 11 や AudioPriority:-15, F19)
             if (!kvPairs.empty()) {
               if (!kvPairs.back().second.empty()) {
                 kvPairs.back().second += ", ";
@@ -849,8 +847,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
               int fc = 0;
               rule.normalAffinityMask = ParseCoreListToMask(v, fc);
             }
-          } else if (k == "TargetPriority") {
-            rule.targetPriority = static_cast<DWORD>(atoi(v.c_str()));
           } else if (k == "Bypass" || k == "Ignore") {
             rule.isBypassed = (atoi(v.c_str()) != 0);
           } else if (k == "AppType" || k == "Normchrom") {
@@ -859,27 +855,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
             double dVal = atof(v.c_str());
             dVal = std::ceil(dVal * 10.0) / 10.0;
             rule.cyclesDelta = (dVal > 0.0) ? dVal : 0.0;
-          } else if (k == "AudioPid") {
-            rule.lastAudioPid = static_cast<DWORD>(atoi(v.c_str()));
-          } else if (k == "AudioTid" || k == "AudioTids") {
-            rule.lastAudioTids.clear();
-            std::stringstream ss(v);
-            std::string ttok;
-            while (std::getline(ss, ttok, ',')) {
-              while (!ttok.empty() &&
-                     isspace(static_cast<unsigned char>(ttok.front())))
-                ttok.erase(ttok.begin());
-              while (!ttok.empty() &&
-                     isspace(static_cast<unsigned char>(ttok.back())))
-                ttok.pop_back();
-              if (!ttok.empty()) {
-                DWORD tVal = static_cast<DWORD>(atoi(ttok.c_str()));
-                if (tVal > 0)
-                  rule.lastAudioTids.push_back(tVal);
-              }
-            }
-            rule.lastAudioTid =
-                rule.lastAudioTids.empty() ? 0 : rule.lastAudioTids[0];
           } else if (k == "ProcessPriority" || k == "ProcessPriorityClass") {
             if (v == "Default" || v == "Untouched" || v == "0" || v.empty()) {
               rule.processPriorityClass = NORMAL_PRIORITY_CLASS;
@@ -1133,9 +1108,6 @@ static void SaveConfig(const ati::GlobalConfig &config,
                    static_cast<unsigned long long>(rule.normalAffinityMask));
           val += ", NormalCores:" + std::string(nHex);
         }
-        if (rule.targetPriority != 0) {
-          val += ", TargetPriority:" + std::to_string(rule.targetPriority);
-        }
         if (rule.slotBypassed[s]) {
           val += ", Bypass:1";
         }
@@ -1230,25 +1202,6 @@ static void SaveConfig(const ati::GlobalConfig &config,
       snprintf(nHex, sizeof(nHex), "0x%llX",
                static_cast<unsigned long long>(rule.normalAffinityMask));
       val += ", NormalCores:" + std::string(nHex);
-    }
-    if (rule.targetPriority != 0) {
-      val += ", TargetPriority:" + std::to_string(rule.targetPriority);
-    }
-    // 検証用: INI 保存時の AudioPid / AudioTid 出力を抑止
-    if (false && rule.isAudioIsolated && rule.isRunning && !rule.isBypassed &&
-        rule.activePid != 0 &&
-        (!rule.activeAudioTids.empty() || rule.activeAudioTid != 0)) {
-      val += ", AudioPid:" + std::to_string(rule.activePid);
-      val += ", AudioTid:";
-      if (!rule.activeAudioTids.empty()) {
-        for (size_t i = 0; i < rule.activeAudioTids.size(); ++i) {
-          if (i > 0)
-            val += ", ";
-          val += std::to_string(rule.activeAudioTids[i]);
-        }
-      } else {
-        val += std::to_string(rule.activeAudioTid);
-      }
     }
     if (rule.isBypassed) {
       val += ", Bypass:1";
@@ -1374,19 +1327,15 @@ static void RefreshListView(HWND hList,
                    std::to_string(tid);
         } else if (r.multiSearchSleeping) {
           thName = "sleeping...";
+        } else if (r.multiSearchPhase == 2) {
+          int rem = r.multiSearchTurns;
+          if (rem < 1)
+            rem = 1;
+          if (rem > 3)
+            rem = 3;
+          thName = "Standby " + std::to_string(rem);
         } else {
-          int intervalMs = (g_isolator.GetConfig().pollingIntervalMs > 0)
-                               ? g_isolator.GetConfig().pollingIntervalMs
-                               : 1000;
-          int turnsPerSec = 1000 / intervalMs;
-          if (turnsPerSec < 1)
-            turnsPerSec = 1;
-          int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
-          if (sec < 1)
-            sec = 1;
-          if (sec > 10)
-            sec = 10;
-          thName = "Standby " + std::to_string(sec);
+          thName = "Searching...";
         }
       } else if (r.isAudioIsolated && tid != 0) {
         thName = "PID " + std::to_string(r.activePid) + " / TID " +
@@ -1553,19 +1502,15 @@ static void UpdateListViewDynamic(HWND hList,
                  std::to_string(dr.tid);
       } else if (r.multiSearchSleeping) {
         thName = "sleeping...";
+      } else if (r.multiSearchPhase == 2) {
+        int rem = r.multiSearchTurns;
+        if (rem < 1)
+          rem = 1;
+        if (rem > 3)
+          rem = 3;
+        thName = "Standby " + std::to_string(rem);
       } else {
-        int intervalMs = (g_isolator.GetConfig().pollingIntervalMs > 0)
-                             ? g_isolator.GetConfig().pollingIntervalMs
-                             : 1000;
-        int turnsPerSec = 1000 / intervalMs;
-        if (turnsPerSec < 1)
-          turnsPerSec = 1;
-        int sec = (r.multiSearchTurns + turnsPerSec - 1) / turnsPerSec;
-        if (sec < 1)
-          sec = 1;
-        if (sec > 10)
-          sec = 10;
-        thName = "Standby " + std::to_string(sec);
+        thName = "Searching...";
       }
     } else if (r.isAudioIsolated && dr.tid != 0) {
       thName = "PID " + std::to_string(r.activePid) + " / TID " +
@@ -2005,7 +1950,6 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     }
 
     auto cores = ati::CpuTopology::GetCpuCores();
-    int coreCount = static_cast<int>(cores.size());
     float scale = GetDpiScaleForWindow(hDlg);
 
     // メインウィンドウからディスプレイ中央方向に少しずれた場所へ表示
@@ -2591,7 +2535,6 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     }
 
     auto cores = ati::CpuTopology::GetCpuCores();
-    int coreCount = static_cast<int>(cores.size());
     float scale = GetDpiScaleForWindow(hDlg);
 
     InitAffinityListView(hDlg, IDC_LIST_RULE_CORES, scale, cores, "Audio Core",
@@ -3575,6 +3518,7 @@ static bool EnableRealtimePrivilege() {
 }
 
 static bool s_skipDestroyCleanup = false;
+static bool s_skipAudioDgRestoreOnExit = false;
 
 static void SaveWindowMetricsAndConfig(HWND hDlg) {
   HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
@@ -3665,11 +3609,12 @@ static void SaveWindowMetricsAndConfig(HWND hDlg) {
 
 // --- アプリケーション再起動ヘルパー ---
 static void RestartApplication(HWND hDlg) {
+  const bool restoreAudioDg = ((GetKeyState(VK_CONTROL) & 0x8000) == 0);
   char exePath[MAX_PATH] = {0};
   GetModuleFileNameA(nullptr, exePath, MAX_PATH);
   KillTimer(hDlg, TIMER_POLLING_ID);
   RemoveTrayIcon();
-  g_isolator.ResumeAllSuspendedThreads();
+  g_isolator.ResumeAllSuspendedThreads(restoreAudioDg);
   SaveWindowMetricsAndConfig(hDlg);
   s_skipDestroyCleanup = true;
   bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
@@ -3685,6 +3630,7 @@ static void RestartApplication(HWND hDlg) {
 
 // --- 管理者として再起動ヘルパー (UAC 昇格) ---
 static void RestartAsAdmin(HWND hDlg) {
+  const bool restoreAudioDg = ((GetKeyState(VK_CONTROL) & 0x8000) == 0);
   char exePath[MAX_PATH] = {0};
   GetModuleFileNameA(nullptr, exePath, MAX_PATH);
   bool wasInTray = !IsWindowVisible(hDlg) || IsIconic(hDlg);
@@ -3704,7 +3650,7 @@ static void RestartAsAdmin(HWND hDlg) {
   if (reinterpret_cast<INT_PTR>(hInst) > 32) {
     KillTimer(hDlg, TIMER_POLLING_ID);
     RemoveTrayIcon();
-    g_isolator.ResumeAllSuspendedThreads();
+    g_isolator.ResumeAllSuspendedThreads(restoreAudioDg);
     s_skipDestroyCleanup = true;
     DestroyWindow(hDlg);
   } else {
@@ -4106,12 +4052,6 @@ static void RelayoutMainDialog(HWND hDlg, float scale, int cx, int cy) {
     }
   };
 
-  // ToTray ボタンは廃止 (非表示化)
-  HWND hBtnHide = GetDlgItem(hDlg, IDC_BTN_HIDE);
-  if (hBtnHide) {
-    ShowWindow(hBtnHide, SW_HIDE);
-  }
-
   // 右パネルボタングループ: EDIT -> ADD -> REMOVE -> SETTINGS を等間隔で整列
   int btnSpacing = ScaleI(Layout::kBtnSpacing, scale);
   int yEdit = curY;
@@ -4158,7 +4098,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.0");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.1");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -4363,7 +4303,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                       2);
 
       int startY = rcList.bottom + ScaleI(Layout::kBtnSpacing, scale);
-      int startX = rcList.left + ScaleI(Layout::kBtnSpacing, scale);
       int dotSize = ScaleI(Layout::kDotSize, scale);
 
       HFONT hFont = GetEffectiveFont(hDlg);
@@ -4525,11 +4464,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
       // バックグラウンド監視・TID捕捉・アフィニティ制御はドラッグ中も休まず実行
       bool changed = g_isolator.ScanAndIsolate();
 
-      // 起動時の初期照合クリーンアップ完了時に1回だけINIを一括更新
-      if (g_isolator.CheckAndClearInitialNeedSave()) {
-        SaveConfig(g_isolator.GetConfig(), g_iniPath);
-      }
-
       // タイマー設定 (通常周期、または高速サンプリング要求時は INI / 4)
       static UINT s_currentInterval = 0;
       UINT desiredInterval = g_isolator.GetDesiredPollingIntervalMs();
@@ -4613,8 +4547,8 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
       return TRUE;
     }
 
-    else if (cmdId == IDC_BTN_HIDE || cmdId == IDCANCEL) {
-      LogDebug("MainDlg: Hiding window (IDC_BTN_HIDE or IDCANCEL)");
+    else if (cmdId == IDCANCEL) {
+      LogDebug("MainDlg: Hiding window (IDCANCEL)");
       ShowWindow(hDlg, SW_HIDE);
       return TRUE;
     } else if (cmdId == IDOK) {
@@ -4643,7 +4577,6 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           newRule.audioAffinityMask = config.defaultAudioAffinityMask;
           newRule.audioPriority = 0; // デフォルト Normal (0) -> TID非アタッチ (淡緑)
           newRule.currentThreadCount = 0;
-          newRule.targetPriority = 0;
           newRule.processPriorityClass = NORMAL_PRIORITY_CLASS;
           newRule.processPriorityModified = false; // デフォルト PID非アタッチ (淡緑)
           newRule.applyCount = 0;
@@ -4696,6 +4629,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
       }
       return TRUE;
     } else if (cmdId == IDC_BTN_EXIT || cmdId == ID_TRAY_EXIT) {
+      s_skipAudioDgRestoreOnExit = ((GetKeyState(VK_CONTROL) & 0x8000) != 0);
       KillTimer(hDlg, TIMER_POLLING_ID);
       RemoveTrayIcon();
       DestroyWindow(hDlg);
@@ -5354,7 +5288,10 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
     KillTimer(hDlg, TIMER_POLLING_ID);
     RemoveTrayIcon();
     if (!s_skipDestroyCleanup) {
-      g_isolator.ResumeAllSuspendedThreads();
+      const bool restoreAudioDg =
+          !s_skipAudioDgRestoreOnExit &&
+          ((GetKeyState(VK_CONTROL) & 0x8000) == 0);
+      g_isolator.ResumeAllSuspendedThreads(restoreAudioDg);
       SaveWindowMetricsAndConfig(hDlg);
     }
 
@@ -5397,7 +5334,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     UINT uRestoreMsg = RegisterWindowMessageA("ATI_RestoreInstance");
 
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.0");
+    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.1");
+    if (!hExisting)
+      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.0");
     if (!hExisting)
       hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.8");
     if (!hExisting)

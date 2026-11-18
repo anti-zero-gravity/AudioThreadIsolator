@@ -46,14 +46,11 @@ struct ProcessRule {
                      // THREAD_PRIORITY_IDLE)
   DWORD_PTR normalAffinityMask = 0; // 通常スレッド退避先マスク (0:
                                     // Global設定のnormalAffinityMaskを自動継承)
-  DWORD targetPriority = 0;   // 特定優先度フィルタ (0: 指定なし/自動判定)
   DWORD processPriorityClass = NORMAL_PRIORITY_CLASS; // プロセス優先度クラス
 
   // 監視除外・ペンディングフラグ
   // (チェックONで監視・アイソレートから除外、デフォルト: false)
   bool isBypassed = false;
-  // 個別ヒューリスティック探索フラグ (デフォルト: true)
-  bool enableHeuristics = true;
   // appType アプリ種別判定 (0: 未判定/audiodg, 1: 非Chromium, 2: Chromium系, 3:
   // DAW型高負荷, 4: Roon専用, 5: Voicemeeter専用)
   int appType = 0;
@@ -63,9 +60,11 @@ struct ProcessRule {
   std::vector<int> audioPriorities; // 各スレッド用の個別適用優先度 (空の場合は audioPriority を使用)
   std::vector<bool> slotBypassed; // 各スロット用の個別バイパスフラグ (マルチスロット用)
   std::unordered_set<DWORD> suspendedAudioTids; // 個別スレッド一時停止管理セット
-  int multiSearchTurns = 0;       // 複数スロット探索用カウントダウンターン数 (10秒 = 10 * turnsPerSec)
+  int multiSearchPhase = 0; // 複数スロット探索フェーズ (0:未開始/完了, 1:Searching...2秒, 2:Standby 3..1(3秒×3回), 4:sleeping...)
+  int multiSearchTurns = 0;       // Phase 1: 残りターン数 (2秒), Phase 2: 残り回数 (3..1)
   size_t lastIdentifiedCount = 0; // 前回確認時の確定オーディオスレッド数
-  bool multiSearchSleeping = false; // 10秒経過しても未確定枠が残る場合の休眠フラグ
+  bool multiSearchSleeping = false; // 3秒×3回経過しても未確定枠が残る場合の休眠フラグ
+  ULONGLONG multiSearchLastCheckTick = 0; // Phase 2 前回検査時刻 (GetTickCount64)
   double cyclesDelta = 0.0; // 個別 Cycles Delta 走査閾値 (M/s, 0.0: Global継承)
   DWORD audioServicePid =
       0; // Chromiumモード: 特定済み Audio Service の PID (ランタイムのみ)
@@ -88,7 +87,7 @@ struct ProcessRule {
   bool wasHalfAutoPromoted =
       false; // Half-Isolated判定によるLowest(-2)への自動昇格が実行済みか
   bool chromiumScanAttempted =
-      false; // Chromium起動時/Bypass復帰時のAudioService特定走査を試行済みか(未特定時はStandbyへ移行し毎秒走査を抑止)
+      false; // Chromium起動時/Bypass復帰時のAudioService特定走査を試行済みか(未特定時は sleeping... へ移行し毎秒走査を抑止)
   std::vector<int> actualAudioBasePriorities; // 各スロットの実際の物理 Dynamic Priority (Dyn Pri)
   std::vector<int> actualThreadRelativePrios; // 各スロットの実測相対優先度 (GetThreadPriority)
   std::vector<bool> resetPriorityToZeroRequested; // 相対0 (Normal) へのワンショットリセット要求
@@ -98,16 +97,11 @@ struct ProcessRule {
   bool processPriorityModified = false; // Col 3 (Process Priority) が明示変更済みか (false時は淡緑背景・OS未アタッチ)
   DWORD actualProcessPriorityClass = NORMAL_PRIORITY_CLASS; // 実測プロセス優先度クラス (GetPriorityClass)
 
-  // 前回終了時ステータス記録と照合 (起動時引き継ぎ用)
-  DWORD lastAudioPid = 0; // 前回終了時ステータス記録: オーディオPID
-  DWORD lastAudioTid = 0; // 前回終了時ステータス記録: オーディオTID (単一互換用)
-  std::vector<DWORD> lastAudioTids; // 前回終了時ステータス記録: オーディオTID群 (複数スロット対応)
-
-  // 新探索フロー状態管理
-  int searchPhase = 0; // 0: 未開始/確定完了, 1: Searching...(2秒/4ターン), 2:
-                       // カウントダウン(Standby 10..3), 3:
-                       // 終盤再確定(Standby 2..1), 4: sleeping...
-  int searchTurns = 0; // 各フェーズでの残りターン数 (500ms単位)
+  // 新探索フロー状態管理 (AppType: 1, 3)
+  int searchPhase = 0; // 0: 未開始/確定完了, 1: Searching...(2秒),
+                       // 2: Standby 3..1 (3秒ターン×3回), 4: sleeping...
+  int searchTurns = 0; // Phase 1: 残りターン数 (2秒), Phase 2: 残り検査回数 (3..1)
+  ULONGLONG searchLastCheckTick = 0; // Phase 2 前回検査時刻 (GetTickCount64)
 
   // 定常状態の 3 秒周期監視ゲート管理 (AppType 0, 2 以外)
   int steadyWaitTurns = 0;         // 定常時の残りスキップターン数
@@ -123,13 +117,11 @@ struct GlobalConfig {
       IDLE_PRIORITY_CLASS; // デフォルトプロセス優先度クラス (初期値: Idle 0x40)
   DWORD_PTR normalAffinityMask; // 通常スレッド退避先マスク (0:
                                 // 隔離コア以外の全コア自動)
-  int pollingIntervalMs;        // 監視周期 (デフォルト 1000ms)
+  int pollingIntervalMs;        // 監視周期 (デフォルト 500ms)
   double defaultCyclesDelta =
-      5.0; // 4KBスタック走査を発行する秒換算負荷閾値 (M/s, デフォルト 5.0)
+      5.0; // 32KBスタック走査を発行する秒換算負荷閾値 (M/s, デフォルト 5.0)
   std::string rawDefaultCyclesDeltaStr =
       ""; // INIの生文字列 (空欄状態の保持・再出力用)
-  bool enableHeuristics = false; // 非MMCSSスレッド探索用ヒューリスティック監視有効化
-                                 // (デフォルト: false)
   std::vector<int>
       columnWidths; // 各カラム幅 (論理ピクセル, 空の場合はデフォルト)
   int windowHeight =
@@ -160,12 +152,9 @@ public:
   void ResumeMultiSearch(size_t index);
   bool ToggleSuspendAudioThread(size_t index, DWORD tid = 0);
   bool IsAudioThreadSuspended(size_t index, DWORD tid) const;
-  void ResumeAllSuspendedThreads();
+  void ResumeAllSuspendedThreads(bool restoreAudioDg = true);
   std::vector<ProcessRule> GetRulesSnapshot();
   void SortRulesByName();
-
-  // 起動時照合によるINI更新要求チェック
-  bool CheckAndClearInitialNeedSave();
 
   // ポーリング間隔の正規化 (100, 200, 500, 1000 ms のみに限定)
   static int NormalizePollingInterval(int ms);
@@ -184,7 +173,6 @@ public:
 private:
   mutable std::mutex m_mutex;
   GlobalConfig m_config;
-  bool m_initialNeedSave = false;
 
   // ── リファクタリング: 共通ヘルパーメソッド ──
   // Chromium 系 PID 追跡状態の一括クリア
@@ -204,16 +192,18 @@ private:
   static bool ShouldFetchDynamicPriority(ProcessRule &rule, size_t slot);
 
   // オーディオスレッドへの優先度・Ideal
-  // Processor・アフィニティマスク適用共通ルーチン (Type 1 & Type 2 共通)
+  // Processor・アフィニティマスク適用共通ルーチン (Type 1〜5 共通)
   bool ApplyAudioThreadSettings(HANDLE hThread, DWORD tid, int targetAudioPrio,
                                 int audioCore, DWORD_PTR audioMask,
-                                ProcessRule &rule);
+                                ProcessRule &rule,
+                                DWORD_PTR knownAffinity = 0);
 
-  // 通常スレッドへのアフィニティマスク退避・Ideal Processor 分散適用共通ルーチン (Type 1 & Type 2
+  // 通常スレッドへのアフィニティマスク退避・Ideal Processor 分散適用共通ルーチン (Type 1〜5
   // 共通)
   bool EvacuateNormalThreadSettings(HANDLE hThread, DWORD tid,
                                     DWORD_PTR normalMask,
-                                    int idealCore = -1);
+                                    int idealCore = -1,
+                                    DWORD_PTR knownAffinity = 0);
 
   // キー: TID, 値: 適用済みマスク
   std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;
@@ -230,10 +220,6 @@ private:
 
   // 全種別共通: HighQoS 初回適用済み PID セット (新規検出PIDに1回のみ発行)
   std::unordered_set<DWORD> m_highQosAppliedPids;
-
-  // Chromium モード: コマンドライン走査済み子プロセス PID セット
-  // (毎秒総当たり走査防止)
-  std::unordered_set<DWORD> m_chromiumScannedPids;
 
   // Chromium Audio Service スレッド追従管理 (テスト仕様: 蓄積保持)
   struct ChromiumThreadTrackInfo {
@@ -256,7 +242,6 @@ private:
   std::unordered_map<DWORD, std::unordered_map<DWORD, ChromiumThreadTrackInfo>>
       m_chromiumThreadTracks;
   std::unordered_map<DWORD, ChromiumAudioState> m_chromiumAudioStates;
-  std::unordered_set<DWORD> m_chromiumEvictedPids;
 
   // audiodg.exe (AppType: 0) 適用済み TID セットおよび前回適用優先度 (キー: PID)
   std::unordered_map<DWORD, std::unordered_set<DWORD>> m_audioDgAppliedTids;
@@ -270,22 +255,13 @@ private:
   std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>>
       m_trackedAudioThreads;
 
-  // スレッドCPU時間サンプリング (キー: PID, 値: (キー: TID, 値:
-  // 前回計測の合計CPU時間))
-  std::unordered_map<DWORD, std::unordered_map<DWORD, ULONGLONG>>
-      m_prevThreadCpuTimes;
-
   struct ProcessSamplingState {
     std::unordered_map<DWORD, ULONG64> lastCycles; // サイクルタイム前回計測値
-    std::unordered_map<DWORD, ULONGLONG> lastCpuTime;
-    std::unordered_map<DWORD, ULONGLONG> accumulatedDelta; // 累積デルタ
     std::unordered_map<DWORD, ULONGLONG> latestDelta; // 直近ターンの瞬間デルタ
     std::unordered_set<DWORD>
         audioCandidateTids; // オーディオ関連と判定された候補 TID
     std::unordered_set<DWORD>
         socketCandidateTids; // ソケット送受信候補 TID (mswsock.dll / ws2_32.dll)
-    std::unordered_set<DWORD>
-        delayExecTids; // WaitReason == 4 (DelayExecution) 観測済み TID
     std::unordered_set<DWORD>
         vmGuiTids; // Voicemeeter GUI スレッド TID (user32/gdi32/gdiplus/win32u)
     std::unordered_set<DWORD> inspectedTids; // スタック検査済み TID (生涯1回)
@@ -297,12 +273,11 @@ private:
     DWORD tid;
     LONG basePri;
     int priority;
-    std::string threadName;
     HANDLE hThread;
     DWORD_PTR currentAffinity;
   };
 
-  // 候補 6: Phase 1 / Phase 3 スレッド探索・確定共通ルーチン
+  // スレッド探索・確定共通ルーチン (Searching... / Standby 3..1)
   bool TryIdentifyAudioThread(ProcessRule &rule, ProcessSamplingState &sampleState,
                               const std::vector<LocalThreadInfo> &threadInfos,
                               HANDLE hProcess, DWORD pid, DWORD_PTR audioMask,
@@ -319,6 +294,8 @@ private:
   DWORD m_unlistedApplyCount = 0;
   bool m_hasUnlistedMaskInOs = false;
   bool m_debugPrivilegeEnabled = false;
+  bool m_forceProcessSnapshot = false;
+  bool m_suppressAudioDgRestore = false;
   void EnableDebugPrivilegeOnce();
   std::unordered_set<std::string> BuildUnlistedWhitelist(bool includeExclusions = true) const;
   void RestoreAffinityForProcessNamesLocked(const std::unordered_set<std::string> &namesLower);

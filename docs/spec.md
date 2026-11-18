@@ -1,4 +1,4 @@
-# Audio Thread Isolator (ATI) v2.0.0 - Specification & User Manual (spec.md)
+# Audio Thread Isolator (ATI) v2.0.1 - Specification & User Manual (spec.md)
 
 ## 1. Application Overview
 
@@ -22,7 +22,7 @@
 - **`[Add]`**: Opens the Process Picker dialog (Section 2.2).
 - **`[Remove]`**: Removes the selected process from the monitoring list.
 - **`[Settings]`**: Opens the Global Settings dialog (Section 2.4).
-- **`[Exit]`**: Exits the application.
+- **`[Exit]`**: Exits the application (hold `Ctrl` while clicking to exit without auto-restoring `audiodg.exe`).
 - **Column Width & Window Height Drag Adjustment**: Dragging table header borders to resize column widths and dragging the top/bottom edges of the main window to resize vertical height are automatically saved to `ATI.ini`.
 
 #### Process Table (Monitoring List)
@@ -42,9 +42,9 @@
 
 - **Dedicated Multi-Row Expansion (Voicemeeter)**:
   - All Voicemeeter editions (`AppType: 5`, 2 rows) automatically expand into role-specific rows and isolate each network/audio engine thread independently.
-  - **10-Second Scan Countdown & `sleeping...` Transition**:
-    - Continuously scans for unconfirmed slots for 10 seconds, displaying `Standby 10` down to `Standby 1` on pending rows.
-    - Slots remaining undetected after 10 seconds (for example, when VBAN is disabled in Voicemeeter) transition to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the 10-second countdown scan while preserving already-confirmed threads.
+  - **2-Second Search + 3-Interval Standby Countdown & `sleeping...` Transition**:
+    - After an initial 2-second `Searching...` phase, unconfirmed slots are checked 3 times at 3-second intervals, displaying `Standby 3` down to `Standby 1` on pending rows (suspending thread enumeration during wait turns).
+    - Slots remaining undetected after all 3 checks (for example, when VBAN is disabled in Voicemeeter) transition to `sleeping...`. Clicking a sleeping row (Col 0 or Col 5) restarts the scan while preserving already-confirmed threads.
   - Editing and saving settings via `[Edit]` or clicking a cell on any sibling row updates all expanded rows of the process simultaneously.
 - **Roon Dedicated Continuous Standby (`AppType: 4`)**:
   - `RoonAppliance.exe` and `RAATServer.exe` operate as single-slot (1 row) rules.
@@ -71,7 +71,7 @@
 | `Not running` | None (Unchecked `☐` / `☑`) | Application is not running (standby). | Check to pre-configure Bypass before launch |
 | `Searching...` | ● Coral Pink | Searching for audio thread. | Toggles Bypass |
 | `Need Admin` | ● Coral Pink | Process requires administrator privileges (e.g. `audiodg.exe`), but ATI is running without elevation. Relaunch ATI as Administrator. | Toggles Bypass |
-| `Standby` / `Standby 10..1` | ● Coral Pink | Continuous monitoring standby. Awaiting audio output. | Transitions to Bypass (displays ☑ in ! col) |
+| `Standby 3..1` | ● Coral Pink | Periodic standby search (3 checks at 3-second intervals). Awaiting audio output. | Transitions to Bypass (displays ☑ in ! col) |
 | `sleeping...` | ● Flashing Muted Purple / Red | Sleeping due to silence / inactivity. | Immediately restarts search |
 | `PID <pid> / TID <tid>` | ● Cyan / Teal | Audio thread identified and isolated onto audio core (displayed as `PID <pid> / -` for `audiodg.exe`). | Transitions to Bypass (displays ☑ in ! col) |
 | `PID <pid> / Searching...` | ● Coral Pink | Chromium audio process identified; searching internal threads. | Transitions to Bypass (displays ☑ in ! col) |
@@ -109,9 +109,9 @@ Under standard applications (Normal process priority class), each thread priorit
 - **Right-Click Menu**:
   - **`Open Settings`**: Restores and displays the main window.
   - **`Start with Windows`**: Toggles automatic startup with Windows.
-  - **`Restart`**: Restarts the application normally.
-  - **`Restart as Administrator`**: Restarts with elevated UAC privileges (automatically hidden if already running as Administrator).
-  - **`Exit`**: Exits the application.
+  - **`Restart`**: Restarts the application normally (hold `Ctrl` to restart without auto-restoring `audiodg.exe`).
+  - **`Restart as Administrator`**: Restarts with elevated UAC privileges (automatically hidden if already running as Administrator; hold `Ctrl` to restart without auto-restoring `audiodg.exe`).
+  - **`Exit`**: Exits the application (hold `Ctrl` to exit without auto-restoring `audiodg.exe`).
 
 ---
 
@@ -149,7 +149,7 @@ Opened by clicking a target cell (Col 1 / 6 / 7 / 8 / 9) in the main window's pr
   - **Per-Slot Bypass (Mask Switch)**: Clicking the `!` column (Col 0) or `PID / TID` column (Col 5) on either of the two rows toggles Bypass ON / OFF for that individual slot. When Bypass is ON, the slot's thread keeps its priority unchanged while the normal eviction mask (`NormalCores`) is immediately applied; toggling Bypass OFF immediately reapplies the slot's dedicated audio core mask.
   - The edit dialog edits the slot of the row that was clicked (or selected for `[Edit]`); multiple cores can be toggled or entered as a hexadecimal mask in the `Audio Core` row.
 - **Windows Audio Engine (`audiodg.exe`)**:
-  In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS (once upon PID detection) directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, showing the effective priority of the active main audio thread rather than idle standby threads in Col 2, and incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits, the PID is restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`).
+  In the Windows Audio Device Graph Isolation process `audiodg.exe` (fixed as `AppType:0`), internal audio threads continuously replace one another. Instead of locking onto a single TID, ATI **applies the configured audio core mask, process priority class, and HighQoS (once upon PID detection) directly to the `audiodg.exe` process (PID), and applies the configured thread priority to all underlying threads (all TIDs)** (displayed as `PID <pid> / -` in Col 5, showing the effective priority of the active main audio thread rather than idle standby threads in Col 2, and incrementing `Chgs` by `+1` upon initial PID lock regardless of thread count). On subsequent polling turns, ATI detects newly spawned TIDs and immediately applies the thread priority while incrementing `Chgs` by `+1`. When `audiodg.exe` is removed from the list, switched to Bypass, or when ATI exits or restarts, the PID is automatically restored to all cores and `Normal` priority class, and all TIDs are restored to `+2` (`Highest`). Holding `Ctrl` while clicking **`[Exit]`** or triggering **`Exit`**, **`Restart`**, or **`Restart as Administrator`** from the system tray menu skips this automatic restoration and preserves the currently applied cores and priorities.
 - **Roon Dedicated Control (`AppType: 4` — `RoonAppliance.exe` / `RAATServer.exe` / `RoonBridge.exe`)**:
   - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
   - **Renderer PC (Endpoint / Roon Bridge)**: Register `RAATServer.exe` in the ATI instance running on the endpoint machine (registering `RoonBridge.exe` will automatically fall back to `RAATServer.exe`).
@@ -195,7 +195,7 @@ Saved per registered process under the executable name as key, with comma-separa
 1. **Usage of Pause (`❚❚`) Feature**:
    - This feature is strictly for verification to temporarily mute audio and confirm that the selected thread is the actual playback thread. Forcibly suspending threads can cause application deadlocks or crashes if misused as a general mute function.
 2. **Behavior on Temporary Bypass (`!` / Bypass)**:
-   - Entering Bypass stops ATI monitoring and active affinity adjustments for that process. Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling (as an exception, `audiodg.exe` automatically restores to standard settings upon Bypass, rule removal, or application exit).
+   - Entering Bypass stops ATI monitoring and active affinity adjustments for that process. Previously applied thread affinities and priorities are maintained and do not revert immediately to default OS scheduling (as an exception, `audiodg.exe` automatically restores to standard settings upon Bypass, rule removal, or application exit/restart; however, holding `Ctrl` while clicking **`[Exit]`** or selecting **`Exit`**, **`Restart`**, or **`Restart as Administrator`** from the system tray menu skips auto-restoration and preserves its current cores and priorities).
 3. **Single-Instance Enforcement & Self-Protection**:
    - Multiple instances are prevented; launching ATI while an instance is already running restores the existing instance's system tray icon (recovering from Explorer crashes if the icon disappeared), activates its main window to the foreground, and immediately exits the new instance. To prevent ATI's own monitoring loop from congesting audio cores, ATI automatically restricts its own process affinity to normal cores.
 4. **Control Scope by Launch Mode (Standard vs. Administrator)**:
