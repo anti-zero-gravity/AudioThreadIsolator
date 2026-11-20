@@ -10,7 +10,7 @@
 | **② How many buffer transfers occur per second under a 48kHz environment?** | **Buffer Size Dependent (Exact Value)** | Determined by the formula `48,000 ÷ sample count`. Standard shared mode (480 samples) = **100 transfers/sec**, ultra-low-latency exclusive mode (64 samples) = **750 transfers/sec**, minimum limit (32 samples) = **1,500 transfers/sec**. |
 | **③ Does the thread exit immediately after a short burst (<10ms) regardless of the CPU quantum (~15.5ms)?** | **Highly Accurate** | Rather than consuming the full quantum (maximum execution slice), the thread completes one period of buffer transfer (several to dozens of μs) and immediately **voluntarily yields the CPU** via a `Wait` call. |
 | **④ Is latency minimization the core rationale for this design?** | **Highly Accurate** | By minimizing buffer sizes and exchanging them at high frequency, **audio I/O latency is kept below the threshold of human perception**. |
-| **⑤ Why does the measured Cycles Delta of an audio thread consistently reach ~5M/s?** | **Physical Inevitability** | It is not merely waveform computation load, but the physical accumulation of **1,500 context switches/sec (~1.8M cycles)** + **WASAPI/ASIO buffer transfer (~1.7M cycles)** + **DPC/ISR & MMCSS monitoring (~1.5M cycles)**. |
+| **⑤ Why does the measured Cycles Delta of an ultra-low-latency audio thread reach ~5M/s?** | **Physical Inevitability** | At 64-sample operation, it is not merely waveform computation load, but the physical accumulation of **1,500 context switches/sec (~1.8M cycles)** + **WASAPI/ASIO buffer transfer (~1.7M cycles)** + **DPC/ISR & MMCSS monitoring (~1.5M cycles)** (threads running at 10ms periods or lightweight PCM-bridge designs can fall below 5M/s). |
 
 ---
 
@@ -108,9 +108,9 @@ This design pattern—minimal buffers, high-frequency wakeups, and instant relin
 
 ---
 
-## 4. Physical and Mathematical Breakdown of the Measured Audio Thread Cycles Delta (~5M/s)
+## 4. Physical and Mathematical Breakdown of Ultra-Low-Latency Audio Thread Cycles Delta (~5M/s at 64 Samples)
 
-When observing low-latency audio threads (WASAPI / ASIO) via thread monitoring utilities like ATI or Process Explorer, the Cycles Delta (accumulated CPU cycle increase per second) **consistently registers around ~5M/s (5,000,000 cycles/sec)**.
+When observing ultra-low-latency audio threads (64-sample WASAPI / ASIO) via thread monitoring utilities like ATI or Process Explorer, the Cycles Delta (accumulated CPU cycle increase per second) **registers around ~5M/s (5,000,000 cycles/sec)** (whereas larger buffer periods or lightweight PCM-bridge architectures can fall below 5M/s).
 
 This figure does not reflect heavy mathematical DSP computation. It represents the **physical cumulative overhead of ultra-high-frequency context switches and buffer synchronization**.
 
@@ -148,6 +148,23 @@ Hardware interrupt handling (DPC - Deferred Procedure Call) generated upon audio
 | **B. WASAPI Buffer Transfer & API Handling** | 750 transfers/sec × ~2,300 cycles | **1,725,000** | ~35% |
 | **C. DPC/ISR & MMCSS Monitoring** | Hardware interrupts & quantum accounting | **1,475,000** | ~29% |
 | **Total (Cycles Delta)** | **A + B + C** | **5,000,000 cycles (5M/s)** | **100%** |
+
+### 4-3. Cases Falling Below or Far Exceeding `5M/s` (Architectural Variance)
+
+The `~5M/s` breakdown above represents a typical ultra-low-latency scenario (**48kHz / 64 samples, 750 periods/sec, 1,500 context switches/sec + DPC/MMCSS overhead**). In real-world applications, `Cycles Delta` varies substantially depending on buffer period and thread responsibilities.
+
+1. **Lightweight Cases Below `5M/s` (~`2M – 4M/s`)**
+   - **Larger Buffer Periods (10ms Shared Mode / MME, etc.)**:
+     When driven at 480–512 samples per period (~94–100 wakeups/sec, ~200 context switches/sec as listed in Section 2-2), both context switch and buffer-handling frequencies drop to roughly 1/7th–1/8th of the 64-sample rate, reducing Csw and API costs accordingly.
+   - **Thread Separation from Upstream Processing (Lightweight PCM Bridge)**:
+     When heavy work such as LAN packet reception and resampling is offloaded to separate threads inside the application, leaving the audio thread (e.g., `wdmaud.drv` in `VBANReceptor.exe`) to only copy prepared PCM into the `audiodg.exe` shared buffer and return to `UserRequest` wait, measured `Cycles Delta` sits around **`~3.4M/s`**.
+   - **Handling in ATI**:
+     Because ATI's internal default stack-walk threshold (`5.0 M/s`) skips threads below that rate and transitions them to `sleeping...`, lower the process-specific `Delta` parameter in `ATI.ini` for such lightweight audio threads (see Section 4 of [Specification & User Manual (docs/spec.md)](spec.md) for format details).
+
+2. **High-Load Cases Far Exceeding `5M/s` (~`Tens of M/s – 250M/s`)**
+   - **DSP-Integrated Audio Threads**: DAWs and audio players executing VST plugins, heavy resampling, or multi-bus mixing directly inside the audio callback thread.
+   - **Network Socket Streaming Threads (e.g., Voicemeeter VBAN Thread)**:
+     Threads sending/receiving small-chunk UDP audio packets at high frequency via `ws2_32.dll`, which incur frequent user-mode ↔ kernel network stack (`AFD.sys` / `tcpip.sys`) system calls plus packet-pacing control in the same thread, often reach tens to ~250M/s.
 
 ---
 

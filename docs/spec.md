@@ -124,7 +124,7 @@ Opened via `[Settings]` on the main window. Manages default values for newly add
 | **`Default Audio Core (Mask)`** / **`Excluded (Mask)`** | Specifies default audio core(s) and excluded cores via bitmask (or comma-separated core numbers). | Direct input or table click |
 | **`Apply` (Audio Core Row)** | **[Dedicated Core Protection (Exclusive Checkbox)]** Applies an affinity mask excluding the audio core to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned processes at `INI×10` polling intervals. | Check to enable (mutually exclusive with Excluded row) / uncheck to stop polling |
 | **`Apply` (Excluded Row)** | **[Apply Excluded Mask (Exclusive Checkbox)]** Applies the specified excluded core mask to all non-ATI processes (except `UnlistedExclusions`) and automatically tracks newly spawned processes at `INI×10` polling intervals. | Check to enable (mutually exclusive with Audio Core row) / uncheck to stop polling |
-| **`Polling Interval (ms)`** | Polling cycle for monitoring thread (`100` / `200` / `500` / `1000` ms). | Number input (auto-corrected) |
+| **`Polling Interval (ms)`** | Polling cycle for monitoring thread (`100` / `200` / `500` / `1000` ms). Do not change from the default `500` ms unless necessary (core detection timing; changes not recommended). | Number input (auto-corrected) |
 | **`Unmask All`** | Becomes active (green) only when both `Apply` checkboxes are unchecked while masks are applied; explicitly clears protection masks from all non-monitored processes and restores all-core OS defaults. | Click to unmask |
 | **`OK` / `Cancel`** | Saves (OK) or discards (Cancel) settings and closes. | Click |
 
@@ -168,12 +168,13 @@ Configuration is saved in `ATI.ini` in the same directory as the executable.
 |:---|:---|:---|:---|
 | **`DefaultAudioCore`** | Default audio core (or comma-separated multi-core list) assigned to newly registered processes. | `0` to (Max Cores - 1) | `1` (`0` for single-core) |
 | **`NormalCores`** | Hexadecimal mask of cores allocated to normal threads. | Hex bitmask (e.g., `0x3F3`) | All cores excluding `DefaultAudioCore` |
-| **`PollingIntervalMs`** | Normal polling interval in milliseconds. | `100`, `200`, `500`, `1000` | `500` |
+| **`PollingIntervalMs`** | Normal polling interval in milliseconds (also configurable in Global Settings `Polling Interval (ms)`). **\* Core detection timing; changes not recommended (keep default `500`).** | `100`, `200`, `500`, `1000` (rounded up to 100ms steps) | `500` |
 | **`AlwaysOnTop`** | Main window always-on-top state. | `0` (Disabled), `1` (Enabled) | `0` |
 | **`ColumnWidths`** | Saved column widths of the main window process table (all 10 columns). | Comma-separated integers (10 values) | Default column widths |
 | **`WindowHeight`** | Saved vertical window height of the main window (in pixels). | Positive integer | Auto-calculated height |
 | **`UnlistedMask`** | Automatic affinity protection mode for Unlisted processes. | `0` (OFF), `1` (Exclude Audio Core), `2` (Apply Excluded Mask) | `0` |
 | **`UnlistedExclusions`** | Comma-separated list of executable names checked in the `!` column of `Select Process` to exclude from Unlisted mask targets. | Comma-separated exe names | Empty |
+| **`DefaultCyclesDelta`** | Default per-second `Cycles Delta` threshold for triggering the 32KB call stack walk on uninspected threads (no GUI control). **\* Not recommended to change, as it alters detection sensitivity across all registered processes (including Chromium). To lower the threshold for a specific app, use `Delta:` under `[Processes]`.** | Numeric >= `0.1` (M/s, rounded up in `0.1` steps; empty or `<= 0` uses default) | Empty (internal default `5.0`) |
 
 ### 4.2 Process Section `[Processes]`
 
@@ -187,6 +188,32 @@ Saved per registered process under the executable name as key, with comma-separa
 | **`NormalCores`** | Eviction core bitmask assigned to normal threads. When multiple cores are enabled, normal threads retain the multi-core affinity mask while their Ideal CPU (`SetThreadIdealProcessor`) is automatically distributed in round-robin order sorted by `Cycles Delta` descending. | Hex mask starting with `0x` |
 | **`Bypass`** | Temporary bypass state (`1`: bypassed, omitted: active). | `1` |
 | **`AppType`** | Application classification mode (`0`: `audiodg.exe` dedicated, `1`: Standard Audio, `2`: Chromium, `3`: High-load DAW, `4`: Roon dedicated, `5`: Voicemeeter dedicated). | `0`, `1`, `2`, `3`, `4`, `5` |
+| **`Delta`** | Per-process 32KB call stack walk threshold (`CyclesDelta` is also accepted on load). Overrides `[Global] DefaultCyclesDelta`. Lower this value for lightweight audio threads under `5.0 M/s` such as `VBANReceptor.exe`. | Numeric >= `0.1` (M/s, rounded up in `0.1` steps; `0` or omitted inherits Global) |
+
+### 4.3 Manual Editing Rules & Format Examples for `ATI.ini` (`Delta` Tuning)
+
+- **Exit ATI Before Editing**: Manually editing `ATI.ini` while ATI is running will be overwritten by ATI's in-memory settings upon exit or configuration save. Always **exit ATI first**, edit and save `ATI.ini`, then relaunch ATI.
+- **Avoid Changing Global Timing/Threshold Keys (`PollingIntervalMs` / `DefaultCyclesDelta`)**: Because both affect core detection timing or sensitivity across all registered applications, keep their defaults (`PollingIntervalMs=500`, `DefaultCyclesDelta=` empty for internal default `5.0 M/s`) and adjust `Delta:` only on the specific process line needed.
+- **Order-Independent Keys**: Under `[Processes]`, comma-separated parameters (`AppType:`, `Delta:`, `AudioCore:`, `AudioPriority:`, `ProcessPriority:`, `NormalCores:`, `Bypass:`) may be written in **any order** (on the next save, ATI normalizes them into standard order and `Delta:` format).
+- **Multi-Value Parameter Rule**: When a single key takes comma-separated multiple values (such as `AudioCore:11, 10` or `AudioPriority:-15, F19`), keep its subsequent values immediately after that key without inserting another key in between.
+- **Voicemeeter (`AppType: 5`, 2-line `(1)` / `(2)` Format)**: A `Delta:` specified on the first line `(1)` applies to the entire process (when ATI saves, it writes `Delta:` to both lines).
+
+#### Format Examples
+
+```ini
+[Global]
+DefaultAudioCore=11
+NormalCores=0x3F3
+; Core monitoring polling interval (changes not recommended; keep default 500 ms)
+PollingIntervalMs=500
+; Global threshold for all processes (changes not recommended; keep empty for internal default 5.0 M/s)
+DefaultCyclesDelta=
+
+[Processes]
+; Parameters are order-independent (both lines below parse identically)
+VBANReceptor.exe=AppType:3, Delta:1.5, AudioCore:11, AudioPriority:0
+VBANReceptor.exe=Delta:1.5, AudioCore:11, AudioPriority:0, AppType:3
+```
 
 ---
 
