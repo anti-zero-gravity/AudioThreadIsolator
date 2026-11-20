@@ -199,6 +199,14 @@ Saved per registered process under the executable name as key, with comma-separa
 - **Multi-Value Parameter Rule**: When a single key takes comma-separated multiple values (such as `AudioCore:11, 10` or `AudioPriority:-15, F19`), keep its subsequent values immediately after that key without inserting another key in between.
 - **Voicemeeter (`AppType: 5`, 2-line `(1)` / `(2)` Format)**: A `Delta:` specified on the first line `(1)` applies to the entire process (when ATI saves, it writes `Delta:` to both lines).
 
+#### Finding the Right `Delta` Value with Process Explorer (Troubleshooting `sleeping...`)
+
+If a lightweight audio pass-through app (for example, `VBANReceptor.exe` at ~`3.4 M/s`) falls below the default `5.0 M/s` threshold and enters `sleeping...`, measure its actual thread load using Microsoft Sysinternals [Process Explorer](https://learn.microsoft.com/en-us/sysinternals/downloads/process-explorer):
+
+1. Start audio playback in the target application, open Process Explorer, double-click the process, and switch to the **`Threads`** tab.
+2. Locate the active audio thread (typically showing `wdmaud.drv`, `audioses.dll`, or an ASIO DLL as its start address with steadily incrementing Context Switches) and check its **`Cycles Delta`** column (e.g., `3.4M`).
+3. Exit ATI, add a slightly lower threshold (e.g., **`Delta:2`** for `3.4M`) to that process entry in `ATI.ini`, save, and relaunch ATI.
+
 #### Format Examples
 
 ```ini

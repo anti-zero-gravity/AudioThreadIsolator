@@ -30,7 +30,7 @@ MSI Affinity V9による、デバイスのAffinityMaskと優先度設定、MMCSS
   - タスクトレイアイコンの右クリックメニュー「`Restart as Administrator`」からワンクリックで管理者権限へ昇格再起動。
   - OS 特権を自動有効化し、通常起動では制限される Windows カーネルのリアルタイム優先度クラス（Base Priority 16〜31）が設定可能。
   - **起動モードによる設定範囲の違い**:
-    - PPL（Protected Process Light）で保護された`audiodg.exe`プロセスの優先度設定やコア隔離が可能になります。
+    - `LOCAL SERVICE` 権限で動作する `audiodg.exe` プロセスの優先度設定やコア隔離が可能になります（MMCSS 無効化時）。
     - Unlisted マスクを適用できるプロセス数が増えます。
 - **監視対象外（Unlisted）プロセスの自動アフィニティ退避と個別除外**:
   - Global Settings の排他チェックボックス（`Default Audio Core` 除外 / `Excluded` マスク適用）を ON にすると、ATI 未登録の全プロセスへ `SetProcessAffinityMask` を一括適用し、以降に新規起動するプロセスも `INI×10` 周期で自動適用されます。累計の適用数は左下に`● <累計数> Unmonitored Processes Masked`と表示されるようになります。
@@ -86,6 +86,9 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
 3. **オンボードおよびネットワークオーディオ構成時の配慮**:
    - **オンボード HD-Audio**: オーディオスレッド用 CPU# を指定、または HD-Audio 専用 CPU# を用意することをおすすめします。
    - **LAN 経由送信 (NAA 等)**: LAN 経由でオーディオデータを NAA（Network Audio Adapter）などに送信するオーディオ構成の場合は、LAN 専用の CPU# を選定しておくことをおすすめします。
+4. **Windows MMCSS の無効化（`audiodg.exe` 等の優先度制御に必須）**:
+   - ATI は概念的に「Windows 標準の MMCSS をユーザー側で代替するユーティリティ」です。標準状態ではカーネルドライバ `mmcss.sys` が `audiodg.exe` や WASAPI / ASIO スレッドの優先度を `21〜26` へ強制上書き（および 10ms 周期の枯渇降格）し続けます。
+   - ATI から指定した優先度を有効にするには、`HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Audio`（必要に応じて `Pro Audio` も同様）配下の **`Scheduling Category`** に **`"Dummy"`**（または空文字列 `""`）を設定して OS を再起動してください（※値エントリー自体を削除すると既定の `Low` へフォールバックして無効化されないため、誤操作防止のため `"Dummy"` の入力を推奨します）。詳細は [MMCSS 実効優先度マトリクス](https://view.officeapps.live.com/op/view.aspx?src=https%3A%2F%2Fraw.githubusercontent.com%2Fanti-zero-gravity%2FAudioThreadIsolator%2Fmain%2Fdocs%2FMMCSS_Priority_Matrix_v2.xlsx%3Fv%3D2) および [MMCSS と Linux ALSA の比較 (docs/alsa_vs_mmcss_ja.md)](docs/alsa_vs_mmcss_ja.md) を参照してください。
 
 ### 2. ATI の初期設定
 - **DefaultAudioCore**:
@@ -98,13 +101,19 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
   - 詳細な UI・設定仕様については [機能仕様書 (docs/spec_ja.md)](docs/spec_ja.md) を参照してください。
 
 ### 3. スレッド優先度と音質の設計思想
+- **迷わない基本チューニング手順（推奨ベースライン）**:
+  - いきなり全スレッドを優先度 `1` に下げて音切れさせるのではなく、まずは **「プロセス優先度クラスを `Idle` に固定し、プロセス内のオーディオスレッドには起動時の元の優先度（または音切れしない下限値）を与える」** 構成から始めると、安定稼働と音質のバランスを取りやすくなります。
 - **低優先度駆動（Idle）の優位性**:
   - 「優先度 1 が最もよい音質が得られる」という設定方針に則れば、スレッド処理が後回しにされた結果のスタッターや音切れが予想されます。クォンタム設定は ["Short / Variable / 1:1"](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/rkssS5LdGl#2-3-%E3%82%AF%E3%82%A9%E3%83%B3%E3%82%BF%E3%83%A0%E9%95%B7%E3%83%86%E3%83%BC%E3%83%96%E3%83%AB%E3%81%A8%E7%94%A8%E9%80%94%E5%88%A5%E3%83%81%E3%83%A5%E3%83%BC%E3%83%8B%E3%83%B3%E3%82%B0%E8%A8%AD%E5%AE%9A%E6%97%A9%E8%A6%8B%E8%A1%A8) を強く推奨します。
 - **幅広いニーズへの対応**:
   - ATI は「音切れしない範囲で最も低い優先度が音質に優れる」という思想をベースに設計されていますが、プロセス優先度をアイドルに押さえて、オーディオスレッドのみを優先度31にしたり、その逆、プロセスをリアルタイムにしてオーディオスレッド優先度を１にするような極端な設定も可能です。
   - オーディオ用でも、その他全てのコアでもない、マスクのコアナンバーにチェックを入れないコアを作れます。この空きコアは複数のプロセスを渡るシグナルパスを想定していて、例えば#4 再生アプリ→#5 Voicemeeter→#6 audiodg→#7 LANデバイス→他PC　というような1プロセス1コア占有を可能にしています。
 
-### 4. Tips（特定アプリケーションの設定例）
+### 4. Tips（特定アプリケーションの設定例・トラブルシューティング）
+- **`audiodg.exe`（Windows オーディオエンジン）**:
+  - 上記の MMCSS `Tasks\Audio` 無効化（`"Dummy"`）と ATI の管理者権限起動を行った上で、専用コア（例 `#3`）＋ **`Idle 1`** に固定する設定が定番ベースラインです。
+- **Chromium 系ブラウザ（Vivaldi / Chrome / Edge 等）**:
+  - YouTube 等の Web 再生では、Audio Service プロセスを **`Idle`** クラスにし、オーディオスレッドを元優先度（`9〜10`）基準の **`Fixed 11`** 等に設定すると安定して動作します。
 - **Roon**:
   - Roon は複数のプロセス（`Roon.exe`, `RoonAppliance.exe`, `RoonServer.exe`, `RAATServer.exe`）で構成されています。
   - **サーバー PC（Roon Server / Core 側）**: 常駐させた ATI に `RoonAppliance.exe` を登録します。
@@ -114,7 +123,23 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
   - サーバー PC に Voicemeeter、レンダラー PC に VBAN Receptor を登録して両スレッドを低優先度で動作させる場合の推奨環境:
     - **ネットワーク接続**: サーバー PC とレンダラー PC 間を Ethernet LAN ケーブル直結
     - **NIC 詳細設定**: 各種オフロードは「有効」、フロー制御は「無効」、デュプレックス（速度と二重方式）は「10M FULL」
-    - **ATI コア割り当て**: Voicemeeter の `VAIO/AUX & DSP` 項目に対する Audio Core 割り当て CPU の推奨数は「4個以上」（例: 16進マスクによる複数コア割り当て）
+    - **優先度の目安**: Voicemeeter 既定のリアルタイム帯（VBAN `23` / DSP `19`）を避け、音切れしない範囲（例：VBAN `15` / DSP `13`）へ引き下げ
+    - **ATI コア割り当て**: Voicemeeter の `VAIO/AUX & DSP` 項目に対する Audio Core 割り当て CPU の推奨数は「4個以上」（システム処理が集中する `#0` を避けた複数コアマスク割り当て）
+- **軽量アプリが `sleeping...` で特定できない場合（`Delta` 調整）**:
+  - `VBANReceptor.exe`（約 `3.4 M/s`）など `Cycles Delta` が既定しきい値（`5.0 M/s`）未満のアプリは、Microsoft Sysinternals [Process Explorer](https://learn.microsoft.com/ja-jp/sysinternals/downloads/process-explorer) の `Threads` タブで実測 `Cycles Delta` を確認し、ATI 終了後に `ATI.ini` の対象行へ **`Delta:2`** 等を追記して調整できます（手順詳細は [docs/spec_ja.md](docs/spec_ja.md) セクション 4.3 を参照）。
+
+---
+
+## 関連ドキュメント・設定ガイド
+
+- **実践設定ガイド（画像付き・HackMD）**:
+  - [ATI 設定実例 & システムチューニング解説（日本語）](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/B1s17MaAze) / [Practical ATI Configuration Guide (English)](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/HyT5dJRAGe)
+- **仕様・技術リファレンス（`docs/`）**:
+  - [機能仕様書・ユーザー説明書 (docs/spec_ja.md)](docs/spec_ja.md)
+  - [Windows（MMCSS ＋ WASAPI / ASIO）と Linux（ALSA）のスケジューリング比較 (docs/alsa_vs_mmcss_ja.md)](docs/alsa_vs_mmcss_ja.md)
+  - [MMCSS カーネル実効優先度マトリクス Excel（ブラウザ閲覧）](https://view.officeapps.live.com/op/view.aspx?src=https%3A%2F%2Fraw.githubusercontent.com%2Fanti-zero-gravity%2FAudioThreadIsolator%2Fmain%2Fdocs%2FMMCSS_Priority_Matrix_v2.xlsx%3Fv%3D2) / [直接ダウンロード (docs/MMCSS_Priority_Matrix_v2.xlsx)](docs/MMCSS_Priority_Matrix_v2.xlsx)
+  - [オーディオスレッドの Cycles Delta とバッファリング周期解析 (docs/cycles_delta_ja.md)](docs/cycles_delta_ja.md)
+  - [管理用 API 発行マトリクス一覧 (docs/api_matrix_ja.md)](docs/api_matrix_ja.md)
 
 ---
 

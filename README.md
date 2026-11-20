@@ -30,7 +30,7 @@ By preparing an environment coordinated with device AffinityMask and priority se
   - Elevate with one click from the system tray right-click menu (`Restart as Administrator`).
   - Automatically enables OS privileges, unlocking the Windows kernel Realtime priority class (Base Priority 16–31) normally restricted under standard user launch.
   - **Control Scope Differences by Launch Mode**:
-    - Enables priority configuration and core isolation for the PPL (Protected Process Light) protected `audiodg.exe` process.
+    - Enables priority configuration and core isolation for `audiodg.exe` running under `LOCAL SERVICE` privilege (with MMCSS disabled).
     - Increases the number of processes eligible for Unlisted affinity masking.
 - **Automatic Affinity Eviction & Per-Process Exclusion for Unlisted Processes**:
   - Checking either mutually exclusive checkbox in Global Settings (Exclude `Default Audio Core` / Apply `Excluded` mask) applies `SetProcessAffinityMask` across all processes not registered in ATI and automatically applies it to newly launched processes at `INI×10` intervals. The cumulative count is displayed at the bottom-left as `● <count> Unmonitored Processes Masked`.
@@ -86,6 +86,9 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 3. **Onboard & Network Audio Considerations**:
    - **Onboard HD-Audio**: We recommend designating audio CPU# cores or preparing a dedicated CPU# exclusively for the HD-Audio device.
    - **Network Audio Streaming (NAA, etc.)**: When streaming audio data over LAN to devices such as a Network Audio Adapter (NAA), we recommend assigning a dedicated CPU# for the network interface controller.
+4. **Disabling Windows MMCSS (Required for Priority Control of `audiodg.exe`, etc.)**:
+   - Conceptually, ATI serves as a user-controlled replacement for Windows MMCSS. By default, the kernel driver `mmcss.sys` overrides the priorities of `audiodg.exe` and WASAPI / ASIO audio threads to `21–26` (with 10 ms quota demotions).
+   - For ATI's priority settings to take effect, set **`Scheduling Category`** under `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile\Tasks\Audio` (and `Pro Audio` if needed) to **`"Dummy"`** (or an empty string `""`) and reboot Windows. *(Note: deleting the value entry itself falls back to default `Low` rather than disabling MMCSS; explicitly entering `"Dummy"` is recommended.)* See the [MMCSS Effective Priority Matrix](https://view.officeapps.live.com/op/view.aspx?src=https%3A%2F%2Fraw.githubusercontent.com%2Fanti-zero-gravity%2FAudioThreadIsolator%2Fmain%2Fdocs%2FMMCSS_Priority_Matrix_v2_en.xlsx%3Fv%3D2) and [Windows MMCSS vs. Linux ALSA Comparison (docs/alsa_vs_mmcss.md)](docs/alsa_vs_mmcss.md).
 
 ### 2. Initial Configuration in ATI
 - **DefaultAudioCore**:
@@ -98,13 +101,19 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
   - For full UI and configuration details, see the [User Manual & Specification (docs/spec.md)](docs/spec.md).
 
 ### 3. Thread Priority & Sound Quality Philosophy
+- **Simple Recommended Baseline**:
+  - Rather than immediately dropping every thread to Priority `1` and risking dropouts, a practical and repeatable starting point is to **set the process priority class to `Idle` and assign the audio thread its original startup priority (or the lowest level free of dropouts)**.
 - **Advantages of Low Priority Operation (Idle)**:
   - Following the tuning policy that "Priority 1 achieves the best sound quality," stutters or audio dropouts can be expected as a result of thread execution being deferred. Setting the processor quantum to ["Short / Variable / 1:1"](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/BkMrmGLqMx#2-3-Quantum-Length-Table-and-Tuning-Quick-Reference-by-Use-Case) is strongly recommended.
 - **Flexibility for Diverse Needs**:
   - While ATI is built on the philosophy that "the lowest priority free of audio dropouts delivers superior sound quality," extreme configurations are also possible—such as keeping the process priority at Idle while setting only the audio thread to Priority 31, or conversely setting the process to Realtime while setting the audio thread priority to 1.
   - You can also create unallocated CPU cores left unchecked in both the Audio mask and the Excluded (all other threads) mask. These spare cores are intended for signal paths spanning multiple processes, enabling dedicated 1-process-per-core isolation such as `#4 Playback App → #5 Voicemeeter → #6 audiodg → #7 LAN Device → Remote PC`.
 
-### 4. Tips (Application-Specific Configuration)
+### 4. Tips (Application-Specific Configuration & Troubleshooting)
+- **`audiodg.exe` (Windows Audio Engine)**:
+  - With MMCSS `Tasks\Audio` disabled (`"Dummy"`) and ATI running as Administrator, assigning a dedicated core (e.g., `#3`) and locking thread priority to **`Idle 1`** is a widely used baseline.
+- **Chromium Browsers (Vivaldi / Chrome / Edge, etc.)**:
+  - For YouTube and web audio playback, setting the Audio Service process to **`Idle`** class and locking the audio thread to **`Fixed 11`** (just above its default startup priority of `9–10`) provides stable playback.
 - **Roon**:
   - Roon consists of multiple distinct processes (`Roon.exe`, `RoonAppliance.exe`, `RoonServer.exe`, and `RAATServer.exe`).
   - **Server PC (Roon Server / Core)**: Register `RoonAppliance.exe` in the ATI instance running on the server machine.
@@ -114,7 +123,23 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
   - Recommended environment when running Voicemeeter on the server PC and VBAN Receptor on the renderer PC with both threads executing at low priority:
     - **Network Connection**: Direct Ethernet LAN cable connection between Server PC and Renderer PC
     - **NIC Advanced Properties**: Enable all hardware offloads, disable Flow Control, set Speed & Duplex to "10M FULL"
-    - **ATI Core Allocation**: The recommended number of assigned Audio Cores for Voicemeeter's `VAIO/AUX & DSP` slot is 4 cores or more (e.g. multi-core allocation via hex mask).
+    - **Priority Guideline**: Avoid Voicemeeter's default realtime priorities (VBAN `23` / DSP `19`) and lower to the minimum glitch-free levels (e.g., VBAN `15` / DSP `13`)
+    - **ATI Core Allocation**: The recommended number of assigned Audio Cores for Voicemeeter's `VAIO/AUX & DSP` slot is 4 cores or more (multi-core mask avoiding core `#0`, which handles heavy OS traffic)
+- **Lightweight Apps Falling into `sleeping...` (`Delta` Threshold Tuning)**:
+  - For lightweight pass-through apps whose `Cycles Delta` is below ATI's default `5.0 M/s` threshold (such as `VBANReceptor.exe` at ~`3.4 M/s`), inspect the audio thread's `Cycles Delta` in Microsoft Sysinternals [Process Explorer](https://learn.microsoft.com/en-us/sysinternals/downloads/process-explorer) (`Threads` tab), exit ATI, and add **`Delta:2`** to that process entry in `ATI.ini` (see [docs/spec.md](docs/spec.md) Section 4.3).
+
+---
+
+## Documentation & Guides
+
+- **Illustrated Practical Configuration Guide (HackMD)**:
+  - [Practical ATI Configuration Guide (English)](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/HyT5dJRAGe) / [ATI 設定実例 & システムチューニング解説（日本語）](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/B1s17MaAze)
+- **Specifications & Technical References (`docs/`)**:
+  - [User Manual & Specification (docs/spec.md)](docs/spec.md)
+  - [Windows (MMCSS + WASAPI / ASIO) vs. Linux (ALSA) Scheduling Comparison (docs/alsa_vs_mmcss.md)](docs/alsa_vs_mmcss.md)
+  - [MMCSS Kernel Effective Priority Matrix Excel (View in Browser)](https://view.officeapps.live.com/op/view.aspx?src=https%3A%2F%2Fraw.githubusercontent.com%2Fanti-zero-gravity%2FAudioThreadIsolator%2Fmain%2Fdocs%2FMMCSS_Priority_Matrix_v2_en.xlsx%3Fv%3D2) / [Direct Download (docs/MMCSS_Priority_Matrix_v2_en.xlsx)](docs/MMCSS_Priority_Matrix_v2_en.xlsx)
+  - [Audio Thread Cycles Delta & Buffering Architecture Analysis (docs/cycles_delta.md)](docs/cycles_delta.md)
+  - [API Call Matrix & Polling Schedule Reference (docs/api_matrix.md)](docs/api_matrix.md)
 
 ---
 

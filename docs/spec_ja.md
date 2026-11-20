@@ -198,6 +198,14 @@
 - **複数値パラメータの注意**: `AudioCore:11, 10` や `AudioPriority:-15, F19` のように 1 つのキーにカンマ区切りで複数値を指定する場合のみ、2 つ目以降の値をそのキーの直後に続けて記述してください（間に別キーを挟まないでください）。
 - **Voicemeeter（`AppType: 5`, `(1)` / `(2)` 2 行構成）**: 1 行目（`(1)`）側に記述した `Delta:` がプロセス全体に適用されます（保存時は両行に出力されます）。
 
+#### Process Explorer を使った `Delta` 適正値の確認手順（`sleeping...` 対策）
+
+軽量な音声中継アプリ（例：`VBANReceptor.exe` は約 `3.4 M/s`）などで既定の `5.0 M/s` を下回り `sleeping...` になる場合は、Microsoft Sysinternals の [Process Explorer](https://learn.microsoft.com/ja-jp/sysinternals/downloads/process-explorer) で実測値を確認して `Delta:` を調整します。
+
+1. 対象アプリで音声を再生した状態で Process Explorer を開き、対象プロセスをダブルクリックして **`Threads`** タブを表示する。
+2. 音声処理スレッド（開始アドレスに `wdmaud.drv` / `audioses.dll` / ASIO DLL 等が表示され、コンテキストスイッチが継続的に増えているスレッド）の **`Cycles Delta`** 列を確認する（例：`3.4M`）。
+3. ATI を終了し、`ATI.ini` の対象プロセス行へ実測値よりやや低い値（例：`3.4M` なら **`Delta:2`**）を追記して保存し、ATI を再起動する。
+
 #### 実書式例
 
 ```ini
