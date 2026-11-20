@@ -133,7 +133,7 @@ ATI のデフォルト設定では、登録されたアプリの起動を検知�
 ## 関連ドキュメント・設定ガイド
 
 - **実践設定ガイド（画像付き・HackMD）**:
-  - [ATI 設定実例 & システムチューニング解説（日本語）](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/B1s17MaAze) / [Practical ATI Configuration Guide (English)](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/HyT5dJRAGe)
+  - [ATI 設定実例 & システムチューニング解説（日本語）](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/B1s17MaAze)
 - **仕様・技術リファレンス（`docs/`）**:
   - [機能仕様書・ユーザー説明書 (docs/spec_ja.md)](docs/spec_ja.md)
   - [Windows（MMCSS ＋ WASAPI / ASIO）と Linux（ALSA）のスケジューリング比較 (docs/alsa_vs_mmcss_ja.md)](docs/alsa_vs_mmcss_ja.md)

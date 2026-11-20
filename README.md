@@ -133,7 +133,7 @@ To maximize the benefits of ATI, we strongly recommend preparing **dedicated CPU
 ## Documentation & Guides
 
 - **Illustrated Practical Configuration Guide (HackMD)**:
-  - [Practical ATI Configuration Guide (English)](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/HyT5dJRAGe) / [ATI 設定実例 & システムチューニング解説（日本語）](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/B1s17MaAze)
+  - [Practical ATI Configuration Guide (English)](https://hackmd.io/@PsD5syoNTWq95HbQ6lFbtA/HyT5dJRAGe)
 - **Specifications & Technical References (`docs/`)**:
   - [User Manual & Specification (docs/spec.md)](docs/spec.md)
   - [Windows (MMCSS + WASAPI / ASIO) vs. Linux (ALSA) Scheduling Comparison (docs/alsa_vs_mmcss.md)](docs/alsa_vs_mmcss.md)
