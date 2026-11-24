@@ -13,7 +13,7 @@
 - **`確定TID (1〜2回)`**: プロセス内の全スレッドではなく、特定済みのオーディオスレッド（単一スロット 1 本、Voicemeeter 最大 2 本）のみに発行するもの。
 - **`全TID (N回)`**: 対象プロセス内の生存スレッド数 `N` 本（例: 15〜50 本）の回数だけループ発行コストを払うもの。
 
-### 1.1 OS 全域・プロセス単位 API（14種）
+### 1.1 OS 全域・プロセス単位 API（15種）
 
 | API 名 | 対象 | コスト粒度 | 負荷 | 主な役割 |
 | :--- | :---: | :---: | :---: | :--- |
@@ -28,6 +28,7 @@
 | `SetProcessAffinityMask` | PID | 不一致時 (1回) | 小 | プロセス実行許可コアマスクの変更 |
 | `GetPriorityClass` | PID | PID単位 (1回) | 極小 | プロセス優先度クラスの実測取得 |
 | `SetPriorityClass` | PID | 不一致時 (1回) | 小 | プロセス優先度クラスの設定 |
+| `SetProcessPriorityBoost` | PID | 初回/解除 (1回) | 極小 | `audiodg` の動的優先度ブースト無効化・復元 |
 | `QueryFullProcessImageNameA` | PID | 初回 1回のみ | 小 | EXEパス取得（Chromium 初回判定用） |
 | `NtQueryInformationProcess` | 子PID | 未特定時のみ | 小 | PEB 取得（Chromium 子プロセス特定用） |
 | `NtSuspendProcess / Resume` | PID | 手動時 (1回) | 小 | `audiodg.exe` プロセス全体の一時停止 |
@@ -43,6 +44,7 @@
  カーネルの自動継承機構により、親プロセスの HighQoS（1ms タイマー維持・速度制限解除）が配下の全スレッドへ恒久波及する。
 - **`SetProcessAffinityMask` / `SetPriorityClass`**: 事前に `Get` で現在値と照合し、不一致時のみ発行する（例外として `Type 2` の非音声子 PID 初回退避のみ `Get` なしで `SetProcessAffinityMask` を 1 回発行）。
  Col 3 が非アタッチ（淡緑背景）の時は `SetPriorityClass` は **0回**。
+- **`SetProcessPriorityBoost`**: `AppType: 0`（`audiodg.exe`）専用。新規 PID 検出時に HighQoS（`SetProcessInformation`）と同じタイミングで初回 1 回のみ `bDisablePriorityBoost = TRUE` を発行し（優先度アタッチ有無にかかわらず適用・定常 **0回**、カーネル継承により新規生成スレッドへも自動波及）、Bypass・削除・終了/再起動時の標準復元（`RestoreAudioDgProcessLocked`）時のみ `FALSE` で復元する（`Type 1〜5` では通常コア上のフィーダー・UI スレッドにおいて CPU 飢餓（スターベーション）を防ぐ OS の動的優先度ブースト（I/O 完了時や長時間待機時の優先度引き上げ）を維持するためプロセス単位では発行しない）。
 
 ---
 
@@ -70,13 +72,14 @@
 
 ---
 
-### 1.3 スレッド制御系 API（7種）
+### 1.3 スレッド制御系 API（8種）
 
 | API 名 | 対象 | コスト粒度 | 負荷 | 主な役割 |
 | :--- | :---: | :---: | :---: | :--- |
 | `GetThreadPriority` | TID | 条件時 (0〜2回) | 極小 | Win32 相対優先度（`-15`〜`+15`）取得 |
 | `SetThreadPriority` | TID | 不一致時のみ | 小 | Win32 相対優先度の設定 |
 | `NtSetInformationThread` | TID | 不一致時のみ | 小 | `Fixed 1〜31` 絶対優先度 (`KPRIORITY`) 設定 |
+| `SetThreadPriorityBoost` | TID | 未適用TIDのみ | 極小 | 隔離オーディオスレッドの動的ブースト無効化 |
 | `SetThreadAffinityMask` | TID | 未適用TIDのみ | 小 | オーディオコア固定・通常スレッド退避 |
 | `SetThreadIdealProcessor` | TID | 未適用TIDのみ | 小 | 最優先コア指定・通常コアへの分散配置 |
 | `SuspendThread` | TID | 手動時 (1回) | 小 | Col 4 (`❚❚`) オーディオスレッド一時停止 |
@@ -85,6 +88,7 @@
 #### 実行コスト・動作備考（1.3）
 - **非アタッチ時の優先度 API スキップ**: Col 2 が非アタッチ（淡緑背景：`audioPriority == 0`）かつ新規/確認イベント対象外の定常時は、
  `GetThreadPriority` / `SetThreadPriority` / `NtSetInformationThread` はすべて **0回**。
+- **隔離オーディオスレッドの動的ブースト無効化 (`SetThreadPriorityBoost`)**: `AppType: 1〜5` で隔離が確定したオーディオスレッドに対し、優先度アタッチ有無（淡緑・白）にかかわらず `SetThreadAffinityMask` / `SetThreadIdealProcessor` の未適用・マスク変更時と同じタイミングで `bDisablePriorityBoost = TRUE` を発行し（定常 **0回**）、I/O・イベント起床時の一時ブーストによる実効優先度変動および `Fixed 1〜14` 維持判定との干渉を防ぐ。
 - **`GetThreadPriority` 一括取得の限定**: 通常スレッド列挙時の `GetThreadPriority` 一括取得は未特定探索中の `AppType: 3` (DAW) と `Type 5` (Voicemeeter) のみに限定し、定常隔離中・一般アプリ・`RAATServer` 探索中は **0回**（侵略スレッド抑制・`Dyn Pri` 確認時のみ個別取得）。
 - **アフィニティ・Ideal CPU の差分発行**: 適用済みキャッシュ（`m_appliedThreads` / `m_appliedIdealCores`）と実マスク照合により、
  退避・隔離完了後の定常ターンでは `SetThreadAffinityMask` / `SetThreadIdealProcessor` ともに **0回**。
@@ -117,7 +121,7 @@
 | `INI × 1` | 500ms 毎 | `Type 2` (Chromium) | `Step 2` 無音待機・再生維持 |
 | `INI × 1` | 500ms 毎 | `Type 1, 3, 4, 5` | 初回 2 秒 `Searching...` 探索（`Type 4` 常時） |
 | `INI / 4` | 125ms 毎 | `Type 2` (Chromium) | `Step 3` 高速サンプリング（3回計測） |
-| 単発 (1回) | イベント時 | 全 Type | 初回 `HighQoS` / ピッカー / `❚❚` 停止 |
+| 単発 (1回) | イベント時 | 全 Type | 初回 `HighQoS`・Boost無効化 / ピッカー / `❚❚` |
 | 単発 (2回) | 0秒 + 約3秒後 | 全 Type | 実測 `Dyn Pri` の 2 段階取得 |
 
 - **スレッド走査が停止する（0回）状態**:
@@ -176,6 +180,7 @@
 | `GetThreadPriority` | ▲ アタッチ/確認 | ▲ アタッチ/確認 | ▲ アタッチ/確認 | ▲ 特定/抑制時 |
 | `SetThreadPriority` | ▲ アタッチ差分 | ▲ アタッチ差分 | ▲ アタッチ差分 | ▲ 特定/抑制時 |
 | `NtSetInformationThread` | ▲ Fixed差分 | ▲ Fixed差分 | ▲ Fixed差分 | ▲ 特定時 |
+| `SetThreadPriorityBoost` | ▲ 差分 | ▲ 差分 | ▲ 差分 | ▲ 特定時1回 |
 | `CloseHandle` | ● N+3回〜 | ● N+3回〜 | ● N+3〜4回 | ● 2N+2回 |
 
 - **6ターン中5ターンは休止**: スキップされる 5 ターンは `GetExitCodeProcess`（登録済みルール PID の死活確認）のみとなり、上表の API はすべて **0回**（`Type 1, 3, 5` の `Standby 3..1` 待機ターンも同様）。
@@ -207,6 +212,7 @@
 | `SetProcessAffinityMask` | - | ▲ 差分 | ▲ 差分 | ▲ 初回1回 | ▲ 初回1回 |
 | `GetPriorityClass` | - | ● 1回 | ▲ 再生中1回 | ▲ ブラウザ例外 | ▲ 確定枠あり |
 | `SetPriorityClass` | - | ▲ 差分 | ▲ 差分 | ▲ 差分 | ▲ 差分 |
+| `SetProcessPriorityBoost` | - | ▲ 初回1回 | - | - | - |
 | `OpenThread` | - | ▲ 新規TID | ▲ 候補/確定分 | ● N回 | ● N回 |
 | `CloseHandle` | ▲ 登録PID分 | ● N+2回〜 | ▲ 候補+N+2 | ● 2N+2回 | ● 2N+2回 |
 | `QueryThreadCycleTime` | - | - | ▲ 候補/確定分 | ● N回 (待機0) | ● N回 (待機0) |
@@ -218,6 +224,7 @@
 | `GetThreadPriority` | - | ▲ 新規/確認 | ▲ アタッチ/確認 | ▲ DAW探索N回 | ● N回 |
 | `SetThreadPriority` | - | ▲ 新規TID | ▲ アタッチ差分 | ▲ 特定/抑制時 | ▲ 特定/抑制時 |
 | `NtSetInformationThread` | - | ▲ 新規TID | ▲ Fixed差分 | ▲ 特定時 | ▲ 特定時 |
+| `SetThreadPriorityBoost` | - | - | ▲ 差分 | ▲ 特定時1回 | ▲ 特定時1回 |
 
 - **全 Type 死活確認（`!shouldScanProcesses` 時）**: `OpenProcess(QUERY_LIMITED)` + `GetExitCodeProcess` + `CloseHandle` は **`m_config.rules` に登録済の稼働 `PID > 4` のみ**に限定して実行し、`SNAPPROCESS` 実行ターンは **0回**。
 - **`Type 0` (`audiodg.exe`)**: 既存 TID は `m_audioDgAppliedTids` でスキップされるため新規 TID がない限り `OpenThread` は **0回**（Col 2 非アタッチ時は新規出現時も優先度 API **0回**）。環境の PPL 保護で `OpenProcess(PROCESS_QUERY_INFORMATION)` が拒否された場合は、`NtGetNextThread` の代わりに `NtQuerySystemInformation(5)` による TID 一括取得へフォールバックする。
@@ -244,6 +251,7 @@
 | `GetThreadPriority` | - | ▲ アタッチ/確認 | - |
 | `SetThreadPriority` | - | ▲ アタッチ差分 | - |
 | `NtSetInformationThread` | - | ▲ Fixed差分のみ | - |
+| `SetThreadPriorityBoost` | - | ● 勝者1本 | - |
 
 - `Type 2` の `Step 2` 待機中に `Delta >= 閾値` を検知した時だけ 125ms × 3回（計375ms）動作し、
  3区間の Delta 合計 1 位を `flag = 2` に確定して `INI × 1`（500ms）へ戻る。
@@ -259,6 +267,7 @@
 | トリガーイベント | 対象 Type | 発行 API | 発行回数 |
 | :--- | :---: | :--- | :---: |
 | 新規 PID 検出時 | 全 `Type 0〜5` | `SetProcessInformation` (HighQoS) | 初回 1回のみ |
+| Priority Boost 無効化 | `Type 0` / `Type 1〜5` | `SetProcessPriorityBoost` / `SetThreadPriorityBoost` | 初回PID検出 / 隔離適用時 1回のみ |
 | 初回 `AppType` 判定時 | 未判定アプリ | `QueryFullProcessImageNameA` | 初回 1回のみ |
 | Chromium 親制御退避 | `Type 2` | `QueryThreadCycleTime` + `SetAffinity` | 初回 1回のみ |
 | 実測 `Dyn Pri` 取得 | `Type 0` (`audiodg`) | `NtQuerySystemInformation` (`CtxSw` 1位) | 0秒 + 約3秒後の 2回 |
@@ -267,7 +276,7 @@
 | ピッカー非アタッチ復帰 | 全 `Type 0〜5` | *(発行なし：OS優先度を維持し監視解除)* | 0回 |
 | Col 4 (`❚❚`) 停止・再開 | `Type 0` (`audiodg`) | `NtSuspendProcess` / `NtResumeProcess` | 操作時 1回のみ |
 | Col 4 (`❚❚`) 停止・再開 | `Type 1〜5` | `SuspendThread` / `ResumeThread` | 操作時 1回のみ |
-| `audiodg` 解除・終了時 | `Type 0` (`audiodg`) | 全コア復元 + `NORMAL` + 全TID `+2` | 解除・終了時 1回のみ |
+| `audiodg` 解除・終了時 | `Type 0` (`audiodg`) | 全コア復元 + `NORMAL` + Boost有効 + 全TID `+2` | 解除・終了時 1回のみ |
 
 - **`Ctrl` + 終了・再起動時の `audiodg.exe` 非復元**: メイン画面の `[Exit]` ボタンおよびタスクトレイの `Exit` / `Restart` / `Restart as Administrator` を `Ctrl` キー押下中に実行した場合は、`RestoreAudioDgProcessLocked` をスキップして現在のコア・優先度設定を維持する。
 - **`Type 1, 3, 4, 5` の 2 回目 `Dyn Pri` 取得**: 3.0 秒経過後の次回 `INI × 6` ターン（特定から約 3.0〜4.5 秒後）に実行される。

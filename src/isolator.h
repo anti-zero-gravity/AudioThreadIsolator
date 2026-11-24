@@ -177,7 +177,7 @@ private:
   // ── リファクタリング: 共通ヘルパーメソッド ──
   // Chromium 系 PID 追跡状態の一括クリア
   void ClearChromiumTrackingState(DWORD pid);
-  // audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF / Normal / 全TID +2)
+  // audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF / Normal / Boost有効 / 全TID +2)
   void RestoreAudioDgProcessLocked(DWORD targetPid = 0);
   // Suspend 中オーディオスレッドの安全な Resume
   static void ResumeAudioThreadIfSuspended(ProcessRule &rule);

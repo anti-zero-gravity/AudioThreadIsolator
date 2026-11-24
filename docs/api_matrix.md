@@ -12,7 +12,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 - **`Fixed TID (1-2)`**: Invoked only on identified audio threads (1 per single-slot app, up to 2 for Voicemeeter).
 - **`All TIDs (N)`**: Invoked in a loop across all `N` live threads inside the target PID (e.g., 15-50 threads).
 
-### 1.1 OS-Wide & Process-Level APIs (14 Entries)
+### 1.1 OS-Wide & Process-Level APIs (15 Entries)
 
 | API Name | Scope | Cost Granularity | Overhead | Primary Role |
 | :--- | :---: | :---: | :---: | :--- |
@@ -27,6 +27,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `SetProcessAffinityMask` | PID | On Mismatch (1) | Low | Update process execution core affinity mask |
 | `GetPriorityClass` | PID | Per-PID (1) | Tiny | Query current process priority class |
 | `SetPriorityClass` | PID | On Mismatch (1) | Low | Apply configured process priority class |
+| `SetProcessPriorityBoost` | PID | Once / Restore (1) | Tiny | Disable/restore dynamic boost on `audiodg` |
 | `QueryFullProcessImageNameA` | PID | Once (Initial) | Low | Resolve EXE path for initial Chromium check |
 | `NtQueryInformationProcess` | Child | Unresolved Only | Low | Read PEB to locate Chromium AudioService PID |
 | `NtSuspendProcess / Resume` | PID | Manual Only (1) | Low | Suspend/resume entire `audiodg.exe` process |
@@ -40,6 +41,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 - **`GetExitCodeProcess`**: Reads the kernel `EPROCESS` exit code directly instead of taking per-turn snapshots. Restricted strictly to running `PID > 4` entries registered in `m_config.rules`, preventing unrelated app or system exits from triggering `SNAPPROCESS`.
 - **`SetProcessInformation` (`ProcessPowerThrottling = 4`)**: Issued once on initial PID detection (**0 calls** in steady state). Kernel inheritance propagates HighQoS (1ms timer resolution, no throttling) to all child threads.
 - **`SetProcessAffinityMask` / `SetPriorityClass`**: Compares against `Get` first and issues `Set` only on mismatch (exception: initial evacuation of `Type 2` non-audio child PIDs calls `SetProcessAffinityMask` once without `Get`). `SetPriorityClass` is **0 calls** when Col 3 is unattached (light green).
+- **`SetProcessPriorityBoost`**: Restricted to `AppType: 0` (`audiodg.exe`). When Col 2 or Col 3 is attached, issues `bDisablePriorityBoost = TRUE` once per PID (**0 calls** in steady state; inherited automatically by newly spawned threads), and restores `FALSE` only during `RestoreAudioDgProcessLocked` (Bypass, removal, exit/restart) or explicit `Normal (0)` reset. Never called at the process level for `Type 1..5` so normal-core feeder and UI threads retain OS starvation-rescue and I/O boosts.
 
 ---
 
@@ -65,13 +67,14 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 
 ---
 
-### 1.3 Thread Control APIs (7 Entries)
+### 1.3 Thread Control APIs (8 Entries)
 
 | API Name | Scope | Cost Granularity | Overhead | Primary Role |
 | :--- | :---: | :---: | :---: | :--- |
 | `GetThreadPriority` | TID | Conditional (0-2) | Tiny | Query Win32 relative priority (`-15` to `+15`) |
 | `SetThreadPriority` | TID | On Mismatch | Low | Apply Win32 relative thread priority |
 | `NtSetInformationThread` | TID | On Mismatch | Low | Apply `Fixed 1..31` absolute `KPRIORITY` |
+| `SetThreadPriorityBoost` | TID | Unapplied Only | Tiny | Disable dynamic priority boost on audio TID |
 | `SetThreadAffinityMask` | TID | Unapplied Only | Low | Pin audio thread / evict normal threads |
 | `SetThreadIdealProcessor` | TID | Unapplied Only | Low | Set preferred audio core / spread normal cores |
 | `SuspendThread` | TID | Manual Only (1) | Low | Suspend Col 4 (`❚❚`) audio thread |
@@ -79,6 +82,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 
 #### Runtime Cost & Behavior Notes (1.3)
 - **Unattached Priority API Skip**: When Col 2 is unattached (light green: `audioPriority == 0`) in steady state outside new-TID or `Dyn Pri` checks, `GetThreadPriority`, `SetThreadPriority`, and `NtSetInformationThread` are all **0 calls**.
+- **Audio Thread Dynamic Boost Disable (`SetThreadPriorityBoost`)**: For isolated audio threads in `AppType: 1..5`, regardless of priority attach state (pale green or white), issues `bDisablePriorityBoost = TRUE` alongside `SetThreadAffinityMask` / `SetThreadIdealProcessor` only on initial isolation or mask change (**0 calls** in steady state), preventing wake-up priority jumps across dynamic priorities (`1..14`) and avoiding false `Fixed 1..14` maintenance re-writes.
 - **Scoped `GetThreadPriority` Enumeration**: Bulk per-thread `GetThreadPriority` during discovery runs only for unconfirmed `AppType: 3` (DAW) and `Type 5` (Voicemeeter), staying **0 calls** during steady isolation, general apps, and `RAATServer` search (queried individually only on intruder demotion or `Dyn Pri` checks).
 - **Differential Affinity & Ideal CPU**: Matched against `m_appliedThreads` / `m_appliedIdealCores` caches, keeping `SetThreadAffinityMask` and `SetThreadIdealProcessor` at **0 calls** during steady state.
 
@@ -110,7 +114,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `INI × 1` | Every 500ms | `Type 2` (Chromium) | `Step 2` silence standby / playback maintain |
 | `INI × 1` | Every 500ms | `Type 1, 3, 4, 5` | Initial 2s `Searching...` (`Type 4` continuous) |
 | `INI / 4` | Every 125ms | `Type 2` (Chromium) | `Step 3` high-speed sampling (3 iterations) |
-| One-Shot (1) | On Event | All Types | Initial `HighQoS` / Picker / `❚❚` Suspend |
+| One-Shot (1) | On Event | All Types | Initial `HighQoS` & Boost OFF / Picker / `❚❚` |
 | One-Shot (2) | 0s + ~3s | All Types | 2-stage actual `Dyn Pri` acquisition |
 
 - **States Where Thread Scanning Stops (0 Calls)**:
@@ -169,6 +173,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `GetThreadPriority` | ▲ Attach/Chk | ▲ Attach/Chk | ▲ Attach/Chk | ▲ Match/Demote |
 | `SetThreadPriority` | ▲ Attach Diff | ▲ Attach Diff | ▲ Attach Diff | ▲ Match/Demote |
 | `NtSetInformationThread` | ▲ Fixed Diff | ▲ Fixed Diff | ▲ Fixed Diff | ▲ On Match |
+| `SetThreadPriorityBoost` | ▲ Diff | ▲ Diff | ▲ Diff | ▲ 1x Match |
 | `CloseHandle` | ● N+3+ | ● N+3+ | ● N+3-4 | ● 2N+2 |
 
 - **5 Out of 6 Ticks Paused**: Skipped ticks execute only `GetExitCodeProcess` liveness checks for registered PIDs; all APIs in the table above stay at **0 calls** (likewise on `Standby 3..1` wait ticks).
@@ -197,6 +202,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `SetProcessAffinityMask` | - | ▲ Diff | ▲ Diff | ▲ 1st Only | ▲ 1st Only |
 | `GetPriorityClass` | - | ● 1 | ▲ Active 1 | ▲ Browser Ex | ▲ 1+ Isolated |
 | `SetPriorityClass` | - | ▲ Diff | ▲ Diff | ▲ Diff | ▲ Diff |
+| `SetProcessPriorityBoost` | - | ▲ 1st Only | - | - | - |
 | `OpenThread` | - | ▲ New TID | ▲ Cand/Fixed | ● N | ● N |
 | `CloseHandle` | ▲ Reg PIDs | ● N+2+ | ▲ Cand+N+2 | ● 2N+2 | ● 2N+2 |
 | `QueryThreadCycleTime` | - | - | ▲ Cand/Fixed | ● N (0 Wait) | ● N (0 Wait) |
@@ -208,6 +214,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `GetThreadPriority` | - | ▲ New/Chk | ▲ Attach/Chk | ▲ DAW N Only | ● N |
 | `SetThreadPriority` | - | ▲ New TID | ▲ Attach Diff | ▲ Match/Demote | ▲ Match/Demote |
 | `NtSetInformationThread` | - | ▲ New TID | ▲ Fixed Diff | ▲ On Match | ▲ On Match |
+| `SetThreadPriorityBoost` | - | - | ▲ Diff | ▲ 1x Match | ▲ 1x Match |
 
 - **Liveness Pass (`!shouldScanProcesses`)**: `OpenProcess(QUERY_LIMITED)` + `GetExitCodeProcess` + `CloseHandle` run strictly on active `PID > 4` entries in `m_config.rules` (**0 calls** on ticks running `SNAPPROCESS`).
 - **`Type 0` (`audiodg.exe`)**: Existing TIDs are skipped via `m_audioDgAppliedTids`, keeping `OpenThread` at **0 calls** unless new TIDs appear (and Col 2 unattached keeps priority APIs at **0 calls** even on new TIDs). Where PPL blocks `OpenProcess(PROCESS_QUERY_INFORMATION)`, enumeration falls back to `NtQuerySystemInformation(5)`.
@@ -234,6 +241,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | `GetThreadPriority` | - | ▲ Attach/Chk | - |
 | `SetThreadPriority` | - | ▲ Attach Diff | - |
 | `NtSetInformationThread` | - | ▲ Fixed Diff | - |
+| `SetThreadPriorityBoost` | - | ● Winner 1 | - |
 
 - Triggered during `Type 2` `Step 2` when `Delta >= threshold`, running 3 times at 125ms (375ms total), crowning the highest cumulative Delta thread as `flag = 2`, and returning to `INI × 1` (500ms).
 - Threads dropping to `Delta == 0` are marked (`-1`), while `flag = 1` siblings and cache-matched `alreadyEvacuated` threads are skipped (**0** `OpenThread` calls).
@@ -246,6 +254,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | Trigger Event | Target Type | Invoked API | Call Count |
 | :--- | :---: | :--- | :---: |
 | New PID Detected | All `Type 0..5` | `SetProcessInformation` (HighQoS) | Once on 1st Detect |
+| Priority Boost Disable | `Type 0` / `Type 1..5` | `SetProcessPriorityBoost` / `SetThreadPriorityBoost` | Once on 1st PID / Isolation |
 | Initial `AppType` Probe | Unclassified | `QueryFullProcessImageNameA` | Once on 1st Detect |
 | Chromium Parent Evict | `Type 2` | `QueryThreadCycleTime` + `SetAffinity` | Once on 1st Detect |
 | Actual `Dyn Pri` Check | `Type 0` (`audiodg`) | `NtQuerySystemInformation` (Top `CtxSw`) | Twice (0s + ~3s) |
@@ -254,7 +263,7 @@ This technical reference documents all Win32 and NT Native APIs invoked by ATI f
 | Picker Unattach Reset | All `Type 0..5` | *(None: preserves OS priority, stops tracking)* | 0 calls |
 | Col 4 (`❚❚`) Suspend/Resume | `Type 0` (`audiodg`) | `NtSuspendProcess` / `NtResumeProcess` | Once per Action |
 | Col 4 (`❚❚`) Suspend/Resume | `Type 1..5` | `SuspendThread` / `ResumeThread` | Once per Action |
-| `audiodg` Release / Exit | `Type 0` (`audiodg`) | Restore All Cores + `NORMAL` + All TIDs `+2` | Once on Release/Exit |
+| `audiodg` Release / Exit | `Type 0` (`audiodg`) | Restore All Cores + `NORMAL` + Boost ON + All TIDs `+2` | Once on Release/Exit |
 
 - **Skipping `audiodg.exe` Restore via `Ctrl` + Exit/Restart**: Holding `Ctrl` while invoking **`[Exit]`** or tray **`Exit`** / **`Restart`** / **`Restart as Administrator`** skips `RestoreAudioDgProcessLocked` and preserves active cores and priorities.
 - **2nd `Dyn Pri` Check for `Type 1, 3, 4, 5`**: Executes on the first `INI × 6` tick after 3.0s elapse (roughly 3.0-4.5s post-identification). Changing priority settings via picker also re-triggers this 2-stage check.

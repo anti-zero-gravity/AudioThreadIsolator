@@ -1511,7 +1511,7 @@ void ThreadIsolator::ClearChromiumTrackingState(DWORD pid) {
 }
 
 // audiodg.exe (AppType: 0) 終了・削除・Bypass 時の標準状態復元 (全コア 0xFFF /
-// Normal / 全TID +2)
+// Normal / Boost有効 / 全TID +2)
 void ThreadIsolator::RestoreAudioDgProcessLocked(DWORD targetPid) {
   EnableDebugPrivilegeOnce();
   std::vector<DWORD> pids;
@@ -1560,6 +1560,8 @@ void ThreadIsolator::RestoreAudioDgProcessLocked(DWORD targetPid) {
         SetProcessAffinityMask(hProc, fullMask);
       }
       SetPriorityClass(hProc, NORMAL_PRIORITY_CLASS);
+      SetProcessPriorityBoost(hProc, FALSE);
+      m_highQosAppliedPids.erase(pid);
       CloseHandle(hProc);
     }
 
@@ -1823,7 +1825,7 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
     }
   }
 
-  // 2. アフィニティおよび Ideal Processor を設定 (未適用またはマスク変更時のみ発行)
+  // 2. アフィニティ・Ideal Processor・Priority Boost 無効化を設定 (未適用またはマスク変更時のみ発行)
   DWORD_PTR curAff =
       (knownAffinity != 0) ? knownAffinity : QueryThreadAffinityMask(hThread);
   bool needApplyMask = (curAff != audioMask ||
@@ -1840,6 +1842,7 @@ bool ThreadIsolator::ApplyAudioThreadSettings(HANDLE hThread, DWORD tid,
     }
     SetThreadIdealProcessor(hThread, static_cast<DWORD>(audioCore));
     m_appliedIdealCores[tid] = audioCore;
+    SetThreadPriorityBoost(hThread, TRUE);
   }
 
   return changed;
@@ -2763,9 +2766,10 @@ bool ThreadIsolator::ScanAndIsolate() {
         }
 
         if (hProc) {
-          // 1. HighQoS 適用 (新規検出PIDに対し初回1回のみ)
+          // 1. HighQoS ＆ Priority Boost 無効化適用 (新規検出PIDに対し初回1回のみ・子スレッド自動継承)
           if (m_highQosAppliedPids.insert(pid).second) {
             ApplyProcessHighQoS(hProc);
+            SetProcessPriorityBoost(hProc, TRUE);
           }
 
           // 2. PID に audioMask を適用

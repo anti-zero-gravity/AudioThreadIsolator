@@ -251,18 +251,6 @@ static std::string FormatThreadPriorityDisplay(DWORD pClass, int threadPrio,
     return name + " " + std::to_string(actualBasePri);
   }
 
-  if (effectiveClass == NORMAL_PRIORITY_CLASS) {
-    int fgBase = 9;
-    int bgBase = 7;
-    if (ati::GetNormalPairBasePriorities(threadPrio, fgBase, bgBase)) {
-      if (fgBase == bgBase) {
-        return name + " " + std::to_string(fgBase);
-      }
-      return name + " FG " + std::to_string(fgBase) + " - BG " +
-             std::to_string(bgBase);
-    }
-  }
-
   int rank = ati::FindRankByPrio(effectiveClass, threadPrio);
   const auto *entry = ati::GetMatrixEntryByRank(rank);
   if (entry) {
@@ -297,7 +285,7 @@ static std::string FormatRuleThreadPriorityDisplay(const ati::ProcessRule &r,
   if (rowPrio == 0 && !isForceZero && actBase > 0) {
     if (slot < r.actualThreadRelativePrios.size()) {
       int actRel = r.actualThreadRelativePrios[slot];
-      for (int i = 0; i < 49; ++i) {
+      for (int i = 0; i < ati::kPriorityMatrixEntryCount; ++i) {
         if (ati::kPriorityMatrixEntries[i].processPriorityClass == effClass &&
             ati::kPriorityMatrixEntries[i].threadPriority == actRel &&
             ati::kPriorityMatrixEntries[i].basePriority == actBase) {
@@ -306,7 +294,7 @@ static std::string FormatRuleThreadPriorityDisplay(const ati::ProcessRule &r,
       }
     }
     int matchedRel = 999;
-    for (int i = 0; i < 49; ++i) {
+    for (int i = 0; i < ati::kPriorityMatrixEntryCount; ++i) {
       if (ati::kPriorityMatrixEntries[i].processPriorityClass == effClass &&
           ati::kPriorityMatrixEntries[i].basePriority == actBase) {
         matchedRel = ati::kPriorityMatrixEntries[i].threadPriority;
@@ -3270,7 +3258,7 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam,
               r.actualAudioBasePriorities[subIdx] > 0) {
             int actBase = r.actualAudioBasePriorities[subIdx];
             int matchedRel = 999;
-            for (int i = 0; i < 49; ++i) {
+            for (int i = 0; i < ati::kPriorityMatrixEntryCount; ++i) {
               if (ati::kPriorityMatrixEntries[i].processPriorityClass ==
                       effProcClass &&
                   ati::kPriorityMatrixEntries[i].basePriority == actBase) {
@@ -4098,7 +4086,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.1");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.2");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -5334,7 +5322,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     UINT uRestoreMsg = RegisterWindowMessageA("ATI_RestoreInstance");
 
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.1");
+    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.2");
+    if (!hExisting)
+      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.1");
     if (!hExisting)
       hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.0");
     if (!hExisting)
