@@ -4,6 +4,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "process_picker.h"
 #include "dpi_utils.h"
+#include "priority_matrix_data.h"
 #include "resource.h"
 #include <algorithm>
 #include <commctrl.h>
@@ -30,25 +31,6 @@ static std::vector<std::string> *s_pExcludedInOut = nullptr;
 static std::vector<PickerRow> s_pickerRows;
 static std::map<std::string, bool, CaseInsensitiveCompare> s_excludedState;
 static bool s_hintVisible = false;
-
-static std::string PriorityToString(DWORD prio) {
-  switch (prio) {
-  case REALTIME_PRIORITY_CLASS:
-    return "Realtime";
-  case HIGH_PRIORITY_CLASS:
-    return "High";
-  case ABOVE_NORMAL_PRIORITY_CLASS:
-    return "Above Normal";
-  case NORMAL_PRIORITY_CLASS:
-    return "Normal";
-  case BELOW_NORMAL_PRIORITY_CLASS:
-    return "Below Normal";
-  case IDLE_PRIORITY_CLASS:
-    return "Low";
-  default:
-    return "Normal";
-  }
-}
 
 static void SetPickerHintVisible(HWND hDlg, bool show) {
   if (!hDlg || s_hintVisible == show)
@@ -214,7 +196,7 @@ static void PopulateRunningProcesses(HWND hList) {
     ListView_SetItemText(hList, index, 1,
                          const_cast<LPSTR>(item.processName.c_str()));
 
-    std::string prioStr = PriorityToString(item.currentPriorityClass);
+    std::string prioStr = GetProcessPriorityClassName(item.currentPriorityClass, "Low");
     ListView_SetItemText(hList, index, 2, const_cast<LPSTR>(prioStr.c_str()));
 
     index++;

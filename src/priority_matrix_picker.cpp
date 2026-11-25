@@ -10,7 +10,6 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <fstream>
 #include <cmath>
 #include <algorithm>
 
@@ -41,85 +40,6 @@ static bool s_isMouseOverLeftMatrix = false;
 static bool s_wheelActive = false;
 static int s_wheelPrio = 8;
 
-static const int kPriorityMatrix[6][7] = {
-    {  1,  2,  3,  4,  5,  6, 15 }, // Row 0: Idle (Base 4)
-    {  1,  4,  5,  6,  7,  8, 15 }, // Row 1: Below Normal (Base 6)
-    {  1,  6,  7,  8,  9, 10, 15 }, // Row 2: Normal (Base 8)
-    {  1,  8,  9, 10, 11, 12, 15 }, // Row 3: Above Normal (Base 10)
-    {  1, 11, 12, 13, 14, 15, 15 }, // Row 4: High (Base 13)
-    { 16, 22, 23, 24, 25, 26, 31 }  // Row 5: Realtime (Base 24)
-};
-
-static const int kProcessBases[6] = { 4, 6, 8, 10, 13, 24 };
-static const int kColThreadPrios[7] = {
-    THREAD_PRIORITY_IDLE,
-    THREAD_PRIORITY_LOWEST,
-    THREAD_PRIORITY_BELOW_NORMAL,
-    THREAD_PRIORITY_NORMAL,
-    THREAD_PRIORITY_ABOVE_NORMAL,
-    THREAD_PRIORITY_HIGHEST,
-    THREAD_PRIORITY_TIME_CRITICAL
-};
-
-static const wchar_t* kRowProcessNames[6] = {
-    L"Idle",
-    L"Below Normal",
-    L"Normal",
-    L"Above Normal",
-    L"High",
-    L"Realtime"
-};
-
-static const wchar_t* kShortProcessNames[6] = {
-    L"Idle",
-    L"Below Normal",
-    L"Normal",
-    L"Above Normal",
-    L"High",
-    L"Realtime"
-};
-
-static const wchar_t* kColThreadNames[7] = {
-    L"Idle (-15)",
-    L"Lowest (-2)",
-    L"Below Normal (-1)",
-    L"Normal (0)",
-    L"Above Normal (+1)",
-    L"Highest (+2)",
-    L"Time Critical (+15)"
-};
-
-static int ProcessClassToRow(DWORD procClass) {
-    switch (procClass) {
-    case IDLE_PRIORITY_CLASS:         return 0;
-    case BELOW_NORMAL_PRIORITY_CLASS: return 1;
-    case NORMAL_PRIORITY_CLASS:       return 2;
-    case ABOVE_NORMAL_PRIORITY_CLASS: return 3;
-    case HIGH_PRIORITY_CLASS:         return 4;
-    case REALTIME_PRIORITY_CLASS:     return 5;
-    default:                          return 2;
-    }
-}
-
-static DWORD RowToProcessClass(int row) {
-    switch (row) {
-    case 0:  return IDLE_PRIORITY_CLASS;
-    case 1:  return BELOW_NORMAL_PRIORITY_CLASS;
-    case 2:  return NORMAL_PRIORITY_CLASS;
-    case 3:  return ABOVE_NORMAL_PRIORITY_CLASS;
-    case 4:  return HIGH_PRIORITY_CLASS;
-    case 5:  return REALTIME_PRIORITY_CLASS;
-    default: return NORMAL_PRIORITY_CLASS;
-    }
-}
-
-static int ThreadPrioToCol(int threadPrio) {
-    for (int c = 0; c < 7; ++c) {
-        if (kColThreadPrios[c] == threadPrio) return c;
-    }
-    return 3;
-}
-
 static int ClampRowForAdmin(int r) {
     if (!s_isAdmin && r == 5) return 4;
     return r;
@@ -133,32 +53,6 @@ static const int HIT_MAP_H = 340;
 // GDI+ Image Cache
 static std::unordered_map<int, Gdiplus::Image*> s_compositeCache;
 static Gdiplus::Image* s_pBaseDarkImg = nullptr;
-static std::wstring s_uiPartsDirW;
-
-static void FindUiPartsDirectory() {
-    if (!s_uiPartsDirW.empty()) return;
-
-    char exePathA[MAX_PATH] = { 0 };
-    GetModuleFileNameA(nullptr, exePathA, MAX_PATH);
-    PathRemoveFileSpecA(exePathA);
-
-    std::string candidates[] = {
-        std::string(exePathA) + "\\ui_parts",
-        std::string(exePathA) + "\\demo\\ui_parts",
-        "c:\\Users\\YK-PC\\.gemini\\antigravity-ide\\scratch\\ATI\\ui_parts",
-        "c:\\Users\\YK-PC\\.gemini\\antigravity-ide\\scratch\\ATI\\demo\\ui_parts"
-    };
-
-    for (const auto& path : candidates) {
-        std::string hitBin = path + "\\hit_map.bin";
-        if (PathFileExistsA(hitBin.c_str())) {
-            int len = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
-            s_uiPartsDirW.resize(len - 1);
-            MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, &s_uiPartsDirW[0], len);
-            break;
-        }
-    }
-}
 
 static Gdiplus::Image* LoadImageFromResource(int resId) {
     HINSTANCE hInst = GetModuleHandleA(nullptr);
@@ -202,32 +96,12 @@ static bool LoadHitMapFromResource() {
 
 static void LoadHitMapBin() {
     if (!s_hitMapData.empty()) return;
-    if (LoadHitMapFromResource()) return;
-
-    // フォールバック (外部ファイル探索)
-    FindUiPartsDirectory();
-    if (s_uiPartsDirW.empty()) return;
-
-    std::wstring binPath = s_uiPartsDirW + L"\\hit_map.bin";
-    std::ifstream ifs(binPath.c_str(), std::ios::binary | std::ios::ate);
-    if (ifs.is_open()) {
-        std::streamsize size = ifs.tellg();
-        ifs.seekg(0, std::ios::beg);
-        s_hitMapData.resize(static_cast<size_t>(size));
-        if (ifs.read(reinterpret_cast<char*>(s_hitMapData.data()), size)) {
-            // loaded
-        }
-    }
+    LoadHitMapFromResource();
 }
 
 static Gdiplus::Image* GetBaseDarkImage() {
     if (!s_pBaseDarkImg) {
         s_pBaseDarkImg = LoadImageFromResource(IDR_MATRIX_BASE_DARK);
-        if (!s_pBaseDarkImg) {
-            FindUiPartsDirectory();
-            std::wstring p = s_uiPartsDirW + L"\\base_dark_layer.png";
-            s_pBaseDarkImg = Gdiplus::Image::FromFile(p.c_str());
-        }
     }
     return s_pBaseDarkImg;
 }
@@ -242,16 +116,6 @@ static Gdiplus::Image* GetRowImage(int row) {
     }
 
     Gdiplus::Image* img = LoadImageFromResource(cacheKey);
-    if (img && img->GetLastStatus() == Gdiplus::Ok) {
-        s_compositeCache[cacheKey] = img;
-        return img;
-    }
-
-    FindUiPartsDirectory();
-    wchar_t fname[64];
-    swprintf(fname, 64, L"\\full_composites\\matrix_row_%d.png", rowIdx);
-    std::wstring fullPath = s_uiPartsDirW + fname;
-    img = Gdiplus::Image::FromFile(fullPath.c_str());
     if (img && img->GetLastStatus() == Gdiplus::Ok) {
         s_compositeCache[cacheKey] = img;
         return img;
@@ -277,16 +141,6 @@ static Gdiplus::Image* GetCellImage(int row, int col) {
         s_compositeCache[cacheKey] = img;
         return img;
     }
-
-    FindUiPartsDirectory();
-    wchar_t fname[64];
-    swprintf(fname, 64, L"\\full_composites\\matrix_rank_%02d.png", rank);
-    std::wstring fullPath = s_uiPartsDirW + fname;
-    img = Gdiplus::Image::FromFile(fullPath.c_str());
-    if (img && img->GetLastStatus() == Gdiplus::Ok) {
-        s_compositeCache[cacheKey] = img;
-        return img;
-    }
     return GetRowImage(row);
 }
 
@@ -305,7 +159,7 @@ static ActivePickerState ResolveActiveState() {
         int repCol = (s_committedCol >= 0) ? s_committedCol : 3;
         st.displayRow = targetRow;
         st.displayCol = -1;
-        st.displayPrio = kPriorityMatrix[targetRow][repCol];
+        st.displayPrio = GetMatrixBasePriority(targetRow, repCol);
         st.isFixed = false;
         st.isRowOnly = true;
         return st;
@@ -316,7 +170,7 @@ static ActivePickerState ResolveActiveState() {
         int baseRow = (s_isCtrlPressed && s_hoveredRawRow >= 0) ? ClampRowForAdmin(s_hoveredRawRow) : s_committedRow;
         int matchedCol = -1;
         for (int c = 0; c < 7; ++c) {
-            if (kPriorityMatrix[baseRow][c] == s_wheelPrio) {
+            if (GetMatrixBasePriority(baseRow, c) == s_wheelPrio) {
                 matchedCol = c;
                 break;
             }
@@ -334,7 +188,7 @@ static ActivePickerState ResolveActiveState() {
         int activeCol = s_hoveredRawCol;
         st.displayRow = activeRow;
         st.displayCol = activeCol;
-        st.displayPrio = kPriorityMatrix[activeRow][activeCol];
+        st.displayPrio = GetMatrixBasePriority(activeRow, activeCol);
         st.isFixed = false;
         st.isRowOnly = false;
         return st;
@@ -354,7 +208,7 @@ static ActivePickerState ResolveActiveState() {
     int col = (s_committedCol >= 0) ? s_committedCol : 3;
     st.displayRow = baseRow;
     st.displayCol = col;
-    st.displayPrio = kPriorityMatrix[baseRow][col];
+    st.displayPrio = GetMatrixBasePriority(baseRow, col);
     st.isFixed = false;
     st.isRowOnly = false;
     return st;
@@ -376,7 +230,7 @@ static void CommitAndClose(HWND hWnd) {
             res.threadPriority = EncodeFixedThreadPriority(st.displayPrio);
         } else {
             int col = (st.displayCol >= 0 && st.displayCol <= 6) ? st.displayCol : 3;
-            res.threadPriority = kColThreadPrios[col];
+            res.threadPriority = kColumnThreadPriorities[col];
         }
     }
 
@@ -503,7 +357,7 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         // Large Base Priority Hero Number (Pale green #9ae6b4 when relative in row, White when Fixed)
         wchar_t bpBuf[32];
         if (st.isRowOnly) {
-            swprintf(bpBuf, 32, L"%d", kProcessBases[st.displayRow]);
+            swprintf(bpBuf, 32, L"%d", kProcessBasePriorities[st.displayRow]);
         } else {
             swprintf(bpBuf, 32, L"%d", st.displayPrio);
         }
@@ -521,7 +375,7 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         float domainX = static_cast<float>(textPadX) + refHeroBounds.Width + 6.0f * s_scale;
         float domainY = static_cast<float>(curY) + 18.0f * s_scale;
 
-        int checkPrio = st.isRowOnly ? kProcessBases[st.displayRow] : st.displayPrio;
+        int checkPrio = st.isRowOnly ? kProcessBasePriorities[st.displayRow] : st.displayPrio;
         bool isRealtimeDomain = (checkPrio >= 16);
         const wchar_t* domainStr = isRealtimeDomain ? L"Realtime" : L"Dynamic";
         Gdiplus::Font domainFont(L"Segoe UI", 14.0f * s_scale, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
@@ -558,7 +412,7 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         g.DrawString(L"Process Class:", -1, &lblFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &lblBrush);
         curY += rowStepLbl;
         wchar_t pClassBuf[64];
-        wcscpy_s(pClassBuf, kRowProcessNames[st.displayRow]);
+        swprintf(pClassBuf, 64, L"%hs", GetRowProcessLabel(st.displayRow));
         g.DrawString(pClassBuf, -1, &valFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &valBrush);
 
         curY += rowStepVal;
@@ -574,7 +428,7 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
                 threadIsFixedStyle = true;
             } else {
                 int c = (s_committedCol >= 0 && s_committedCol <= 6) ? s_committedCol : 3;
-                swprintf(tPrioBuf, 64, L"%ls [Unchanged]", kColThreadNames[c]);
+                swprintf(tPrioBuf, 64, L"%hs [Unchanged]", GetColThreadLabel(c));
                 threadIsFixedStyle = false;
             }
         } else if (st.isFixed) {
@@ -582,7 +436,7 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
             threadIsFixedStyle = true;
         } else {
             int c = (st.displayCol >= 0 && st.displayCol <= 6) ? st.displayCol : 3;
-            wcscpy_s(tPrioBuf, kColThreadNames[c]);
+            swprintf(tPrioBuf, 64, L"%hs", GetColThreadLabel(c));
             threadIsFixedStyle = false;
         }
         g.DrawString(tPrioBuf, -1, &valFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)),
@@ -595,13 +449,13 @@ static LRESULT CALLBACK PickerWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM
         curY += rowStepLbl;
         wchar_t formBuf[96];
         if (st.isRowOnly) {
-            swprintf(formBuf, 96, L"Process Base Priority = %d", kProcessBases[st.displayRow]);
+            swprintf(formBuf, 96, L"Process Base Priority = %d", kProcessBasePriorities[st.displayRow]);
         } else if (st.isFixed) {
-            swprintf(formBuf, 96, L"Fixed KPRIORITY = %d (Process: %ls)", st.displayPrio, kShortProcessNames[st.displayRow]);
+            swprintf(formBuf, 96, L"Fixed KPRIORITY = %d (Process: %hs)", st.displayPrio, GetRowProcessLabel(st.displayRow));
         } else {
             int c = (st.displayCol >= 0 && st.displayCol <= 6) ? st.displayCol : 3;
-            int tr = kColThreadPrios[c];
-            swprintf(formBuf, 96, L"%d + (%+d) = %d", kProcessBases[st.displayRow], tr, kPriorityMatrix[st.displayRow][c]);
+            int tr = kColumnThreadPriorities[c];
+            swprintf(formBuf, 96, L"%d + (%+d) = %d", kProcessBasePriorities[st.displayRow], tr, GetMatrixBasePriority(st.displayRow, c));
         }
         Gdiplus::SolidBrush formBrush(Gdiplus::Color(255, 203, 213, 225));
         g.DrawString(formBuf, -1, &monoFont, Gdiplus::PointF(static_cast<float>(textPadX), static_cast<float>(curY)), &formBrush);
@@ -865,7 +719,7 @@ HWND ShowPriorityMatrixPicker(
     s_wheelActive = false;
     s_wheelPrio = (s_committedCol == -1 && s_committedFixedPrio > 0)
         ? s_committedFixedPrio
-        : kPriorityMatrix[s_committedRow][s_committedCol];
+        : GetMatrixBasePriority(s_committedRow, s_committedCol);
 
     // Detect DPI scale from parent window
     HMODULE hUser32 = GetModuleHandleA("user32.dll");

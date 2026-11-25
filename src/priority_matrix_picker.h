@@ -6,6 +6,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <functional>
+#include "priority_matrix_data.h"
 
 namespace ati {
 
@@ -23,14 +24,6 @@ struct PriorityPickerResult {
 };
 
 using PriorityPickerCallback = std::function<void(const PriorityPickerResult&)>;
-
-// Fixed thread priority (KPRIORITY 1..31) encoding helpers
-#ifndef ATI_FIXED_PRIO_HELPERS
-#define ATI_FIXED_PRIO_HELPERS
-inline bool IsFixedThreadPriority(int v) { return v >= 101 && v <= 131; }
-inline int DecodeFixedThreadPriority(int v) { return v - 100; }
-inline int EncodeFixedThreadPriority(int p) { return 100 + p; }
-#endif
 
 // GDI+ のライフサイクル管理
 void InitializeGdiPlus();

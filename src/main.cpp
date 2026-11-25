@@ -196,23 +196,7 @@ static std::string GetPriorityString(int prio) {
 }
 
 static std::string GetProcessPriorityString(DWORD pClass) {
-  switch (pClass) {
-  case REALTIME_PRIORITY_CLASS:
-    return "Realtime";
-  case HIGH_PRIORITY_CLASS:
-    return "High";
-  case ABOVE_NORMAL_PRIORITY_CLASS:
-    return "Above Normal";
-  case NORMAL_PRIORITY_CLASS:
-    return "Normal";
-  case BELOW_NORMAL_PRIORITY_CLASS:
-    return "Below Normal";
-  case IDLE_PRIORITY_CLASS:
-    return "Idle";
-  case 0:
-  default:
-    return "Normal";
-  }
+  return ati::GetProcessPriorityClassName(pClass);
 }
 
 static std::string GetThreadShortName(int prio) {
@@ -268,13 +252,11 @@ static std::string FormatRuleThreadPriorityDisplay(const ati::ProcessRule &r,
   if (effClass == 0)
     effClass = NORMAL_PRIORITY_CLASS;
 
-  int rowPrio =
-      (slot < r.audioPriorities.size()) ? r.audioPriorities[slot] : r.audioPriority;
+  int rowPrio = r.GetSlotPriority(slot);
   int actBase = (slot < r.actualAudioBasePriorities.size())
                     ? r.actualAudioBasePriorities[slot]
                     : 0;
-  bool isForceZero = (slot < r.normalPrioForceApplied.size() &&
-                      r.normalPrioForceApplied[slot]);
+  bool isForceZero = r.IsSlotNormalForceApplied(slot);
 
   if (ati::IsFixedThreadPriority(rowPrio)) {
     return FormatThreadPriorityDisplay(effClass, rowPrio, actBase);
@@ -513,24 +495,6 @@ static void LoadConfig(ati::GlobalConfig &config, const std::string &iniPath) {
     firstCore = defaultCore;
   }
   config.defaultAudioCore = firstCore;
-
-  char procPrioBuf[64] = {0};
-  GetPrivateProfileStringA("Global", "DefaultProcessPriority", "Idle",
-                           procPrioBuf, sizeof(procPrioBuf), iniPath.c_str());
-  std::string ppStr(procPrioBuf);
-  if (ppStr == "Realtime") {
-    config.defaultProcessPriorityClass = REALTIME_PRIORITY_CLASS;
-  } else if (ppStr == "High") {
-    config.defaultProcessPriorityClass = HIGH_PRIORITY_CLASS;
-  } else if (ppStr == "Above Normal" || ppStr == "AboveNormal") {
-    config.defaultProcessPriorityClass = ABOVE_NORMAL_PRIORITY_CLASS;
-  } else if (ppStr == "Normal") {
-    config.defaultProcessPriorityClass = NORMAL_PRIORITY_CLASS;
-  } else if (ppStr == "Below Normal" || ppStr == "BelowNormal") {
-    config.defaultProcessPriorityClass = BELOW_NORMAL_PRIORITY_CLASS;
-  } else {
-    config.defaultProcessPriorityClass = IDLE_PRIORITY_CLASS;
-  }
 
   char normalMaskBuf[64] = {0};
   GetPrivateProfileStringA("Global", "NormalCores", "0", normalMaskBuf, 64,
@@ -1244,29 +1208,23 @@ struct DisplayRow {
 };
 static std::vector<DisplayRow> g_displayRows;
 
+static void UpdateListViewDynamic(HWND hList,
+                                  const std::vector<ati::ProcessRule> &rules);
+
 static void RefreshListView(HWND hList,
                             const std::vector<ati::ProcessRule> &rules) {
   g_displayRows.clear();
   ListView_DeleteAllItems(hList);
-
-  auto cores = ati::CpuTopology::GetCpuCores();
 
   for (size_t i = 0; i < rules.size(); ++i) {
     const auto &r = rules[i];
     size_t rowCount = ati::ThreadIsolator::GetRuleSlotCount(r);
 
     for (size_t s = 0; s < rowCount; ++s) {
-      DWORD tid = 0;
-      if (s < r.activeAudioTids.size()) {
-        tid = r.activeAudioTids[s];
-      } else if (s == 0 && !ati::ThreadIsolator::IsMultiSlotRule(r)) {
-        tid = r.activeAudioTid;
-      }
-
       DisplayRow dr;
       dr.ruleIndex = i;
       dr.subIndex = s;
-      dr.tid = tid;
+      dr.tid = 0;
       int itemIdx = static_cast<int>(g_displayRows.size());
       g_displayRows.push_back(dr);
 
@@ -1276,138 +1234,9 @@ static void RefreshListView(HWND hList,
       lvi.iSubItem = 0;
       lvi.pszText = const_cast<LPSTR>("");
       ListView_InsertItem(hList, &lvi);
-
-      // 1: Process Name (.exe を除いて表示 / マルチスロット役割表記)
-      std::string displayName = FormatProcessSlotDisplayName(r, s);
-      ListView_SetItemText(hList, itemIdx, 1,
-                           const_cast<LPSTR>(displayName.c_str()));
-
-      // 2: Thread Priority
-      std::string prioStr = FormatRuleThreadPriorityDisplay(r, s);
-      ListView_SetItemText(hList, itemIdx, 2,
-                           const_cast<LPSTR>(prioStr.c_str()));
-
-      // 3: Process Priority
-      DWORD dispProcClass = (!r.processPriorityModified && r.isRunning &&
-                             r.actualProcessPriorityClass != 0)
-                                ? r.actualProcessPriorityClass
-                                : r.processPriorityClass;
-      std::string procPrioStr = GetProcessPriorityString(dispProcClass);
-      ListView_SetItemText(hList, itemIdx, 3,
-                           const_cast<LPSTR>(procPrioStr.c_str()));
-
-      // 4: Pause / Verify (カスタムドロー描画、テキストは空)
-      ListView_SetItemText(hList, itemIdx, 4, const_cast<LPSTR>(""));
-
-      // 5: Audio Core PID/TID
-      std::string thName;
-      bool isSlotByp =
-          ati::ThreadIsolator::IsMultiSlotRule(r)
-              ? (s < r.slotBypassed.size() && r.slotBypassed[s])
-              : r.isBypassed;
-      if (isSlotByp) {
-        thName = "Bypassed";
-      } else if (!r.isRunning) {
-        thName = "Not running";
-      } else if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
-        if (s < r.activeAudioTids.size() && tid != 0) {
-          thName = "PID " + std::to_string(r.activePid) + " / TID " +
-                   std::to_string(tid);
-        } else if (r.multiSearchSleeping) {
-          thName = "sleeping...";
-        } else if (r.multiSearchPhase == 2) {
-          int rem = r.multiSearchTurns;
-          if (rem < 1)
-            rem = 1;
-          if (rem > 3)
-            rem = 3;
-          thName = "Standby " + std::to_string(rem);
-        } else {
-          thName = "Searching...";
-        }
-      } else if (r.isAudioIsolated && tid != 0) {
-        thName = "PID " + std::to_string(r.activePid) + " / TID " +
-                 std::to_string(tid);
-      } else if (r.detectedThreadName.empty()) {
-        thName = r.isRunning ? "Scanning..." : "Not running";
-      } else {
-        thName = r.detectedThreadName;
-      }
-      ListView_SetItemText(hList, itemIdx, 5,
-                           const_cast<LPSTR>(thName.c_str()));
-
-      // 6: TIDs
-      std::string threadsStr =
-          r.isRunning ? std::to_string(r.currentThreadCount) : "-";
-      ListView_SetItemText(hList, itemIdx, 6,
-                           const_cast<LPSTR>(threadsStr.c_str()));
-
-      // 7: Chgs
-      std::string countStr = std::to_string(r.applyCount);
-      ListView_SetItemText(hList, itemIdx, 7,
-                           const_cast<LPSTR>(countStr.c_str()));
-
-      // 8: Audio
-      std::string forAudioStr = "-";
-      if (r.isRunning) {
-        if (s < r.audioSlotMasks.size() && r.audioSlotMasks[s] != 0) {
-          DWORD_PTR slotMask = r.audioSlotMasks[s];
-          int bitCount = 0;
-          int singleBit = -1;
-          for (int c = 0; c < 64; ++c) {
-            if ((slotMask & (1ULL << c)) != 0) {
-              bitCount++;
-              singleBit = c;
-            }
-          }
-          if (bitCount == 1) {
-            forAudioStr = GetCoreLabel(singleBit, cores);
-          } else {
-            forAudioStr = FormatAudioMaskDisplay(slotMask, cores);
-          }
-        } else {
-          int assignedCore = r.audioCore;
-          if (s < r.audioCores.size()) {
-            assignedCore = r.audioCores[s];
-          } else if (!ati::ThreadIsolator::IsMultiSlotRule(r) &&
-                     r.audioAffinityMask != 0) {
-            int bitIdx = -1;
-            int foundCount = 0;
-            for (int c = 0; c < 64; ++c) {
-              if ((r.audioAffinityMask & (1ULL << c)) != 0) {
-                if (foundCount == static_cast<int>(s)) {
-                  bitIdx = c;
-                  break;
-                }
-                foundCount++;
-              }
-            }
-            if (bitIdx >= 0)
-              assignedCore = bitIdx;
-          }
-          forAudioStr = GetCoreLabel(assignedCore, cores);
-        }
-      }
-      ListView_SetItemText(hList, itemIdx, 8,
-                           const_cast<LPSTR>(forAudioStr.c_str()));
-
-      // 9: Excluded (全スロットで保持マスクをそのまま表示)
-      {
-        int coreCount = ati::CpuTopology::GetSystemCoreCount();
-        DWORD_PTR normalMask = (r.normalAffinityMask != 0)
-                                   ? r.normalAffinityMask
-                                   : g_isolator.GetConfig().normalAffinityMask;
-        DWORD_PTR mask = r.audioAffinityMask
-                             ? r.audioAffinityMask
-                             : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
-        std::string otherThanStr =
-            FormatOtherThanLabels(r.isRunning, r.isBypassed, r.isAudioIsolated,
-                                  mask, normalMask, coreCount, cores);
-        ListView_SetItemText(hList, itemIdx, 9,
-                             const_cast<LPSTR>(otherThanStr.c_str()));
-      }
     }
   }
+  UpdateListViewDynamic(hList, rules);
 }
 
 static void SetSubItemTextIfChanged(HWND hList, int item, int subItem,
@@ -1434,17 +1263,20 @@ static void UpdateListViewDynamic(HWND hList,
   }
 
   auto cores = ati::CpuTopology::GetCpuCores();
+  int coreCount = ati::CpuTopology::GetSystemCoreCount();
+  DWORD_PTR globalNormalMask = g_isolator.GetConfig().normalAffinityMask;
 
   for (size_t rowIdx = 0; rowIdx < g_displayRows.size(); ++rowIdx) {
     auto &dr = g_displayRows[rowIdx];
     if (dr.ruleIndex >= rules.size())
       continue;
     const auto &r = rules[dr.ruleIndex];
+    bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(r);
 
     // 最新の TID を更新
     if (dr.subIndex < r.activeAudioTids.size()) {
       dr.tid = r.activeAudioTids[dr.subIndex];
-    } else if (dr.subIndex == 0 && !ati::ThreadIsolator::IsMultiSlotRule(r)) {
+    } else if (dr.subIndex == 0 && !isMulti) {
       dr.tid = r.activeAudioTid;
     } else {
       dr.tid = 0;
@@ -1476,26 +1308,19 @@ static void UpdateListViewDynamic(HWND hList,
 
     // 5: Audio Core PID/TID
     std::string thName;
-    bool isSlotByp =
-        ati::ThreadIsolator::IsMultiSlotRule(r)
-            ? (dr.subIndex < r.slotBypassed.size() && r.slotBypassed[dr.subIndex])
-            : r.isBypassed;
+    bool isSlotByp = r.IsSlotBypassed(dr.subIndex, isMulti);
     if (isSlotByp) {
       thName = "Bypassed";
     } else if (!r.isRunning) {
       thName = "Not running";
-    } else if (ati::ThreadIsolator::IsMultiSlotRule(r)) {
+    } else if (isMulti) {
       if (dr.subIndex < r.activeAudioTids.size() && dr.tid != 0) {
         thName = "PID " + std::to_string(r.activePid) + " / TID " +
                  std::to_string(dr.tid);
       } else if (r.multiSearchSleeping) {
         thName = "sleeping...";
       } else if (r.multiSearchPhase == 2) {
-        int rem = r.multiSearchTurns;
-        if (rem < 1)
-          rem = 1;
-        if (rem > 3)
-          rem = 3;
+        int rem = std::max(1, std::min(3, r.multiSearchTurns));
         thName = "Standby " + std::to_string(rem);
       } else {
         thName = "Searching...";
@@ -1539,11 +1364,9 @@ static void UpdateListViewDynamic(HWND hList,
           forAudioStr = FormatAudioMaskDisplay(slotMask, cores);
         }
       } else {
-        int assignedCore = r.audioCore;
-        if (dr.subIndex < r.audioCores.size()) {
-          assignedCore = r.audioCores[dr.subIndex];
-        } else if (!ati::ThreadIsolator::IsMultiSlotRule(r) &&
-                   r.audioAffinityMask != 0) {
+        int assignedCore = r.GetSlotCore(dr.subIndex);
+        if (dr.subIndex >= r.audioCores.size() && !isMulti &&
+            r.audioAffinityMask != 0) {
           int bitIdx = -1;
           int foundCount = 0;
           for (int c = 0; c < 64; ++c) {
@@ -1565,10 +1388,8 @@ static void UpdateListViewDynamic(HWND hList,
 
     // 9: Excluded (全スロットで保持マスクをそのまま表示)
     {
-      int coreCount = ati::CpuTopology::GetSystemCoreCount();
-      DWORD_PTR normalMask = (r.normalAffinityMask != 0)
-                                 ? r.normalAffinityMask
-                                 : g_isolator.GetConfig().normalAffinityMask;
+      DWORD_PTR normalMask =
+          (r.normalAffinityMask != 0) ? r.normalAffinityMask : globalNormalMask;
       DWORD_PTR mask = r.audioAffinityMask
                            ? r.audioAffinityMask
                            : ati::ThreadIsolator::MakeCoreMask(r.audioCore);
@@ -1925,6 +1746,31 @@ static WNDPROC s_pfnOriginalCheckboxProc = nullptr;
 static LRESULT CALLBACK CustomCheckboxProc(HWND hWnd, UINT msg, WPARAM wParam,
                                            LPARAM lParam);
 
+static bool ToggleInterlockedAffinityBit(DWORD_PTR &targetMask,
+                                         DWORD_PTR &otherMask, DWORD_PTR bit) {
+  if (targetMask & bit) {
+    if ((targetMask & ~bit) != 0) {
+      targetMask &= ~bit;
+      return true;
+    }
+    return false;
+  }
+  if ((otherMask & bit) != 0 && (otherMask & ~bit) == 0) {
+    return false;
+  }
+  targetMask |= bit;
+  otherMask &= ~bit;
+  return true;
+}
+
+static int FindFirstSetBitIndex(DWORD_PTR mask, int fallback = 0) {
+  for (int c = 0; c < 64; ++c) {
+    if ((mask & (1ULL << c)) != 0)
+      return c;
+  }
+  return fallback;
+}
+
 static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                                         LPARAM lParam) {
   static ati::GlobalConfig s_tmpConfig;
@@ -2213,56 +2059,18 @@ static INT_PTR CALLBACK SettingsDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           DWORD_PTR bit = (1ULL << logicalIdx);
           if (pia->iItem == 0) {
             // 行 0: Default Audio Core
-            if (s_tmpConfig.defaultAudioAffinityMask & bit) {
-              // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
-              if ((s_tmpConfig.defaultAudioAffinityMask & ~bit) != 0) {
-                s_tmpConfig.defaultAudioAffinityMask &= ~bit;
-              }
-            } else {
-              // チェックを入れる: 相互排他インターロック
-              // Other than から外すが、Other than の最後の 1 個なら変更不可
-              if ((s_tmpConfig.normalAffinityMask & bit) != 0 &&
-                  (s_tmpConfig.normalAffinityMask & ~bit) == 0) {
-                // Other than が空になってしまうため変更不可
-              } else {
-                s_tmpConfig.defaultAudioAffinityMask |= bit;
-                s_tmpConfig.normalAffinityMask &= ~bit; // 相互排他
-              }
+            if (ToggleInterlockedAffinityBit(s_tmpConfig.defaultAudioAffinityMask,
+                                             s_tmpConfig.normalAffinityMask, bit)) {
+              s_tmpConfig.defaultAudioCore =
+                  FindFirstSetBitIndex(s_tmpConfig.defaultAudioAffinityMask, 0);
             }
-            int firstCore = 0;
-            for (int c = 0; c < 64; ++c) {
-              if ((s_tmpConfig.defaultAudioAffinityMask & (1ULL << c)) != 0) {
-                firstCore = c;
-                break;
-              }
-            }
-            s_tmpConfig.defaultAudioCore = firstCore;
           } else if (pia->iItem == 1) {
             // 行 1: Other than Audio
-            if (s_tmpConfig.normalAffinityMask & bit) {
-              // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
-              if ((s_tmpConfig.normalAffinityMask & ~bit) != 0) {
-                s_tmpConfig.normalAffinityMask &= ~bit;
-              }
-            } else {
-              // チェックを入れる: 相互排他インターロック
-              // Audio Core から外すが、Audio Core の最後の 1 個なら変更不可
-              if ((s_tmpConfig.defaultAudioAffinityMask & bit) != 0 &&
-                  (s_tmpConfig.defaultAudioAffinityMask & ~bit) == 0) {
-                // Audio Core が空になってしまうため変更不可
-              } else {
-                s_tmpConfig.normalAffinityMask |= bit;
-                s_tmpConfig.defaultAudioAffinityMask &= ~bit; // 相互排他
-                int firstCore = 0;
-                for (int c = 0; c < 64; ++c) {
-                  if ((s_tmpConfig.defaultAudioAffinityMask & (1ULL << c)) !=
-                      0) {
-                    firstCore = c;
-                    break;
-                  }
-                }
-                s_tmpConfig.defaultAudioCore = firstCore;
-              }
+            if (ToggleInterlockedAffinityBit(s_tmpConfig.normalAffinityMask,
+                                             s_tmpConfig.defaultAudioAffinityMask,
+                                             bit)) {
+              s_tmpConfig.defaultAudioCore =
+                  FindFirstSetBitIndex(s_tmpConfig.defaultAudioAffinityMask, 0);
             }
           }
           SetDlgItemHexMask(hDlg, IDC_EDIT_AUDIO_CORE,
@@ -2701,110 +2509,39 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
             pia->iSubItem <= coreCount) {
           int logicalIdx = cores[pia->iSubItem - 1].logicalIndex;
           DWORD_PTR bit = (1ULL << logicalIdx);
-          if (pia->iItem == 0 && s_editMultiSlot) {
-            // 行 0 (マルチスロット): 当該スロットのコアをトグル選択 (複数選択可能)
-            if (s_editRule.audioAffinityMask & bit) {
-              // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
-              if ((s_editRule.audioAffinityMask & ~bit) != 0) {
-                s_editRule.audioAffinityMask &= ~bit;
+          auto syncEditedRuleAudioMask = [](bool syncRootCoreInMulti) {
+            if (s_editMultiSlot) {
+              if (s_editRuleSlot < s_editRule.audioSlotMasks.size()) {
+                s_editRule.audioSlotMasks[s_editRuleSlot] =
+                    s_editRule.audioAffinityMask;
+              }
+              int firstBit =
+                  FindFirstSetBitIndex(s_editRule.audioAffinityMask, -1);
+              if (firstBit >= 0 &&
+                  s_editRuleSlot < s_editRule.audioCores.size()) {
+                s_editRule.audioCores[s_editRuleSlot] = firstBit;
+              }
+              if (syncRootCoreInMulti && !s_editRule.audioCores.empty()) {
+                s_editRule.audioCore = s_editRule.audioCores[0];
               }
             } else {
-              // チェックを入れる: 相互排他インターロック
-              if ((s_editRule.normalAffinityMask & bit) != 0 &&
-                  (s_editRule.normalAffinityMask & ~bit) == 0) {
-                // Other than が空になってしまうため変更不可
-              } else {
-                s_editRule.audioAffinityMask |= bit;
-                s_editRule.normalAffinityMask &= ~bit; // 相互排他
-              }
+              SyncAudioCoresFromMask(s_editRule.audioCores,
+                                     s_editRule.audioAffinityMask);
+              s_editRule.audioSlotMasks = {s_editRule.audioAffinityMask};
+              s_editRule.audioCore =
+                  (!s_editRule.audioCores.empty()) ? s_editRule.audioCores[0] : 0;
             }
-            if (s_editRuleSlot < s_editRule.audioSlotMasks.size()) {
-              s_editRule.audioSlotMasks[s_editRuleSlot] =
-                  s_editRule.audioAffinityMask;
+          };
+
+          if (pia->iItem == 0) {
+            if (ToggleInterlockedAffinityBit(s_editRule.audioAffinityMask,
+                                             s_editRule.normalAffinityMask, bit)) {
+              syncEditedRuleAudioMask(false);
             }
-            int firstBit = -1;
-            for (int c = 0; c < 64; ++c) {
-              if ((s_editRule.audioAffinityMask & (1ULL << c)) != 0) {
-                firstBit = c;
-                break;
-              }
-            }
-            if (firstBit >= 0 &&
-                s_editRuleSlot < s_editRule.audioCores.size()) {
-              s_editRule.audioCores[s_editRuleSlot] = firstBit;
-            }
-          } else if (pia->iItem == 0) {
-            // 行 0: Audio Core
-            if (s_editRule.audioAffinityMask & bit) {
-              // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
-              if ((s_editRule.audioAffinityMask & ~bit) != 0) {
-                s_editRule.audioAffinityMask &= ~bit;
-              }
-            } else {
-              // チェックを入れる: 相互排他インターロック
-              // Other than から外すが、Other than の最後の 1 個なら変更不可
-              if ((s_editRule.normalAffinityMask & bit) != 0 &&
-                  (s_editRule.normalAffinityMask & ~bit) == 0) {
-                // Other than が空になってしまうため変更不可
-              } else {
-                s_editRule.audioAffinityMask |= bit;
-                s_editRule.normalAffinityMask &= ~bit; // 相互排他
-              }
-            }
-            SyncAudioCoresFromMask(s_editRule.audioCores,
-                                   s_editRule.audioAffinityMask);
-            s_editRule.audioSlotMasks = {s_editRule.audioAffinityMask};
-            int firstCore = 0;
-            if (!s_editRule.audioCores.empty()) {
-              firstCore = s_editRule.audioCores[0];
-            }
-            s_editRule.audioCore = firstCore;
           } else if (pia->iItem == 1) {
-            // 行 1: Other than Audio
-            if (s_editRule.normalAffinityMask & bit) {
-              // チェックを外す: 最低 1 コア保護 (最後の 1 個なら変更不可)
-              if ((s_editRule.normalAffinityMask & ~bit) != 0) {
-                s_editRule.normalAffinityMask &= ~bit;
-              }
-            } else {
-              // チェックを入れる: 相互排他インターロック
-              // Audio Core から外すが、Audio Core の最後の 1 個なら変更不可
-              if ((s_editRule.audioAffinityMask & bit) != 0 &&
-                  (s_editRule.audioAffinityMask & ~bit) == 0) {
-                // Audio Core が空になってしまうため変更不可
-              } else {
-                s_editRule.normalAffinityMask |= bit;
-                s_editRule.audioAffinityMask &= ~bit; // 相互排他
-                if (s_editMultiSlot) {
-                  if (s_editRuleSlot < s_editRule.audioSlotMasks.size()) {
-                    s_editRule.audioSlotMasks[s_editRuleSlot] =
-                        s_editRule.audioAffinityMask;
-                  }
-                  int firstBit = -1;
-                  for (int c = 0; c < 64; ++c) {
-                    if ((s_editRule.audioAffinityMask & (1ULL << c)) != 0) {
-                      firstBit = c;
-                      break;
-                    }
-                  }
-                  if (firstBit >= 0 &&
-                      s_editRuleSlot < s_editRule.audioCores.size()) {
-                    s_editRule.audioCores[s_editRuleSlot] = firstBit;
-                  }
-                  if (!s_editRule.audioCores.empty()) {
-                    s_editRule.audioCore = s_editRule.audioCores[0];
-                  }
-                } else {
-                  s_editRule.audioSlotMasks = {s_editRule.audioAffinityMask};
-                  SyncAudioCoresFromMask(s_editRule.audioCores,
-                                         s_editRule.audioAffinityMask);
-                  int firstCore = 0;
-                  if (!s_editRule.audioCores.empty()) {
-                    firstCore = s_editRule.audioCores[0];
-                  }
-                  s_editRule.audioCore = firstCore;
-                }
-              }
+            if (ToggleInterlockedAffinityBit(s_editRule.normalAffinityMask,
+                                             s_editRule.audioAffinityMask, bit)) {
+              syncEditedRuleAudioMask(true);
             }
           }
           SetDlgItemHexMask(hDlg, IDC_EDIT_RULE_CORE,
@@ -2868,34 +2605,12 @@ static INT_PTR CALLBACK RuleEditDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
           int chosenPrio =
               static_cast<int>(SendMessageA(hCombo, CB_GETITEMDATA, sel, 0));
           size_t targetSlot = s_editMultiSlot ? s_editRuleSlot : 0;
-          int prevPrio = (targetSlot < s_editRule.audioPriorities.size())
-                             ? s_editRule.audioPriorities[targetSlot]
-                             : s_editRule.audioPriority;
-          s_editRule.audioPriority = chosenPrio;
-          if (s_editMultiSlot) {
-            if (s_editRuleSlot < s_editRule.audioPriorities.size()) {
-              s_editRule.audioPriorities[s_editRuleSlot] = chosenPrio;
-            }
-          } else {
-            if (!s_editRule.audioPriorities.empty()) {
-              s_editRule.audioPriorities[0] = chosenPrio;
-            }
-          }
+          int prevPrio = s_editRule.GetSlotPriority(targetSlot);
+          size_t reqSlots = ati::ThreadIsolator::GetRuleSlotCount(s_editRule);
+          s_editRule.SetSlotPriority(targetSlot, chosenPrio, reqSlots);
           if (chosenPrio != prevPrio) {
-            size_t reqSlots = ati::ThreadIsolator::GetRuleSlotCount(s_editRule);
-            if (s_editRule.resetPriorityToZeroRequested.size() < reqSlots) {
-              s_editRule.resetPriorityToZeroRequested.resize(reqSlots, false);
-            }
-            if (s_editRule.normalPrioForceApplied.size() < reqSlots) {
-              s_editRule.normalPrioForceApplied.resize(reqSlots, false);
-            }
-            if (chosenPrio == 0) {
-              s_editRule.resetPriorityToZeroRequested[targetSlot] = true;
-              s_editRule.normalPrioForceApplied[targetSlot] = true;
-            } else {
-              s_editRule.resetPriorityToZeroRequested[targetSlot] = false;
-              s_editRule.normalPrioForceApplied[targetSlot] = false;
-            }
+            s_editRule.SetSlotNormalForceFlags(targetSlot, chosenPrio == 0,
+                                               reqSlots);
           }
           s_editRule.wasHalfAutoPromoted = true; // ユーザー明示設定を保護
         }
@@ -3298,138 +3013,26 @@ static LRESULT CALLBACK CustomListProc(HWND hWnd, UINT msg, WPARAM wParam,
                   targetRule.processPriorityModified = false;
                   targetRule.wasHalfAutoPromoted = false;
 
-                  if (targetRule.audioPriorities.size() < requiredSlots) {
-                    targetRule.audioPriorities.resize(requiredSlots,
-                                                      targetRule.audioPriority);
-                  }
-                  if (targetRule.resetPriorityToZeroRequested.size() <
-                      requiredSlots) {
-                    targetRule.resetPriorityToZeroRequested.resize(
-                        requiredSlots, false);
-                  }
-                  if (targetRule.normalPrioForceApplied.size() <
-                      requiredSlots) {
-                    targetRule.normalPrioForceApplied.resize(requiredSlots,
-                                                             false);
-                  }
-                  if (targetRule.actualAudioBasePriorities.size() <
-                      requiredSlots) {
-                    targetRule.actualAudioBasePriorities.resize(requiredSlots,
-                                                                0);
-                  }
-                  if (targetRule.actualThreadRelativePrios.size() <
-                      requiredSlots) {
-                    targetRule.actualThreadRelativePrios.resize(requiredSlots,
-                                                                0);
-                  }
-                  if (targetRule.prioPollTurns.size() < requiredSlots) {
-                    targetRule.prioPollTurns.resize(requiredSlots, 0);
-                  }
-                  if (targetRule.prioRefetchTicks.size() < requiredSlots) {
-                    targetRule.prioRefetchTicks.resize(requiredSlots, 0);
-                  }
-
-                  if (subIdx < targetRule.audioPriorities.size()) {
-                    targetRule.audioPriorities[subIdx] = 0;
-                  }
-                  if (subIdx == 0) {
-                    targetRule.audioPriority = 0;
-                  }
-                  targetRule.resetPriorityToZeroRequested[subIdx] = false;
-                  targetRule.normalPrioForceApplied[subIdx] = false;
-
-                  for (size_t s = 0;
-                       s < targetRule.actualAudioBasePriorities.size(); ++s) {
-                    targetRule.actualAudioBasePriorities[s] = 0;
-                  }
-                  for (size_t s = 0;
-                       s < targetRule.actualThreadRelativePrios.size(); ++s) {
-                    targetRule.actualThreadRelativePrios[s] = 0;
-                  }
-                  for (size_t s = 0; s < targetRule.prioPollTurns.size(); ++s) {
-                    targetRule.prioPollTurns[s] = 0;
-                  }
-                  for (size_t s = 0; s < targetRule.prioRefetchTicks.size();
-                       ++s) {
-                    targetRule.prioRefetchTicks[s] = 0;
-                  }
+                  targetRule.EnsureSlotVectors(requiredSlots);
+                  targetRule.SetSlotPriority(subIdx, 0, requiredSlots);
+                  targetRule.SetSlotNormalForceFlags(subIdx, false, requiredSlots);
+                  targetRule.ClearDynamicPriorityCache(-1, true);
                 } else {
                   if (res.applyProcess) {
                     targetRule.processPriorityClass = res.processPriorityClass;
                     targetRule.processPriorityModified = true;
-                    if (targetRule.actualAudioBasePriorities.size() <
-                        requiredSlots) {
-                      targetRule.actualAudioBasePriorities.resize(requiredSlots,
-                                                                  0);
-                    }
-                    if (targetRule.prioPollTurns.size() < requiredSlots) {
-                      targetRule.prioPollTurns.resize(requiredSlots, 0);
-                    }
-                    if (targetRule.prioRefetchTicks.size() < requiredSlots) {
-                      targetRule.prioRefetchTicks.resize(requiredSlots, 0);
-                    }
-                    for (size_t s = 0;
-                         s < targetRule.actualAudioBasePriorities.size(); ++s) {
-                      targetRule.actualAudioBasePriorities[s] = 0;
-                    }
-                    for (size_t s = 0; s < targetRule.prioPollTurns.size();
-                         ++s) {
-                      targetRule.prioPollTurns[s] = 0;
-                    }
-                    for (size_t s = 0; s < targetRule.prioRefetchTicks.size();
-                         ++s) {
-                      targetRule.prioRefetchTicks[s] = 0;
-                    }
+                    targetRule.EnsureSlotVectors(requiredSlots);
+                    targetRule.ClearDynamicPriorityCache(-1, false);
                   }
 
                   if (res.applyThread) {
-                    if (targetRule.audioPriorities.size() < requiredSlots) {
-                      targetRule.audioPriorities.resize(
-                          requiredSlots, targetRule.audioPriority);
-                    }
-                    if (subIdx < targetRule.audioPriorities.size()) {
-                      targetRule.audioPriorities[subIdx] = res.threadPriority;
-                    }
-                    if (subIdx == 0) {
-                      targetRule.audioPriority = res.threadPriority;
-                    }
-                    if (targetRule.resetPriorityToZeroRequested.size() <
-                        requiredSlots) {
-                      targetRule.resetPriorityToZeroRequested.resize(
-                          requiredSlots, false);
-                    }
-                    if (targetRule.normalPrioForceApplied.size() <
-                        requiredSlots) {
-                      targetRule.normalPrioForceApplied.resize(requiredSlots,
-                                                               false);
-                    }
-                    if (res.threadPriority == 0) {
-                      targetRule.resetPriorityToZeroRequested[subIdx] = true;
-                      targetRule.normalPrioForceApplied[subIdx] = true;
-                    } else {
-                      targetRule.resetPriorityToZeroRequested[subIdx] = false;
-                      targetRule.normalPrioForceApplied[subIdx] = false;
-                    }
-                    if (targetRule.actualAudioBasePriorities.size() <
-                        requiredSlots) {
-                      targetRule.actualAudioBasePriorities.resize(requiredSlots,
-                                                                  0);
-                    }
-                    if (targetRule.actualThreadRelativePrios.size() <
-                        requiredSlots) {
-                      targetRule.actualThreadRelativePrios.resize(requiredSlots,
-                                                                  0);
-                    }
-                    if (targetRule.prioPollTurns.size() < requiredSlots) {
-                      targetRule.prioPollTurns.resize(requiredSlots, 0);
-                    }
-                    if (targetRule.prioRefetchTicks.size() < requiredSlots) {
-                      targetRule.prioRefetchTicks.resize(requiredSlots, 0);
-                    }
-                    targetRule.actualAudioBasePriorities[subIdx] = 0;
-                    targetRule.actualThreadRelativePrios[subIdx] = 0;
-                    targetRule.prioPollTurns[subIdx] = 0;
-                    targetRule.prioRefetchTicks[subIdx] = 0;
+                    targetRule.EnsureSlotVectors(requiredSlots);
+                    targetRule.SetSlotPriority(subIdx, res.threadPriority,
+                                               requiredSlots);
+                    targetRule.SetSlotNormalForceFlags(
+                        subIdx, res.threadPriority == 0, requiredSlots);
+                    targetRule.ClearDynamicPriorityCache(
+                        static_cast<int>(subIdx), true);
                   }
                 }
 
@@ -4086,7 +3689,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
   case WM_INITDIALOG: {
     LogDebug("WM_INITDIALOG: start");
     g_hMainDlg = hDlg;
-    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.2");
+    SetWindowTextA(hDlg, "Audio Thread Isolator v2.0.3");
 
     HWND hList = GetDlgItem(hDlg, IDC_LIST_PROCESSES);
     if (!hList)
@@ -4688,10 +4291,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               // 解除時と同様に探索を即時リスタート
               const auto &dr = g_displayRows[rowIdx];
               bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(targetRule);
-              bool isRowBypassed =
-                  isMulti ? (dr.subIndex < targetRule.slotBypassed.size() &&
-                             targetRule.slotBypassed[dr.subIndex])
-                          : targetRule.isBypassed;
+              bool isRowBypassed = targetRule.IsSlotBypassed(dr.subIndex, isMulti);
               if (targetRule.isRunning && !isRowBypassed) {
                 if (isMulti) {
                   bool isSlotConfirmed =
@@ -4773,10 +4373,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
             if (ruleIdx < rules.size()) {
               const auto &targetRule = rules[ruleIdx];
               bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(targetRule);
-              bool isRowBypassed =
-                  isMulti ? (dr.subIndex < targetRule.slotBypassed.size() &&
-                             targetRule.slotBypassed[dr.subIndex])
-                          : targetRule.isBypassed;
+              bool isRowBypassed = targetRule.IsSlotBypassed(dr.subIndex, isMulti);
               bool isHandled = false;
               if (isMulti && !isRowBypassed) {
                 bool isSlotConfirmed =
@@ -4879,10 +4476,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
                 int cellH = rcSub.bottom - rcSub.top;
                 float scale = GetDpiScaleForWindow(hDlg);
                 bool isMulti = ati::ThreadIsolator::IsMultiSlotRule(r);
-                bool isRowBypassed =
-                    isMulti ? (dr.subIndex < r.slotBypassed.size() &&
-                               r.slotBypassed[dr.subIndex])
-                            : r.isBypassed;
+                bool isRowBypassed = r.IsSlotBypassed(dr.subIndex, isMulti);
 
                 if (r.isRunning && !isRowBypassed) {
                   // 起動中（稼働中・非Bypass）: 丸印インジケーターを描画
@@ -5038,9 +4632,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
               const auto &dr = g_displayRows[row];
               if (dr.ruleIndex < rules.size()) {
                 const auto &r = rules[dr.ruleIndex];
-                int rowPrio = (dr.subIndex < r.audioPriorities.size())
-                                  ? r.audioPriorities[dr.subIndex]
-                                  : r.audioPriority;
+                int rowPrio = r.GetSlotPriority(dr.subIndex);
                 RECT rcSub;
                 ListView_GetSubItemRect(hList, row, plvcd->iSubItem,
                                         LVIR_BOUNDS, &rcSub);
@@ -5049,9 +4641,7 @@ static INT_PTR CALLBACK MainDlgProc(HWND hDlg, UINT msg, WPARAM wParam,
 
                 // Col 2: 未操作 (rowPrio == 0 かつ Normal 明示適用でない) は淡い緑 (TID非アタッチ)
                 // Col 3: 未操作 (!r.processPriorityModified) は淡い緑 (PID非アタッチ)
-                bool isForceZero =
-                    (dr.subIndex < r.normalPrioForceApplied.size() &&
-                     r.normalPrioForceApplied[dr.subIndex]);
+                bool isForceZero = r.IsSlotNormalForceApplied(dr.subIndex);
                 COLORREF cellBkCol = rowBkCol;
                 if (plvcd->iSubItem == 2 && rowPrio == 0 && !isForceZero) {
                   cellBkCol = RGB(220, 245, 220);
@@ -5322,25 +4912,18 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR lpCmdLine, int) {
 
     UINT uRestoreMsg = RegisterWindowMessageA("ATI_RestoreInstance");
 
-    HWND hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.2");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.1");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v2.0.0");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.8");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.7");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.6");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.5");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.4");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator v1.0.3");
-    if (!hExisting)
-      hExisting = FindWindowA(nullptr, "Audio Thread Isolator");
+    HWND hExisting = nullptr;
+    EnumWindows(
+        [](HWND hWnd, LPARAM lParam) -> BOOL {
+          char title[128] = {0};
+          if (GetWindowTextA(hWnd, title, sizeof(title)) > 0 &&
+              strncmp(title, "Audio Thread Isolator", 21) == 0) {
+            *reinterpret_cast<HWND *>(lParam) = hWnd;
+            return FALSE;
+          }
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&hExisting));
 
     if (hExisting) {
       DWORD existingPid = 0;

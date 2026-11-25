@@ -6,21 +6,16 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "priority_matrix_data.h"
 
 
 namespace ati {
-
-#ifndef ATI_FIXED_PRIO_HELPERS
-#define ATI_FIXED_PRIO_HELPERS
-inline bool IsFixedThreadPriority(int v) { return v >= 101 && v <= 131; }
-inline int DecodeFixedThreadPriority(int v) { return v - 100; }
-inline int EncodeFixedThreadPriority(int p) { return 100 + p; }
-#endif
 
 // コアトポロジー情報 (QITuner 準拠)
 struct CoreInfo {
@@ -106,6 +101,117 @@ struct ProcessRule {
   // 定常状態の 3 秒周期監視ゲート管理 (AppType 0, 2 以外)
   int steadyWaitTurns = 0;         // 定常時の残りスキップターン数
   int postIsolationGraceTurns = 0; // 隔離直後・UI操作直後の 500ms 即応維持ターン数
+
+  // ── KISS-2 / DRY-4: スロットアクセサ＆ベクタ初期化・キャッシュ管理ヘルパー ──
+  int GetSlotPriority(size_t slot = 0) const {
+    return (slot < audioPriorities.size()) ? audioPriorities[slot] : audioPriority;
+  }
+
+  void SetSlotPriority(size_t slot, int prio, size_t requiredSlots = 0) {
+    size_t need = (requiredSlots > slot + 1) ? requiredSlots : (slot + 1);
+    if (audioPriorities.size() < need) {
+      audioPriorities.resize(need, audioPriority);
+    }
+    audioPriorities[slot] = prio;
+    if (slot == 0) {
+      audioPriority = prio;
+    }
+  }
+
+  int GetSlotCore(size_t slot = 0) const {
+    return (slot < audioCores.size()) ? audioCores[slot] : audioCore;
+  }
+
+  DWORD_PTR GetSlotAffinityMask(size_t slot = 0) const {
+    if (slot < audioSlotMasks.size() && audioSlotMasks[slot] != 0)
+      return audioSlotMasks[slot];
+    if (slot < audioCores.size())
+      return (static_cast<DWORD_PTR>(1) << audioCores[slot]);
+    if (audioAffinityMask != 0)
+      return audioAffinityMask;
+    return (static_cast<DWORD_PTR>(1) << audioCore);
+  }
+
+  bool IsSlotBypassed(size_t slot, bool isMulti) const {
+    return isMulti ? (slot < slotBypassed.size() && slotBypassed[slot]) : isBypassed;
+  }
+
+  bool IsSlotNormalForceApplied(size_t slot) const {
+    return slot < normalPrioForceApplied.size() && normalPrioForceApplied[slot];
+  }
+
+  void SetSlotNormalForceFlags(size_t slot, bool enabled, size_t requiredSlots = 0) {
+    size_t need = (requiredSlots > slot + 1) ? requiredSlots : (slot + 1);
+    if (resetPriorityToZeroRequested.size() < need)
+      resetPriorityToZeroRequested.resize(need, false);
+    if (normalPrioForceApplied.size() < need)
+      normalPrioForceApplied.resize(need, false);
+    resetPriorityToZeroRequested[slot] = enabled;
+    normalPrioForceApplied[slot] = enabled;
+  }
+
+  void EnsureSlotVectors(size_t requiredSlots) {
+    if (audioPriorities.size() < requiredSlots)
+      audioPriorities.resize(requiredSlots, audioPriority);
+    if (resetPriorityToZeroRequested.size() < requiredSlots)
+      resetPriorityToZeroRequested.resize(requiredSlots, false);
+    if (normalPrioForceApplied.size() < requiredSlots)
+      normalPrioForceApplied.resize(requiredSlots, false);
+    if (actualAudioBasePriorities.size() < requiredSlots)
+      actualAudioBasePriorities.resize(requiredSlots, 0);
+    if (actualThreadRelativePrios.size() < requiredSlots)
+      actualThreadRelativePrios.resize(requiredSlots, 0);
+    if (prioPollTurns.size() < requiredSlots)
+      prioPollTurns.resize(requiredSlots, 0);
+    if (prioRefetchTicks.size() < requiredSlots)
+      prioRefetchTicks.resize(requiredSlots, 0);
+  }
+
+  void ClearDynamicPriorityCache(int targetSlot = -1, bool clearRelative = true,
+                                 bool clearNormalForce = false) {
+    if (targetSlot < 0) {
+      std::fill(actualAudioBasePriorities.begin(), actualAudioBasePriorities.end(), 0);
+      if (clearRelative) {
+        std::fill(actualThreadRelativePrios.begin(), actualThreadRelativePrios.end(), 0);
+      }
+      if (clearNormalForce) {
+        std::fill(normalPrioForceApplied.begin(), normalPrioForceApplied.end(), false);
+      }
+      std::fill(prioPollTurns.begin(), prioPollTurns.end(), 0);
+      std::fill(prioRefetchTicks.begin(), prioRefetchTicks.end(), 0);
+    } else {
+      size_t s = static_cast<size_t>(targetSlot);
+      if (s < actualAudioBasePriorities.size())
+        actualAudioBasePriorities[s] = 0;
+      if (clearRelative && s < actualThreadRelativePrios.size())
+        actualThreadRelativePrios[s] = 0;
+      if (clearNormalForce && s < normalPrioForceApplied.size())
+        normalPrioForceApplied[s] = false;
+      if (s < prioPollTurns.size())
+        prioPollTurns[s] = 0;
+      if (s < prioRefetchTicks.size())
+        prioRefetchTicks[s] = 0;
+    }
+  }
+
+  void StoreSlotDynamicPriority(size_t slot, int actualDynPri, int curRel) {
+    if (actualAudioBasePriorities.size() <= slot)
+      actualAudioBasePriorities.resize(slot + 1, 0);
+    if (actualThreadRelativePrios.size() <= slot)
+      actualThreadRelativePrios.resize(slot + 1, 0);
+    actualAudioBasePriorities[slot] = actualDynPri;
+    actualThreadRelativePrios[slot] = curRel;
+  }
+
+  int ResolveFallbackBasePriority(int threadPrio) const {
+    if (IsFixedThreadPriority(threadPrio))
+      return DecodeFixedThreadPriority(threadPrio);
+    DWORD effClass = (processPriorityClass != 0) ? processPriorityClass
+                                                 : NORMAL_PRIORITY_CLASS;
+    int rank = FindRankByPrio(effClass, threadPrio);
+    const auto *entry = GetMatrixEntryByRank(rank);
+    return entry ? entry->basePriority : (threadPrio + 8);
+  }
 };
 
 // 全体設定
@@ -113,8 +219,6 @@ struct GlobalConfig {
   int defaultAudioCore; // デフォルト隔離コア (代表コア #0 始まり)
   DWORD_PTR defaultAudioAffinityMask; // デフォルト隔離オーディオコアマスク (0:
                                       // defaultAudioCoreから単一生成)
-  DWORD defaultProcessPriorityClass =
-      IDLE_PRIORITY_CLASS; // デフォルトプロセス優先度クラス (初期値: Idle 0x40)
   DWORD_PTR normalAffinityMask; // 通常スレッド退避先マスク (0:
                                 // 隔離コア以外の全コア自動)
   int pollingIntervalMs;        // 監視周期 (デフォルト 500ms)
@@ -205,6 +309,36 @@ private:
                                     int idealCore = -1,
                                     DWORD_PTR knownAffinity = 0);
 
+  // スロット別ワンショット優先度リセット + オーディオスレッド設定適用 + 2段階 Dyn Pri 取得共通ルーチン (DRY-3)
+  bool ProcessSlotPriorityAndDynPri(HANDLE hThread, DWORD tid, size_t slotIdx,
+                                    int assignedCore, DWORD_PTR assignedMask,
+                                    ProcessRule &rule, DWORD_PTR knownAff = 0,
+                                    int *pPrimaryAudioPrio = nullptr);
+
+  // ScanAndIsolate フェーズ分割ヘルパー (KISS-1)
+  void ResetStoppedOrBypassedRuleState(ProcessRule &rule, bool isBypassed);
+  void IsolateAudioDgRule(
+      ProcessRule &rule, const std::vector<DWORD> &pids,
+      const std::unordered_map<DWORD, std::vector<THREADENTRY32>> &processThreads,
+      DWORD_PTR audioMask, bool &stateChanged);
+  void IsolateChromiumRule(
+      ProcessRule &rule, const std::vector<DWORD> &pids,
+      const std::unordered_set<DWORD> &allActivePids,
+      std::unordered_map<DWORD, std::vector<THREADENTRY32>> &processThreads,
+      std::unordered_map<DWORD, std::unordered_map<DWORD, DWORD_PTR>>
+          &processThreadAffinities,
+      bool shouldScanProcesses, int coreCount, DWORD_PTR audioMask,
+      DWORD_PTR normalMask, DWORD_PTR parentMask, bool &stateChanged);
+  void IsolateStandardOrMultiSlotRule(
+      ProcessRule &rule, const std::vector<DWORD> &pids,
+      const std::unordered_set<DWORD> &allActivePids,
+      const std::unordered_map<DWORD, std::vector<THREADENTRY32>> &processThreads,
+      const std::unordered_map<DWORD, std::unordered_map<DWORD, DWORD_PTR>>
+          &processThreadAffinities,
+      int coreCount, int intervalMs, int turnsPerSec, DWORD_PTR audioMask,
+      DWORD_PTR baseNormal, DWORD_PTR normalMask, DWORD_PTR parentMask,
+      bool &stateChanged);
+
   // キー: TID, 値: 適用済みマスク
   std::unordered_map<DWORD, DWORD_PTR> m_appliedThreads;
   // キー: TID, 値: 適用済み Ideal Processor 番号
@@ -229,12 +363,12 @@ private:
   };
   struct ThreadSamplingEntry {
     DWORD tid = 0;
-    int64_t deltas[10] = {0}; // Δ(0) ... Δ(9)。脱落時は deltas[0] = -1
+    int64_t deltas[4] = {0}; // Δ(0) ... Δ(3)。脱落時は deltas[0] = -1
     ULONG64 lastCycle = 0;
   };
   struct ChromiumAudioState {
     int step = 1; // 1: 初期ベースライン, 2: 待機ループ, 3: サンプリング中
-    int k = 0;    // サンプリングインデックス (1..9)
+    int k = 0;    // サンプリングインデックス (1..3)
     std::vector<ThreadSamplingEntry> d; // d(n)
     bool samplingActive = false; // Step 3 サンプリング中 (タイマー加速制御用)
     bool initialEvaluated = false;
@@ -247,9 +381,6 @@ private:
   std::unordered_map<DWORD, std::unordered_set<DWORD>> m_audioDgAppliedTids;
   std::unordered_map<DWORD, int> m_audioDgLastPrio;
 
-  // スレッド属性フラグ (キー: PID, 値: (キー: TID, 値: フラグ 1:timeclit救済))
-  std::unordered_map<DWORD, std::unordered_map<DWORD, uint8_t>> m_threadFlags;
-
   // 永続オーディオスレッドトラッキング (キー: PID, 値: (キー: TID, 値:
   // スレッド表示名))
   std::unordered_map<DWORD, std::unordered_map<DWORD, std::string>>
@@ -260,6 +391,8 @@ private:
     std::unordered_map<DWORD, ULONGLONG> latestDelta; // 直近ターンの瞬間デルタ
     std::unordered_set<DWORD>
         audioCandidateTids; // オーディオ関連と判定された候補 TID
+    std::unordered_set<DWORD>
+        timeCriticalTids; // AppType 3 (DAW) 初回 Time Critical 救済フラグ TID
     std::unordered_set<DWORD>
         socketCandidateTids; // ソケット送受信候補 TID (mswsock.dll / ws2_32.dll)
     std::unordered_set<DWORD>

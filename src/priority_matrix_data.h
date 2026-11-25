@@ -5,6 +5,26 @@
 
 namespace ati {
 
+// Fixed thread priority (KPRIORITY 1..31) encoding helpers
+#ifndef ATI_FIXED_PRIO_HELPERS
+#define ATI_FIXED_PRIO_HELPERS
+inline bool IsFixedThreadPriority(int v) { return v >= 101 && v <= 131; }
+inline int DecodeFixedThreadPriority(int v) { return v - 100; }
+inline int EncodeFixedThreadPriority(int p) { return 100 + p; }
+#endif
+
+inline const char* GetProcessPriorityClassName(DWORD pClass, const char* idleLabel = "Idle") {
+    switch (pClass) {
+    case REALTIME_PRIORITY_CLASS:     return "Realtime";
+    case HIGH_PRIORITY_CLASS:         return "High";
+    case ABOVE_NORMAL_PRIORITY_CLASS: return "Above Normal";
+    case NORMAL_PRIORITY_CLASS:       return "Normal";
+    case BELOW_NORMAL_PRIORITY_CLASS: return "Below Normal";
+    case IDLE_PRIORITY_CLASS:         return idleLabel;
+    default:                          return "Normal";
+    }
+}
+
 struct PriorityMatrixEntry {
     int rank;                 // 1 .. 42
     int row;                  // 0 .. 5
@@ -93,6 +113,53 @@ inline int FindRankByPrio(DWORD procClass, int threadPrio) {
         }
     }
     return 18; // Rank 18: Normal x Normal (0) = Base 8
+}
+
+static constexpr int kProcessBasePriorities[6] = { 4, 6, 8, 10, 13, 24 };
+static constexpr int kColumnThreadPriorities[7] = {
+    THREAD_PRIORITY_IDLE,
+    THREAD_PRIORITY_LOWEST,
+    THREAD_PRIORITY_BELOW_NORMAL,
+    THREAD_PRIORITY_NORMAL,
+    THREAD_PRIORITY_ABOVE_NORMAL,
+    THREAD_PRIORITY_HIGHEST,
+    THREAD_PRIORITY_TIME_CRITICAL
+};
+
+inline int GetMatrixBasePriority(int row, int col) {
+    const PriorityMatrixEntry* e = GetMatrixEntryByRowCol(row, col);
+    return e ? e->basePriority : 8;
+}
+
+inline const char* GetRowProcessLabel(int row) {
+    const PriorityMatrixEntry* e = GetMatrixEntryByRowCol(row, 3);
+    return e ? e->processLabel : "Normal";
+}
+
+inline const char* GetColThreadLabel(int col) {
+    const PriorityMatrixEntry* e = GetMatrixEntryByRowCol(2, col);
+    return e ? e->threadLabel : "Normal (0)";
+}
+
+inline int ProcessClassToRow(DWORD procClass) {
+    for (int i = 0; i < kPriorityMatrixEntryCount; ++i) {
+        if (kPriorityMatrixEntries[i].processPriorityClass == procClass) {
+            return kPriorityMatrixEntries[i].row;
+        }
+    }
+    return 2;
+}
+
+inline DWORD RowToProcessClass(int row) {
+    const PriorityMatrixEntry* e = GetMatrixEntryByRowCol(row, 0);
+    return e ? e->processPriorityClass : NORMAL_PRIORITY_CLASS;
+}
+
+inline int ThreadPrioToCol(int threadPrio) {
+    for (int c = 0; c < 7; ++c) {
+        if (kColumnThreadPriorities[c] == threadPrio) return c;
+    }
+    return 3;
 }
 
 } // namespace ati
